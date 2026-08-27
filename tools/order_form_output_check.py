@@ -14,9 +14,6 @@ from difflib import SequenceMatcher
 if "of_reset_id" not in st.session_state:
     st.session_state["of_reset_id"] = 0
 
-if "of_product_type" not in st.session_state:
-    st.session_state["of_product_type"] = "----- SELECT -----"
-
 if "of_selected_fields" not in st.session_state:
     st.session_state["of_selected_fields"] = []
 
@@ -31,15 +28,62 @@ if "of_result" not in st.session_state:
 st.markdown(
     """
     <style>
-    .tool-page-title { font-size:34px; font-weight:800; margin-bottom:4px; color:#ffffff; }
-    .tool-page-subtitle { color:#aeb8c7; font-size:15px; margin-bottom:28px; }
-    .tool-section-title { font-size:19px; font-weight:750; color:#ffffff; margin-top:10px; margin-bottom:10px; }
-    .field-info-card { padding:14px 16px; border-radius:14px; background:rgba(30,41,59,.72); border:1px solid rgba(148,163,184,.20); margin-bottom:12px; }
-    .field-info-title { color:#93c5fd; font-size:13px; font-weight:700; letter-spacing:.7px; }
-    .field-info-value { color:#ffffff; font-size:15px; margin-top:4px; }
-    .result-pass { color:#4ade80; font-weight:800; }
-    .result-fail { color:#f87171; font-weight:800; }
-    .result-warning { color:#fbbf24; font-weight:800; }
+    .tool-page-title {
+        font-size:34px;
+        font-weight:800;
+        margin-bottom:4px;
+        color:#ffffff;
+    }
+
+    .tool-page-subtitle {
+        color:#aeb8c7;
+        font-size:15px;
+        margin-bottom:28px;
+    }
+
+    .tool-section-title {
+        font-size:19px;
+        font-weight:750;
+        color:#ffffff;
+        margin-top:10px;
+        margin-bottom:10px;
+    }
+
+    .field-info-card {
+        padding:14px 16px;
+        border-radius:14px;
+        background:rgba(30,41,59,.72);
+        border:1px solid rgba(148,163,184,.20);
+        margin-bottom:12px;
+    }
+
+    .field-info-title {
+        color:#93c5fd;
+        font-size:13px;
+        font-weight:700;
+        letter-spacing:.7px;
+    }
+
+    .field-info-value {
+        color:#ffffff;
+        font-size:15px;
+        margin-top:4px;
+    }
+
+    .result-pass {
+        color:#4ade80;
+        font-weight:800;
+    }
+
+    .result-fail {
+        color:#f87171;
+        font-weight:800;
+    }
+
+    .result-warning {
+        color:#fbbf24;
+        font-weight:800;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -51,8 +95,11 @@ def render_title():
         '<div class="tool-page-title">🔍 Order Form → Output Check</div>',
         unsafe_allow_html=True,
     )
+
     st.markdown(
-        '<div class="tool-page-subtitle">Select variable Order Form fields and compare them against the final PDF artwork.</div>',
+        '<div class="tool-page-subtitle">'
+        'Select variable Order Form fields and compare them against the final PDF artwork.'
+        '</div>',
         unsafe_allow_html=True,
     )
 
@@ -67,7 +114,13 @@ def normalize_text(text):
 
     text = unicodedata.normalize("NFKC", str(text))
     text = text.lower()
-    text = text.replace("’", "'").replace("`", "'").replace("–", "-").replace("—", "-")
+    text = (
+        text.replace("’", "'")
+        .replace("`", "'")
+        .replace("–", "-")
+        .replace("—", "-")
+    )
+
     text = text.replace("\n", " ").replace("\r", " ")
 
     # PDF bullet/artifact cleanup.
@@ -107,7 +160,13 @@ def normalize_strict_text(text):
     text = text.replace("’", "'").replace("`", "'")
     text = text.replace("–", "-").replace("—", "-")
 
-    text = re.sub(r"^\s*n\s+(?=[A-Za-z])", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"^\s*n\s+(?=[A-Za-z])",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+
     text = re.sub(r"\s*:\s*-\s*", " ", text)
     text = re.sub(r"\s+", " ", text)
 
@@ -138,19 +197,30 @@ MARKET_PATTERN = re.compile(
 
 
 def canonical_prefix(value):
-    return re.sub(r"\s+", "", str(value or "").upper())
+    return re.sub(
+        r"\s+",
+        "",
+        str(value or "").upper(),
+    )
 
 
 def clean_pdf_artifact_prefix(text):
     text = str(text or "")
-    text = re.sub(r"^\s*n\s+", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"^\s*n\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
     return text.strip()
 
 
 def remove_leading_market_prefix(text):
     text = clean_pdf_artifact_prefix(text)
+
     return re.sub(
-        r"^(?:US|CA|MX|CR/EC/GT/PA/SV|CR/EC/GT/MX/PA/SV|USA|CANADA|MEXICO)\s*[:\-]\s*",
+        r"^(?:US|CA|MX|CR/EC/GT/PA/SV|CR/EC/GT/MX/PA/SV|USA|CANADA|MEXICO)"
+        r"\s*[:\-]\s*",
         "",
         text,
         flags=re.IGNORECASE,
@@ -159,9 +229,11 @@ def remove_leading_market_prefix(text):
 
 def expected_has_market_prefix(text):
     value = normalize_strict_text(text)
+
     return bool(
         re.match(
-            r"^(?:US|CA|MX|CR/EC/GT/PA/SV|CR/EC/GT/MX/PA/SV|USA|CANADA|MEXICO)\s*[:\-]",
+            r"^(?:US|CA|MX|CR/EC/GT/PA/SV|CR/EC/GT/MX/PA/SV|USA|CANADA|MEXICO)"
+            r"\s*[:\-]",
             value,
             flags=re.IGNORECASE,
         )
@@ -221,7 +293,12 @@ def get_field_type(field_name):
         return "SIZE"
 
     if (
-        compact in {"rn", "rnca", "rnnumber", "rnca_number"}
+        compact in {
+            "rn",
+            "rnca",
+            "rnnumber",
+            "rnca_number",
+        }
         or "registrationnumber" in compact
         or "companyrn" in compact
         or compact.startswith("rn")
@@ -252,7 +329,14 @@ def get_field_region(field_name):
     original = str(field_name or "").lower()
     compact = normalize_text(field_name).replace(" ", "")
 
-    if "mexico" in compact and ("_sp" in original or compact.endswith("sp") or "spanish" in compact):
+    if (
+        "mexico" in compact
+        and (
+            "_sp" in original
+            or compact.endswith("sp")
+            or "spanish" in compact
+        )
+    ):
         return "SP_MX"
 
     if "mexico" in compact:
@@ -261,10 +345,18 @@ def get_field_region(field_name):
     if "canada" in compact:
         return "CA"
 
-    if "_en" in original or compact.endswith("en") or "english" in compact:
+    if (
+        "_en" in original
+        or compact.endswith("en")
+        or "english" in compact
+    ):
         return "EN"
 
-    if "_fr" in original or compact.endswith("fr") or "french" in compact:
+    if (
+        "_fr" in original
+        or compact.endswith("fr")
+        or "french" in compact
+    ):
         return "FR"
 
     if (
@@ -279,22 +371,68 @@ def get_field_region(field_name):
 
 
 FIELD_ANCHORS = {
-    "COO": ["made in", "hecho en", "fabrique en"],
+    "COO": [
+        "made in",
+        "hecho en",
+        "fabrique en",
+    ],
     "CONTENT": [
-        "shell", "liner", "body", "fabric", "fiber", "fibre",
-        "content", "composition", "exterior", "extérieur",
-        "forro", "doublure", "cuerpo"
+        "shell",
+        "liner",
+        "body",
+        "fabric",
+        "fiber",
+        "fibre",
+        "content",
+        "composition",
+        "exterior",
+        "extérieur",
+        "forro",
+        "doublure",
+        "cuerpo",
     ],
     "CARE": [
-        "machine wash", "wash", "lavar", "laver", "dry clean",
-        "bleach", "blanchiment", "detergent", "detergente"
+        "machine wash",
+        "wash",
+        "lavar",
+        "laver",
+        "dry clean",
+        "bleach",
+        "blanchiment",
+        "detergent",
+        "detergente",
     ],
-    "RN": ["rn", "ca", "registration number"],
-    "SIZE": ["size", "oz", "ounce", "waist", "inseam"],
-    "COLOR": ["color", "colour"],
-    "BRAND": ["brand"],
-    "GENDER": ["girls", "boys", "women", "men", "unisex"],
-    "ATTRIBUTE": ["attribute", "technology", "feature"],
+    "RN": [
+        "rn",
+        "ca",
+        "registration number",
+    ],
+    "SIZE": [
+        "size",
+        "oz",
+        "ounce",
+        "waist",
+        "inseam",
+    ],
+    "COLOR": [
+        "color",
+        "colour",
+    ],
+    "BRAND": [
+        "brand",
+    ],
+    "GENDER": [
+        "girls",
+        "boys",
+        "women",
+        "men",
+        "unisex",
+    ],
+    "ATTRIBUTE": [
+        "attribute",
+        "technology",
+        "feature",
+    ],
     "GENERAL": [],
 }
 
@@ -305,22 +443,44 @@ FIELD_ANCHORS = {
 
 def load_excel(file):
     file.seek(0)
-    df = pd.read_excel(file, header=0)
-    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    df.columns = [str(c).strip() for c in df.columns]
+
+    df = pd.read_excel(
+        file,
+        header=0,
+    )
+
+    df = (
+        df
+        .dropna(axis=0, how="all")
+        .dropna(axis=1, how="all")
+    )
+
+    df.columns = [
+        str(c).strip()
+        for c in df.columns
+    ]
+
     return df
 
 
 def load_pdf(file):
     file.seek(0)
-    document = fitz.open(stream=file.read(), filetype="pdf")
+
+    document = fitz.open(
+        stream=file.read(),
+        filetype="pdf",
+    )
+
     pages = []
+
     for page_number, page in enumerate(document):
         pages.append({
             "page": page_number + 1,
             "text": page.get_text("text"),
         })
+
     document.close()
+
     return pages
 
 
@@ -331,8 +491,15 @@ def load_pdf(file):
 def clean_pdf_line(line):
     if not line:
         return ""
+
     line = str(line).strip()
-    line = re.sub(r"^\s*n\s+(?=[A-Za-z])", "", line)
+
+    line = re.sub(
+        r"^\s*n\s+(?=[A-Za-z])",
+        "",
+        line,
+    )
+
     return line.strip()
 
 
@@ -350,23 +517,42 @@ def panel_number_from_line(line):
         return None
 
     number = int(match.group(1))
+
     return number if 1 <= number <= 99 else None
 
 
 def reorder_pfl_lines(page_text):
-    lines = [clean_pdf_line(x) for x in str(page_text or "").splitlines()]
-    lines = [x for x in lines if x and len(x) <= 1500]
+    lines = [
+        clean_pdf_line(x)
+        for x in str(page_text or "").splitlines()
+    ]
+
+    lines = [
+        x
+        for x in lines
+        if x and len(x) <= 1500
+    ]
 
     if not lines:
         return []
 
     markers = []
+
     for i, line in enumerate(lines):
         n = panel_number_from_line(line)
-        if n is not None:
-            markers.append({"index": i, "number": n})
 
-    distinct = list(dict.fromkeys(m["number"] for m in markers))
+        if n is not None:
+            markers.append({
+                "index": i,
+                "number": n,
+            })
+
+    distinct = list(
+        dict.fromkeys(
+            m["number"]
+            for m in markers
+        )
+    )
 
     if (
         len(distinct) < 2
@@ -376,30 +562,62 @@ def reorder_pfl_lines(page_text):
         return lines
 
     segments = []
-    number_is_above = markers[0]["index"] <= 1
+
+    number_is_above = (
+        markers[0]["index"] <= 1
+    )
 
     if number_is_above:
         for pos, marker in enumerate(markers):
             start = marker["index"] + 1
-            end = markers[pos + 1]["index"] if pos + 1 < len(markers) else len(lines)
+
+            end = (
+                markers[pos + 1]["index"]
+                if pos + 1 < len(markers)
+                else len(lines)
+            )
+
             if start < end:
-                segments.append((marker["number"], lines[start:end]))
+                segments.append(
+                    (
+                        marker["number"],
+                        lines[start:end],
+                    )
+                )
+
     else:
         start = 0
+
         for marker in markers:
             end = marker["index"]
+
             if start < end:
-                segments.append((marker["number"], lines[start:end]))
+                segments.append(
+                    (
+                        marker["number"],
+                        lines[start:end],
+                    )
+                )
+
             start = marker["index"] + 1
+
         if start < len(lines):
-            segments.append((999999, lines[start:]))
+            segments.append(
+                (
+                    999999,
+                    lines[start:],
+                )
+            )
 
     if not segments:
         return lines
 
-    segments.sort(key=lambda x: x[0])
+    segments.sort(
+        key=lambda x: x[0]
+    )
 
     output = []
+
     for _, segment in segments:
         output.extend(segment)
 
@@ -407,8 +625,16 @@ def reorder_pfl_lines(page_text):
 
 
 def create_standard_blocks(page_text):
-    lines = [clean_pdf_line(x) for x in str(page_text or "").splitlines()]
-    lines = [x for x in lines if x and len(x) <= 1500]
+    lines = [
+        clean_pdf_line(x)
+        for x in str(page_text or "").splitlines()
+    ]
+
+    lines = [
+        x
+        for x in lines
+        if x and len(x) <= 1500
+    ]
 
     blocks = []
 
@@ -422,10 +648,17 @@ def create_standard_blocks(page_text):
             "prefix": "",
         })
 
-    for size in range(2, min(8, len(lines)) + 1):
-        for i in range(len(lines) - size + 1):
+    for size in range(
+        2,
+        min(8, len(lines)) + 1,
+    ):
+        for i in range(
+            len(lines) - size + 1
+        ):
             blocks.append({
-                "text": " ".join(lines[i:i + size]),
+                "text": " ".join(
+                    lines[i:i + size]
+                ),
                 "start": i,
                 "end": i + size,
                 "source_id": f"STD:{i}:{i + size}",
@@ -452,11 +685,28 @@ def split_market_segments(lines):
         current = lines[i]
 
         if i + 1 < len(lines):
-            a = re.sub(r"\s+", "", current).upper()
-            b = re.sub(r"\s+", "", lines[i + 1]).upper()
+            a = re.sub(
+                r"\s+",
+                "",
+                current,
+            ).upper()
 
-            if a.endswith("CR/EC/GT/") and b.startswith("MX/PA/SV"):
-                current = current.rstrip() + " " + lines[i + 1].lstrip()
+            b = re.sub(
+                r"\s+",
+                "",
+                lines[i + 1],
+            ).upper()
+
+            if (
+                a.endswith("CR/EC/GT/")
+                and b.startswith("MX/PA/SV")
+            ):
+                current = (
+                    current.rstrip()
+                    + " "
+                    + lines[i + 1].lstrip()
+                )
+
                 i += 1
 
         merged.append(current)
@@ -465,18 +715,24 @@ def split_market_segments(lines):
     lines = merged
 
     segments = []
+
     current_prefix = ""
     current_parts = []
     current_start = None
     segment_no = 0
 
     def flush(end_line):
-        nonlocal current_prefix, current_parts, current_start, segment_no
+        nonlocal current_prefix
+        nonlocal current_parts
+        nonlocal current_start
+        nonlocal segment_no
 
         if not current_parts:
             return
 
-        text = " ".join(current_parts).strip()
+        text = " ".join(
+            current_parts
+        ).strip()
 
         text = re.split(
             r"\b(?:ACTUAL\s+OTHER\s+SIZES|1/1)\b",
@@ -486,10 +742,15 @@ def split_market_segments(lines):
 
         if text:
             segment_no += 1
+
             segments.append({
                 "prefix": current_prefix,
                 "text": text,
-                "start": current_start if current_start is not None else 0,
+                "start": (
+                    current_start
+                    if current_start is not None
+                    else 0
+                ),
                 "end": end_line,
                 "regional": bool(current_prefix),
                 "source_id": f"SEG:{segment_no}",
@@ -501,20 +762,26 @@ def split_market_segments(lines):
 
     for line_index, raw in enumerate(lines):
         work = clean_pdf_line(raw)
+
         if not work:
             continue
 
-        matches = list(MARKET_PATTERN.finditer(work))
+        matches = list(
+            MARKET_PATTERN.finditer(work)
+        )
 
         if not matches:
             if current_parts:
                 current_parts.append(work)
+
             continue
 
         cursor = 0
 
         for match in matches:
-            before = work[cursor:match.start()].strip()
+            before = work[
+                cursor:match.start()
+            ].strip()
 
             if before:
                 if current_parts:
@@ -529,20 +796,32 @@ def split_market_segments(lines):
                         "source_id": f"TXT:{line_index}:{len(segments)}",
                     })
 
-            flush(line_index + 1)
+            flush(
+                line_index + 1
+            )
 
-            current_prefix = match.group(1).upper().replace(" ", "")
+            current_prefix = (
+                match.group(1)
+                .upper()
+                .replace(" ", "")
+            )
+
             current_start = line_index
             current_parts = []
             cursor = match.end()
 
         tail = work[cursor:].strip()
+
         if tail:
             current_parts.append(tail)
 
     flush(len(lines))
 
-    return [x for x in segments if x["text"]]
+    return [
+        x
+        for x in segments
+        if x["text"]
+    ]
 
 
 def field_scoped_text(text, field_type):
@@ -555,8 +834,14 @@ def field_scoped_text(text, field_type):
 
     if field_type == "CONTENT":
         starts = [
-            "shell", "exterior", "extérieur", "cuerpo",
-            "body", "liner", "forro", "doublure"
+            "shell",
+            "exterior",
+            "extérieur",
+            "cuerpo",
+            "body",
+            "liner",
+            "forro",
+            "doublure",
         ]
 
         positions = [
@@ -626,8 +911,12 @@ def create_pfl_blocks(page_text):
     # -----------------------------------------------------
     # 1. Market-aware regions.
     # -----------------------------------------------------
+
     for segment in split_market_segments(lines):
-        for field_type in ("CONTENT", "CARE"):
+        for field_type in (
+            "CONTENT",
+            "CARE",
+        ):
             scoped = field_scoped_text(
                 segment["text"],
                 field_type,
@@ -636,9 +925,13 @@ def create_pfl_blocks(page_text):
             if not scoped:
                 continue
 
-            normalized = normalize_text(scoped)
+            normalized = normalize_text(
+                scoped
+            )
+
             anchor_found = any(
-                normalize_text(anchor) in normalized
+                normalize_text(anchor)
+                in normalized
                 for anchor in FIELD_ANCHORS[field_type]
             )
 
@@ -650,19 +943,34 @@ def create_pfl_blocks(page_text):
                 "text": scoped,
                 "start": segment["start"],
                 "end": segment["end"],
-                "regional": bool(segment.get("prefix")),
-                "source_id": f"{segment['source_id']}:{field_type}",
+                "regional": bool(
+                    segment.get("prefix")
+                ),
+                "source_id": (
+                    f"{segment['source_id']}:{field_type}"
+                ),
             })
 
     # -----------------------------------------------------
     # 2. Continuation windows.
     # -----------------------------------------------------
-    max_window = min(14, len(lines))
 
-    for size in range(1, max_window + 1):
-        for start_i in range(len(lines) - size + 1):
+    max_window = min(
+        14,
+        len(lines),
+    )
+
+    for size in range(
+        1,
+        max_window + 1,
+    ):
+        for start_i in range(
+            len(lines) - size + 1
+        ):
             text = " ".join(
-                lines[start_i:start_i + size]
+                lines[
+                    start_i:start_i + size
+                ]
             ).strip()
 
             if not text:
@@ -674,13 +982,18 @@ def create_pfl_blocks(page_text):
                 "start": start_i,
                 "end": start_i + size,
                 "regional": False,
-                "source_id": f"WIN:{start_i}:{start_i + size}",
+                "source_id": (
+                    f"WIN:{start_i}:{start_i + size}"
+                ),
             })
 
     # -----------------------------------------------------
     # 3. Full PFL sequence.
     # -----------------------------------------------------
-    full_sequence = " ".join(lines).strip()
+
+    full_sequence = " ".join(
+        lines
+    ).strip()
 
     if full_sequence:
         blocks.append({
@@ -698,10 +1011,15 @@ def create_pfl_blocks(page_text):
 
     for block in blocks:
         key = (
-            normalize_text(block["text"]),
+            normalize_text(
+                block["text"]
+            ),
             block["start"],
             block["end"],
-            block.get("source_id", ""),
+            block.get(
+                "source_id",
+                "",
+            ),
         )
 
         if key in seen:
@@ -719,51 +1037,99 @@ def create_pfl_blocks(page_text):
 
 def contains_rn(text):
     n = normalize_text(text)
+
     return bool(
-        re.search(r"\brn\s*\d{3,}\b", n)
-        or re.search(r"\bca\s*\d{3,}\b", n)
-        or re.search(r"\bregistration\s+number\s*\d+", n)
+        re.search(
+            r"\brn\s*\d{3,}\b",
+            n,
+        )
+        or re.search(
+            r"\bca\s*\d{3,}\b",
+            n,
+        )
+        or re.search(
+            r"\bregistration\s+number\s*\d+",
+            n,
+        )
     )
 
 
 def contains_size_signal(text):
     n = normalize_text(text)
+
     return bool(
         re.search(
             r"\b(?:xxxs|xxs|xs|s|m|l|xl|xxl|xxxl|tp|ttg|eeg|tg|eg|ch|p|g|ech)\b",
             n,
         )
-        or re.search(r"\bsize\b", n)
-        or re.search(r"\b\d+(?:\.\d+)?\s*oz\b", n)
-        or re.search(r"\b\d{2,3}/\d{2,3}\b", n)
-        or re.search(r"\b(?:waist|inseam)\s*\d+", n)
+        or re.search(
+            r"\bsize\b",
+            n,
+        )
+        or re.search(
+            r"\b\d+(?:\.\d+)?\s*oz\b",
+            n,
+        )
+        or re.search(
+            r"\b\d{2,3}/\d{2,3}\b",
+            n,
+        )
+        or re.search(
+            r"\b(?:waist|inseam)\s*\d+",
+            n,
+        )
     )
 
 
 def contains_coo(text):
     n = normalize_text(text)
+
     return any(
         x in n
-        for x in ["made in", "hecho en", "fabrique en"]
+        for x in [
+            "made in",
+            "hecho en",
+            "fabrique en",
+        ]
     )
 
 
 def candidate_market_ok(field_name, block):
     field_type = get_field_type(field_name)
     region = get_field_region(field_name)
-    prefix = canonical_prefix(block.get("prefix", ""))
+    prefix = canonical_prefix(
+        block.get("prefix", "")
+    )
 
-    if field_type not in {"CONTENT", "CARE"} or not region:
+    if (
+        field_type not in {
+            "CONTENT",
+            "CARE",
+        }
+        or not region
+    ):
         return True
 
     if region == "EN":
-        return prefix in {"US", ""}
+        return prefix in {
+            "US",
+            "",
+        }
 
-    if region in {"FR", "CA"}:
-        return prefix in {"CA", ""}
+    if region in {
+        "FR",
+        "CA",
+    }:
+        return prefix in {
+            "CA",
+            "",
+        }
 
     if region == "MX":
-        return prefix in {"MX", ""}
+        return prefix in {
+            "MX",
+            "",
+        }
 
     if region == "SP_MX":
         return prefix in {
@@ -787,9 +1153,13 @@ def candidate_market_ok(field_name, block):
 def field_anchor_hit(field_name, text):
     field_type = get_field_type(field_name)
     n = normalize_text(text)
+
     return any(
         normalize_text(a) in n
-        for a in FIELD_ANCHORS.get(field_type, [])
+        for a in FIELD_ANCHORS.get(
+            field_type,
+            [],
+        )
     )
 
 
@@ -801,12 +1171,17 @@ def block_allowed_for_field(field_name, block):
     if not n:
         return False
 
-    if not candidate_market_ok(field_name, block):
+    if not candidate_market_ok(
+        field_name,
+        block,
+    ):
         return False
 
     if field_type == "SIZE":
-        # Never use RN/CA identifiers for a size field.
-        return not contains_rn(text) and contains_size_signal(text)
+        return (
+            not contains_rn(text)
+            and contains_size_signal(text)
+        )
 
     if field_type == "RN":
         return contains_rn(text)
@@ -815,16 +1190,30 @@ def block_allowed_for_field(field_name, block):
         return contains_coo(text)
 
     if field_type == "CONTENT":
-        if contains_rn(text) or contains_coo(text):
+        if (
+            contains_rn(text)
+            or contains_coo(text)
+        ):
             return False
-        return any(
-            normalize_text(a) in n
-            for a in FIELD_ANCHORS["CONTENT"]
-        ) or token_coverage(field_name, text) > 0
+
+        return (
+            any(
+                normalize_text(a) in n
+                for a in FIELD_ANCHORS["CONTENT"]
+            )
+            or token_coverage(
+                field_name,
+                text,
+            ) > 0
+        )
 
     if field_type == "CARE":
-        if contains_rn(text) or contains_coo(text):
+        if (
+            contains_rn(text)
+            or contains_coo(text)
+        ):
             return False
+
         return any(
             normalize_text(a) in n
             for a in FIELD_ANCHORS["CARE"]
@@ -838,27 +1227,43 @@ def block_allowed_for_field(field_name, block):
 # =========================================================
 
 def token_coverage(expected, actual):
-    expected_tokens = set(tokenize(expected))
-    actual_tokens = set(tokenize(actual))
+    expected_tokens = set(
+        tokenize(expected)
+    )
+
+    actual_tokens = set(
+        tokenize(actual)
+    )
 
     if not expected_tokens:
         return 0.0
 
-    return len(expected_tokens & actual_tokens) / len(expected_tokens)
+    return (
+        len(
+            expected_tokens & actual_tokens
+        )
+        / len(expected_tokens)
+    )
 
 
 def ordered_token_coverage(expected, actual):
     expected_tokens = tokenize(expected)
     actual_tokens = tokenize(actual)
 
-    if not expected_tokens or not actual_tokens:
+    if (
+        not expected_tokens
+        or not actual_tokens
+    ):
         return 0.0
 
     pos = 0
     hits = 0
 
     for token in expected_tokens:
-        for j in range(pos, len(actual_tokens)):
+        for j in range(
+            pos,
+            len(actual_tokens),
+        ):
             if token == actual_tokens[j]:
                 hits += 1
                 pos = j + 1
@@ -867,51 +1272,103 @@ def ordered_token_coverage(expected, actual):
     return hits / len(expected_tokens)
 
 
-def score_block(expected, block, field_name):
-    actual = remove_leading_market_prefix(block["text"])
+def score_block(
+    expected,
+    block,
+    field_name,
+):
+    actual = remove_leading_market_prefix(
+        block["text"]
+    )
+
     en = normalize_text(expected)
     an = normalize_text(actual)
 
     if not en or not an:
         return 0.0, 0.0, 0.0
 
-    coverage = token_coverage(expected, actual)
-    ordered = ordered_token_coverage(expected, actual)
-    ratio = fuzz.ratio(en, an)
-    partial = fuzz.partial_ratio(en, an)
-    token_ratio = fuzz.token_set_ratio(en, an)
+    coverage = token_coverage(
+        expected,
+        actual,
+    )
 
-    field_type = get_field_type(field_name)
+    ordered = ordered_token_coverage(
+        expected,
+        actual,
+    )
+
+    ratio = fuzz.ratio(
+        en,
+        an,
+    )
+
+    partial = fuzz.partial_ratio(
+        en,
+        an,
+    )
+
+    token_ratio = fuzz.token_set_ratio(
+        en,
+        an,
+    )
+
+    field_type = get_field_type(
+        field_name
+    )
 
     anchor_bonus = 0
-    for anchor in FIELD_ANCHORS.get(field_type, []):
+
+    for anchor in FIELD_ANCHORS.get(
+        field_type,
+        [],
+    ):
         if normalize_text(anchor) in an:
             anchor_bonus = 12
             break
 
     region_bonus = 0
-    region = get_field_region(field_name)
-    prefix = canonical_prefix(block.get("prefix", ""))
 
-    if region == "EN" and prefix == "US":
+    region = get_field_region(
+        field_name
+    )
+
+    prefix = canonical_prefix(
+        block.get("prefix", "")
+    )
+
+    if (
+        region == "EN"
+        and prefix == "US"
+    ):
         region_bonus = 18
-    elif region in {"FR", "CA"} and prefix == "CA":
+
+    elif (
+        region in {"FR", "CA"}
+        and prefix == "CA"
+    ):
         region_bonus = 18
-    elif region == "MX" and prefix in {
-        "MX",
-        "CR/EC/GT/MX/PA/SV",
-        "CR/EC/GT/PA/SV",
-    }:
+
+    elif (
+        region == "MX"
+        and prefix in {
+            "MX",
+            "CR/EC/GT/MX/PA/SV",
+            "CR/EC/GT/PA/SV",
+        }
+    ):
         region_bonus = 18
-    elif region in {"SP", "SP_MX"} and prefix in {
-        "CR/EC/GT/MX/PA/SV",
-        "CR/EC/GT/PA/SV",
-        "MX",
-    }:
+
+    elif (
+        region in {"SP", "SP_MX"}
+        and prefix in {
+            "CR/EC/GT/MX/PA/SV",
+            "CR/EC/GT/PA/SV",
+            "MX",
+        }
+    ):
         region_bonus = 14
 
-    # Coverage is intentionally dominant so a short fragment cannot
-    # beat a complete continuation sequence.
+    # Coverage is intentionally dominant.
     score = (
         coverage * 60
         + ordered * 18
@@ -921,110 +1378,248 @@ def score_block(expected, block, field_name):
         + region_bonus
     )
 
-    expected_len = max(1, len(tokenize(expected)))
-    actual_len = max(1, len(tokenize(actual)))
-    size_ratio = min(expected_len, actual_len) / max(expected_len, actual_len)
+    expected_len = max(
+        1,
+        len(
+            tokenize(expected)
+        ),
+    )
+
+    actual_len = max(
+        1,
+        len(
+            tokenize(actual)
+        ),
+    )
+
+    size_ratio = (
+        min(
+            expected_len,
+            actual_len,
+        )
+        / max(
+            expected_len,
+            actual_len,
+        )
+    )
+
     score += size_ratio * 8
 
-    return score, coverage, ordered
+    return (
+        score,
+        coverage,
+        ordered,
+    )
 
 
 # =========================================================
 # CANDIDATE SELECTION
 # =========================================================
 
-def preferred_market_pool(field_name, pdf_blocks):
-    field_type = get_field_type(field_name)
-    region = get_field_region(field_name)
+def preferred_market_pool(
+    field_name,
+    pdf_blocks,
+):
+    field_type = get_field_type(
+        field_name
+    )
 
-    if field_type not in {"CONTENT", "CARE"} or not region:
+    region = get_field_region(
+        field_name
+    )
+
+    if (
+        field_type not in {
+            "CONTENT",
+            "CARE",
+        }
+        or not region
+    ):
         return pdf_blocks
 
     exact = []
 
     for block in pdf_blocks:
-        prefix = canonical_prefix(block.get("prefix", ""))
+        prefix = canonical_prefix(
+            block.get("prefix", "")
+        )
 
-        if region == "EN" and prefix == "US":
-            exact.append(block)
-        elif region in {"FR", "CA"} and prefix == "CA":
-            exact.append(block)
-        elif region == "MX" and prefix == "MX":
-            exact.append(block)
-        elif region == "SP_MX" and prefix in {
-            "CR/EC/GT/MX/PA/SV",
-            "CR/EC/GT/PA/SV",
-        }:
-            exact.append(block)
-        elif region == "SP" and prefix in {
-            "CR/EC/GT/MX/PA/SV",
-            "CR/EC/GT/PA/SV",
-            "MX",
-        }:
+        if (
+            region == "EN"
+            and prefix == "US"
+        ):
             exact.append(block)
 
-    return exact if exact else pdf_blocks
+        elif (
+            region in {"FR", "CA"}
+            and prefix == "CA"
+        ):
+            exact.append(block)
+
+        elif (
+            region == "MX"
+            and prefix == "MX"
+        ):
+            exact.append(block)
+
+        elif (
+            region == "SP_MX"
+            and prefix in {
+                "CR/EC/GT/MX/PA/SV",
+                "CR/EC/GT/PA/SV",
+            }
+        ):
+            exact.append(block)
+
+        elif (
+            region == "SP"
+            and prefix in {
+                "CR/EC/GT/MX/PA/SV",
+                "CR/EC/GT/PA/SV",
+                "MX",
+            }
+        ):
+            exact.append(block)
+
+    return (
+        exact
+        if exact
+        else pdf_blocks
+    )
 
 
-def source_overlaps_used(block, used_sources):
-    source_id = block.get("source_id", "")
+def source_overlaps_used(
+    block,
+    used_sources,
+):
+    source_id = block.get(
+        "source_id",
+        "",
+    )
+
     if source_id in used_sources:
         return True
 
-    start = block.get("start", 0)
-    end = block.get("end", 0)
+    start = block.get(
+        "start",
+        0,
+    )
+
+    end = block.get(
+        "end",
+        0,
+    )
 
     for used in used_sources:
-        if not isinstance(used, tuple):
+        if not isinstance(
+            used,
+            tuple,
+        ):
             continue
+
         used_start, used_end = used
-        if start < used_end and end > used_start:
+
+        if (
+            start < used_end
+            and end > used_start
+        ):
             return True
 
     return False
 
 
-def lock_block_sources(blocks, used_sources):
+def lock_block_sources(
+    blocks,
+    used_sources,
+):
     for block in blocks:
-        source_id = block.get("source_id", "")
+        source_id = block.get(
+            "source_id",
+            "",
+        )
+
         if source_id:
-            used_sources.add(source_id)
+            used_sources.add(
+                source_id
+            )
 
         used_sources.add(
             (
-                block.get("start", 0),
-                block.get("end", 0),
+                block.get(
+                    "start",
+                    0,
+                ),
+                block.get(
+                    "end",
+                    0,
+                ),
             )
         )
 
 
-def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
-    field_type = get_field_type(field_name)
-    region = get_field_region(field_name)
+def choose_pfl_candidate(
+    expected,
+    pdf_blocks,
+    field_name,
+    used_sources,
+):
+    field_type = get_field_type(
+        field_name
+    )
+
+    region = get_field_region(
+        field_name
+    )
 
     def available(block):
-        if not block_allowed_for_field(field_name, block):
+        if not block_allowed_for_field(
+            field_name,
+            block,
+        ):
             return False
-        return not source_overlaps_used(block, used_sources)
+
+        return not source_overlaps_used(
+            block,
+            used_sources,
+        )
 
     preferred = preferred_market_pool(
         field_name,
         pdf_blocks,
     )
 
-    base = [b for b in preferred if available(b)]
+    base = [
+        b
+        for b in preferred
+        if available(b)
+    ]
 
     if not base:
         base = [
-            b for b in pdf_blocks
+            b
+            for b in pdf_blocks
             if available(b)
         ]
 
-    if field_type in {"CONTENT", "CARE"} and region:
+    if (
+        field_type in {
+            "CONTENT",
+            "CARE",
+        }
+        and region
+    ):
         regional = [
-            b for b in base
-            if b.get("regional") and candidate_market_ok(field_name, b)
+            b
+            for b in base
+            if (
+                b.get("regional")
+                and candidate_market_ok(
+                    field_name,
+                    b,
+                )
+            )
         ]
+
         if regional:
             base = regional
 
@@ -1047,20 +1642,26 @@ def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
         )
 
     scored.sort(
-        key=lambda x: (x[0], x[1], x[2]),
+        key=lambda x: (
+            x[0],
+            x[1],
+            x[2],
+        ),
         reverse=True,
     )
 
     if not scored:
         return None
 
-    # -----------------------------------------------------
-    # First candidate.
-    # -----------------------------------------------------
-    first_coverage, first_ordered, first_score, first_block = scored[0]
+    first_coverage = scored[0][0]
+    first_ordered = scored[0][1]
+    first_score = scored[0][2]
+    first_block = scored[0][3]
 
     best = {
-        "blocks": [first_block],
+        "blocks": [
+            first_block
+        ],
         "score": first_score,
         "coverage": first_coverage,
         "ordered": first_ordered,
@@ -1069,11 +1670,27 @@ def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
     # -----------------------------------------------------
     # Continuation search for CONTENT/CARE.
     # -----------------------------------------------------
-    if field_type in {"CONTENT", "CARE"}:
-        expected_len = max(1, len(tokenize(expected)))
+
+    if field_type in {
+        "CONTENT",
+        "CARE",
+    }:
+        expected_len = max(
+            1,
+            len(
+                tokenize(expected)
+            ),
+        )
+
         actual_len = max(
             1,
-            len(tokenize(remove_leading_market_prefix(first_block["text"])))
+            len(
+                tokenize(
+                    remove_leading_market_prefix(
+                        first_block["text"]
+                    )
+                )
+            ),
         )
 
         needs_continuation = (
@@ -1083,47 +1700,93 @@ def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
         )
 
         if needs_continuation:
-            # Use top regional seeds plus nearby/anchored continuation lines.
-            seeds = [entry[3] for entry in scored[:15]]
+            seeds = [
+                entry[3]
+                for entry in scored[:15]
+            ]
 
             continuation_pool = []
+
             for candidate in pdf_blocks:
                 if not available(candidate):
                     continue
+
                 if candidate.get("regional"):
                     continue
-                if not field_anchor_hit(field_name, candidate["text"]):
-                    continue
-                continuation_pool.append(candidate)
 
-            # Prefer continuation candidates with expected-token overlap.
+                if not field_anchor_hit(
+                    field_name,
+                    candidate["text"],
+                ):
+                    continue
+
+                continuation_pool.append(
+                    candidate
+                )
+
             continuation_pool.sort(
                 key=lambda b: (
                     token_coverage(
                         expected,
-                        remove_leading_market_prefix(b["text"]),
+                        remove_leading_market_prefix(
+                            b["text"]
+                        ),
                     ),
                     -abs(
-                        b.get("start", 0)
-                        - first_block.get("end", 0)
+                        b.get(
+                            "start",
+                            0,
+                        )
+                        - first_block.get(
+                            "end",
+                            0,
+                        )
                     ),
                 ),
                 reverse=True,
             )
 
-            continuation_pool = continuation_pool[:30]
+            continuation_pool = (
+                continuation_pool[:30]
+            )
 
             for seed in seeds:
-                seed_text = remove_leading_market_prefix(seed["text"])
+                seed_text = remove_leading_market_prefix(
+                    seed["text"]
+                )
 
                 for extra in continuation_pool:
-                    if extra.get("source_id") == seed.get("source_id"):
+                    if (
+                        extra.get(
+                            "source_id"
+                        )
+                        == seed.get(
+                            "source_id"
+                        )
+                    ):
                         continue
 
-                    # Strongly prefer genuinely adjacent or nearby continuation.
                     distance = min(
-                        abs(extra.get("start", 0) - seed.get("end", 0)),
-                        abs(extra.get("end", 0) - seed.get("start", 0)),
+                        abs(
+                            extra.get(
+                                "start",
+                                0,
+                            )
+                            - seed.get(
+                                "end",
+                                0,
+                            )
+                        ),
+                        abs(
+                            extra.get(
+                                "end",
+                                0,
+                            )
+                            - seed.get(
+                                "start",
+                                0,
+                            )
+                        ),
                     )
 
                     if distance > 12:
@@ -1134,41 +1797,76 @@ def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
                     )
 
                     combined_text = (
-                        seed_text + " " + extra_text
+                        seed_text
+                        + " "
+                        + extra_text
                     ).strip()
 
                     combined_block = {
-                        "prefix": seed.get("prefix", ""),
+                        "prefix": seed.get(
+                            "prefix",
+                            "",
+                        ),
                         "text": combined_text,
                         "start": min(
-                            seed.get("start", 0),
-                            extra.get("start", 0),
+                            seed.get(
+                                "start",
+                                0,
+                            ),
+                            extra.get(
+                                "start",
+                                0,
+                            ),
                         ),
                         "end": max(
-                            seed.get("end", 0),
-                            extra.get("end", 0),
+                            seed.get(
+                                "end",
+                                0,
+                            ),
+                            extra.get(
+                                "end",
+                                0,
+                            ),
                         ),
-                        "regional": bool(seed.get("regional")),
+                        "regional": bool(
+                            seed.get(
+                                "regional"
+                            )
+                        ),
                     }
 
-                    combined_score, combined_coverage, combined_ordered = score_block(
+                    (
+                        combined_score,
+                        combined_coverage,
+                        combined_ordered,
+                    ) = score_block(
                         expected,
                         combined_block,
                         field_name,
                     )
 
-                    # A continuation must genuinely improve expected coverage.
                     if combined_coverage < max(
                         first_coverage,
-                        token_coverage(expected, extra_text),
+                        token_coverage(
+                            expected,
+                            extra_text,
+                        ),
                     ) + 0.08:
                         continue
 
-                    combined_score += combined_coverage * 20
+                    combined_score += (
+                        combined_coverage * 20
+                    )
 
-                    if combined_score > best["score"]:
+                    if (
+                        combined_score
+                        > best["score"]
+                    ):
                         best = {
-                            "blocks": [seed, extra],
+                            "blocks": [
+                                seed,
+                                extra,
+                            ],
                             "score": combined_score,
                             "coverage": combined_coverage,
                             "ordered": combined_ordered,
@@ -1182,14 +1880,24 @@ def choose_pfl_candidate(expected, pdf_blocks, field_name, used_sources):
 # =========================================================
 
 def strict_compare(expected, actual):
-    expected_strict = normalize_strict_text(expected)
-    actual_strict = normalize_strict_text(actual)
+    expected_strict = normalize_strict_text(
+        expected
+    )
+
+    actual_strict = normalize_strict_text(
+        actual
+    )
 
     if expected_strict == actual_strict:
         return True, "—"
 
-    expected_tokens = expected_strict.split()
-    actual_tokens = actual_strict.split()
+    expected_tokens = (
+        expected_strict.split()
+    )
+
+    actual_tokens = (
+        actual_strict.split()
+    )
 
     matcher = SequenceMatcher(
         None,
@@ -1203,23 +1911,36 @@ def strict_compare(expected, actual):
         if tag == "equal":
             continue
 
-        expected_part = " ".join(expected_tokens[a1:a2])
-        actual_part = " ".join(actual_tokens[b1:b2])
+        expected_part = " ".join(
+            expected_tokens[a1:a2]
+        )
+
+        actual_part = " ".join(
+            actual_tokens[b1:b2]
+        )
 
         if tag == "replace":
             differences.append(
                 f"{expected_part} → {actual_part}"
             )
+
         elif tag == "delete":
             differences.append(
                 f"Missing from PDF: {expected_part}"
             )
+
         elif tag == "insert":
             differences.append(
                 f"Extra in PDF: {actual_part}"
             )
 
-    return False, "; ".join(differences[:12]) or "Text differs."
+    return (
+        False,
+        "; ".join(
+            differences[:12]
+        )
+        or "Text differs.",
+    )
 
 
 # =========================================================
@@ -1233,18 +1954,26 @@ def check_field(
     product_type,
     used_sources,
 ):
-    if expected is None or str(expected).strip() == "":
+    if (
+        expected is None
+        or str(expected).strip() == ""
+    ):
         return {
             "status": "SKIP",
             "pdf": "—",
-            "difference": "No variable data in Order Form.",
+            "difference": (
+                "No variable data in Order Form."
+            ),
         }
 
-    expected = str(expected).strip()
+    expected = str(
+        expected
+    ).strip()
 
     # =====================================================
     # PFL
     # =====================================================
+
     if product_type == "PFL":
         chosen = choose_pfl_candidate(
             expected,
@@ -1257,20 +1986,26 @@ def check_field(
             return {
                 "status": "NOT FOUND",
                 "pdf": "Not found in relevant PDF area",
-                "difference": "Selected variable value was not detected.",
+                "difference": (
+                    "Selected variable value was not detected."
+                ),
             }
 
         blocks = chosen["blocks"]
 
-        # Respect the Order Form's own market prefix when explicitly present.
-        if expected_has_market_prefix(expected):
+        if expected_has_market_prefix(
+            expected
+        ):
             actual = " ".join(
                 b["text"]
                 for b in blocks
             ).strip()
+
         else:
             actual = " ".join(
-                remove_leading_market_prefix(b["text"])
+                remove_leading_market_prefix(
+                    b["text"]
+                )
                 for b in blocks
             ).strip()
 
@@ -1279,31 +2014,48 @@ def check_field(
             actual,
         )
 
-        # Known extraction separator :- is intentionally treated as layout
-        # noise only for the normalized fallback.
         if not passed:
-            if normalize_text(expected) == normalize_text(actual):
+            if (
+                normalize_text(
+                    expected
+                )
+                == normalize_text(
+                    actual
+                )
+            ):
                 passed = True
                 diff = "—"
 
-        # Lock the actual source regions so the same content is not reused.
         lock_block_sources(
             blocks,
             used_sources,
         )
 
         return {
-            "status": "PASS" if passed else "FAIL",
+            "status": (
+                "PASS"
+                if passed
+                else "FAIL"
+            ),
             "pdf": actual,
-            "difference": "—" if passed else diff,
+            "difference": (
+                "—"
+                if passed
+                else diff
+            ),
         }
 
     # =====================================================
     # STANDARD / HTL / OTHER
     # =====================================================
+
     allowed = [
-        b for b in pdf_blocks
-        if block_allowed_for_field(field_name, b)
+        b
+        for b in pdf_blocks
+        if block_allowed_for_field(
+            field_name,
+            b,
+        )
     ]
 
     if not allowed:
@@ -1316,17 +2068,26 @@ def check_field(
             block["text"]
         )
 
-        if normalize_text(expected) in normalize_text(actual):
+        if (
+            normalize_text(expected)
+            in normalize_text(actual)
+        ):
             candidate = {
                 "score": 100,
                 "block": block,
             }
+
         else:
-            score, coverage, _ = score_block(
+            (
+                score,
+                coverage,
+                _,
+            ) = score_block(
                 expected,
                 block,
                 field_name,
             )
+
             candidate = {
                 "score": score,
                 "coverage": coverage,
@@ -1335,23 +2096,33 @@ def check_field(
 
         if (
             best is None
-            or candidate["score"] > best["score"]
+            or candidate["score"]
+            > best["score"]
         ):
             best = candidate
 
     if best is None:
         return {
             "status": "NOT FOUND",
-            "pdf": "Not found in relevant PDF area",
-            "difference": "Selected variable value was not detected.",
+            "pdf": (
+                "Not found in relevant PDF area"
+            ),
+            "difference": (
+                "Selected variable value was not detected."
+            ),
         }
 
     actual = best["block"]["text"]
-    actual_clean = remove_leading_market_prefix(actual)
+
+    actual_clean = remove_leading_market_prefix(
+        actual
+    )
 
     if (
-        normalize_text(expected) == normalize_text(actual_clean)
-        or normalize_text(expected) in normalize_text(actual_clean)
+        normalize_text(expected)
+        == normalize_text(actual_clean)
+        or normalize_text(expected)
+        in normalize_text(actual_clean)
     ):
         return {
             "status": "PASS",
@@ -1375,7 +2146,12 @@ def check_field(
 
 def get_difference(expected, actual):
     exp = tokenize(expected)
-    act = tokenize(remove_leading_market_prefix(actual))
+
+    act = tokenize(
+        remove_leading_market_prefix(
+            actual
+        )
+    )
 
     matcher = SequenceMatcher(
         None,
@@ -1389,23 +2165,35 @@ def get_difference(expected, actual):
         if tag == "equal":
             continue
 
-        expected_part = " ".join(exp[a1:a2])
-        actual_part = " ".join(act[b1:b2])
+        expected_part = " ".join(
+            exp[a1:a2]
+        )
+
+        actual_part = " ".join(
+            act[b1:b2]
+        )
 
         if tag == "replace":
             differences.append(
                 f"{expected_part} → {actual_part}"
             )
+
         elif tag == "delete":
             differences.append(
                 f"Missing: {expected_part}"
             )
+
         elif tag == "insert":
             differences.append(
                 f"Extra: {actual_part}"
             )
 
-    return "; ".join(differences[:12]) or "Content differs."
+    return (
+        "; ".join(
+            differences[:12]
+        )
+        or "Content differs."
+    )
 
 
 # =========================================================
@@ -1421,7 +2209,9 @@ def build_report(
     results = []
     field_no = 1
 
-    for page_index, page in enumerate(pdf_pages):
+    for page_index, page in enumerate(
+        pdf_pages
+    ):
         excel_index = page_index
 
         if excel_index >= len(df):
@@ -1432,25 +2222,39 @@ def build_report(
                     "EXCEL ROW": "N/A",
                     "FIELD": field,
                     "ORDER FORM DATA": "No Excel row",
-                    "PDF OUTPUT": "No corresponding Order Form row",
+                    "PDF OUTPUT": (
+                        "No corresponding Order Form row"
+                    ),
                     "STATUS": "NOT FOUND",
-                    "DIFFERENCE": "No corresponding Excel row.",
+                    "DIFFERENCE": (
+                        "No corresponding Excel row."
+                    ),
                 })
+
                 field_no += 1
+
             continue
 
         row = df.iloc[excel_index]
 
         if product_type == "PFL":
-            pdf_blocks = create_pfl_blocks(page["text"])
-        else:
-            pdf_blocks = create_standard_blocks(page["text"])
+            pdf_blocks = create_pfl_blocks(
+                page["text"]
+            )
 
-        # Each actual PDF source region can be assigned once on the page.
+        else:
+            pdf_blocks = create_standard_blocks(
+                page["text"]
+            )
+
         used_sources = set()
 
         for field in selected_fields:
-            value = "" if pd.isna(row[field]) else str(row[field]).strip()
+            value = (
+                ""
+                if pd.isna(row[field])
+                else str(row[field]).strip()
+            )
 
             if not value:
                 results.append({
@@ -1461,8 +2265,11 @@ def build_report(
                     "ORDER FORM DATA": "",
                     "PDF OUTPUT": "—",
                     "STATUS": "SKIP",
-                    "DIFFERENCE": "Blank Order Form value — PDF content ignored.",
+                    "DIFFERENCE": (
+                        "Blank Order Form value — PDF content ignored."
+                    ),
                 })
+
                 field_no += 1
                 continue
 
@@ -1496,16 +2303,32 @@ def build_report(
 
 def style_status(value):
     if value == "PASS":
-        return "background-color:#238636;color:white;font-weight:bold;"
+        return (
+            "background-color:#238636;"
+            "color:white;"
+            "font-weight:bold;"
+        )
 
     if value == "FAIL":
-        return "background-color:#da3633;color:white;font-weight:bold;"
+        return (
+            "background-color:#da3633;"
+            "color:white;"
+            "font-weight:bold;"
+        )
 
     if value == "NOT FOUND":
-        return "background-color:#9e6a03;color:white;font-weight:bold;"
+        return (
+            "background-color:#9e6a03;"
+            "color:white;"
+            "font-weight:bold;"
+        )
 
     if value == "SKIP":
-        return "background-color:#555555;color:white;font-weight:bold;"
+        return (
+            "background-color:#555555;"
+            "color:white;"
+            "font-weight:bold;"
+        )
 
     return ""
 
@@ -1518,7 +2341,7 @@ def main():
     render_title()
 
     # ======================================================
-    # NEW START
+    # RESET / NEW START
     # ======================================================
 
     top_left, top_right = st.columns([7, 1])
@@ -1529,19 +2352,38 @@ def main():
             key="of_new_start",
             width="stretch",
         ):
-            # Incrementing the upload/selectbox widget keys forces Streamlit
-            # to create completely fresh widgets, so uploaded Excel/PDF files
-            # are also cleared.
+            # Increase reset ID so ALL widgets get new keys.
             st.session_state["of_reset_id"] += 1
-            st.session_state["of_product_type"] = "----- SELECT -----"
+
+            # Clear saved selections/results.
             st.session_state["of_selected_fields"] = []
             st.session_state["of_result"] = None
+
             st.rerun()
 
-    reset_id = st.session_state["of_reset_id"]
-    excel_upload_key = f"of_excel_upload_{reset_id}"
-    pdf_upload_key = f"of_pdf_upload_{reset_id}"
-    fields_key = f"of_selected_fields_{reset_id}"
+    # ======================================================
+    # RESET ID / UNIQUE WIDGET KEYS
+    # ======================================================
+
+    reset_id = st.session_state[
+        "of_reset_id"
+    ]
+
+    product_type_key = (
+        f"of_product_type_{reset_id}"
+    )
+
+    excel_upload_key = (
+        f"of_excel_upload_{reset_id}"
+    )
+
+    pdf_upload_key = (
+        f"of_pdf_upload_{reset_id}"
+    )
+
+    fields_key = (
+        f"of_selected_fields_{reset_id}"
+    )
 
     # ======================================================
     # PRODUCT TYPE
@@ -1559,31 +2401,27 @@ def main():
         "PFL",
     ]
 
-    current_type = st.session_state.get(
-        "of_product_type",
-        "----- SELECT -----",
-    )
-
-    if current_type not in product_types:
-        current_type = "----- SELECT -----"
-
     product_type = st.selectbox(
         "Product Type",
-        product_types,
-        index=product_types.index(current_type),
-        key="of_product_type",
+        options=product_types,
+        index=0,
+        key=product_type_key,
     )
 
     if product_type == "PFL":
         st.info(
             "PFL mode enabled — panel sequence, continuation and strict text comparison logic will be used."
         )
+
     elif product_type == "----- SELECT -----":
         st.warning(
             "⚠️ Please select a Product Type before running the comparison."
         )
+
     else:
-        st.caption("Standard comparison mode.")
+        st.caption(
+            "Standard comparison mode."
+        )
 
     # ======================================================
     # FILE UPLOADS
@@ -1618,7 +2456,10 @@ def main():
 
     if excel_file:
         try:
-            df = load_excel(excel_file)
+            df = load_excel(
+                excel_file
+            )
+
         except Exception as error:
             st.error(
                 f"Unable to read the Excel Order Form: {error}"
@@ -1648,15 +2489,14 @@ def main():
         selected_fields = st.multiselect(
             "Select fields to validate",
             options=excel_columns,
-            default=st.session_state.get(
-                "of_selected_fields",
-                [],
-            ),
+            default=[],
             key=fields_key,
         )
 
-        # Keep session state synchronized without using a fixed widget key.
-        st.session_state["of_selected_fields"] = selected_fields
+        # Keep application state synchronized.
+        st.session_state[
+            "of_selected_fields"
+        ] = selected_fields
 
         if selected_fields:
             preview_rows = []
@@ -1668,7 +2508,9 @@ def main():
                     if pd.isna(value):
                         continue
 
-                    value = str(value).strip()
+                    value = str(
+                        value
+                    ).strip()
 
                     if value:
                         values.append(value)
@@ -1676,15 +2518,22 @@ def main():
                 preview_rows.append({
                     "Excel Field": field,
                     "Values": len(values),
-                    "Preview": " | ".join(values[:3]),
+                    "Preview": " | ".join(
+                        values[:3]
+                    ),
                 })
 
-            with st.expander("🔎 Preview Selected Fields"):
+            with st.expander(
+                "🔎 Preview Selected Fields"
+            ):
                 st.dataframe(
-                    pd.DataFrame(preview_rows),
+                    pd.DataFrame(
+                        preview_rows
+                    ),
                     width="stretch",
                     hide_index=True,
                 )
+
         else:
             st.info(
                 "Select at least one Excel field to continue."
@@ -1714,7 +2563,10 @@ def main():
     # ======================================================
 
     try:
-        pdf_pages = load_pdf(pdf_file)
+        pdf_pages = load_pdf(
+            pdf_file
+        )
+
     except Exception as error:
         st.error(
             f"Unable to read the PDF: {error}"
@@ -1739,13 +2591,22 @@ def main():
     info1, info2, info3 = st.columns(3)
 
     with info1:
-        st.metric("Excel Rows", len(df))
+        st.metric(
+            "Excel Rows",
+            len(df),
+        )
 
     with info2:
-        st.metric("PDF Pages", len(pdf_pages))
+        st.metric(
+            "PDF Pages",
+            len(pdf_pages),
+        )
 
     with info3:
-        st.metric("Selected Fields", len(selected_fields))
+        st.metric(
+            "Selected Fields",
+            len(selected_fields),
+        )
 
     if len(df) != len(pdf_pages):
         st.warning(
@@ -1754,6 +2615,7 @@ def main():
             "PDF Page 1 → Excel Row 2, PDF Page 2 → Excel Row 3, "
             "and so on."
         )
+
     else:
         st.success(
             "Excel row count and PDF page count match."
@@ -1770,7 +2632,7 @@ def main():
 
     compare_clicked = st.button(
         "🔍  COMPARE & PROOFREAD",
-        key="of_compare",
+        key=f"of_compare_{reset_id}",
         type="primary",
         width="stretch",
     )
@@ -1799,7 +2661,9 @@ def main():
             product_type,
         )
 
-    st.session_state["of_result"] = report
+    st.session_state[
+        "of_result"
+    ] = report
 
     # ======================================================
     # REPORT
@@ -1819,19 +2683,31 @@ def main():
         return
 
     pass_count = int(
-        (report["STATUS"] == "PASS").sum()
+        (
+            report["STATUS"]
+            == "PASS"
+        ).sum()
     )
 
     fail_count = int(
-        (report["STATUS"] == "FAIL").sum()
+        (
+            report["STATUS"]
+            == "FAIL"
+        ).sum()
     )
 
     not_found_count = int(
-        (report["STATUS"] == "NOT FOUND").sum()
+        (
+            report["STATUS"]
+            == "NOT FOUND"
+        ).sum()
     )
 
     skip_count = int(
-        (report["STATUS"] == "SKIP").sum()
+        (
+            report["STATUS"]
+            == "SKIP"
+        ).sum()
     )
 
     # ======================================================
@@ -1841,16 +2717,28 @@ def main():
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        st.metric("PASS", pass_count)
+        st.metric(
+            "PASS",
+            pass_count,
+        )
 
     with c2:
-        st.metric("FAIL", fail_count)
+        st.metric(
+            "FAIL",
+            fail_count,
+        )
 
     with c3:
-        st.metric("NOT FOUND", not_found_count)
+        st.metric(
+            "NOT FOUND",
+            not_found_count,
+        )
 
     with c4:
-        st.metric("IGNORED", skip_count)
+        st.metric(
+            "IGNORED",
+            skip_count,
+        )
 
     # ======================================================
     # TABLE
@@ -1881,10 +2769,12 @@ def main():
         st.error(
             f"❌ FAIL — {fail_count} variable-data mismatch(es) detected."
         )
+
     elif not_found_count > 0:
         st.warning(
             f"⚠️ REVIEW — {not_found_count} selected variable field(s) could not be located."
         )
+
     else:
         st.success(
             "✅ PASS — All selected variable fields matched the PDF artwork."
@@ -1895,11 +2785,18 @@ def main():
     # ======================================================
 
     failures = report[
-        report["STATUS"].isin(["FAIL", "NOT FOUND"])
+        report["STATUS"].isin(
+            [
+                "FAIL",
+                "NOT FOUND",
+            ]
+        )
     ]
 
     if not failures.empty:
-        st.markdown("### 🔎 Difference Details")
+        st.markdown(
+            "### 🔎 Difference Details"
+        )
 
         for _, result in failures.iterrows():
             field_name = result["FIELD"]
@@ -1907,46 +2804,76 @@ def main():
 
             if status == "FAIL":
                 title = (
-                    f"❌ {field_name} — Page {result['PDF PAGE']}"
+                    f"❌ {field_name} — Page "
+                    f"{result['PDF PAGE']}"
                 )
+
             else:
                 title = (
-                    f"⚠️ {field_name} — Page {result['PDF PAGE']}"
+                    f"⚠️ {field_name} — Page "
+                    f"{result['PDF PAGE']}"
                 )
 
             with st.expander(title):
                 left, right = st.columns(2)
 
                 with left:
-                    st.markdown("**Order Form Data**")
+                    st.markdown(
+                        "**Order Form Data**"
+                    )
+
                     st.code(
-                        str(result["ORDER FORM DATA"])
+                        str(
+                            result[
+                                "ORDER FORM DATA"
+                            ]
+                        )
                     )
 
                 with right:
-                    st.markdown("**PDF Output**")
-                    st.code(
-                        str(result["PDF OUTPUT"])
+                    st.markdown(
+                        "**PDF Output**"
                     )
 
-                st.markdown("**Difference**")
+                    st.code(
+                        str(
+                            result[
+                                "PDF OUTPUT"
+                            ]
+                        )
+                    )
 
-                difference = str(result["DIFFERENCE"])
+                st.markdown(
+                    "**Difference**"
+                )
+
+                difference = str(
+                    result[
+                        "DIFFERENCE"
+                    ]
+                )
 
                 if (
                     "→" in difference
                     or "Extra" in difference
                     or "Missing" in difference
                 ):
-                    st.error(difference)
+                    st.error(
+                        difference
+                    )
+
                 else:
-                    st.warning(difference)
+                    st.warning(
+                        difference
+                    )
 
     # ======================================================
     # LOGIC EXPLANATION
     # ======================================================
 
-    with st.expander("ℹ️ How validation works"):
+    with st.expander(
+        "ℹ️ How validation works"
+    ):
         st.write(
             """
             **Variable-data validation**
@@ -2012,7 +2939,9 @@ def main():
 
     csv_data = (
         report
-        .to_csv(index=False)
+        .to_csv(
+            index=False
+        )
         .encode("utf-8-sig")
     )
 
