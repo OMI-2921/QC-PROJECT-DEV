@@ -140,7 +140,6 @@ def normalize_text(text):
     text = text.replace("\n", " ")
     text = text.replace("\r", " ")
 
-    # PDF bullet extraction cleanup.
     text = re.sub(
         r"(^|\s)n(?=\s)",
         " ",
@@ -244,6 +243,9 @@ def get_field_type(field_name):
     ):
         return "CARE"
 
+    # IMPORTANT:
+    # OZ is treated as SIZE because OZ values are
+    # variable sizing/measurement data.
     if (
         "size" in compact
         or "sizeline" in compact
@@ -251,6 +253,11 @@ def get_field_type(field_name):
         or "waist" in compact
         or "inseam" in compact
         or "fit" in compact
+        or compact == "oz"
+        or "ozsize" in compact
+        or "sizeoz" in compact
+        or "ouncesize" in compact
+        or "ounce" in compact
     ):
         return "SIZE"
 
@@ -258,6 +265,8 @@ def get_field_type(field_name):
         compact == "rn"
         or "registrationnumber" in compact
         or "companyrn" in compact
+        or compact.startswith("rn")
+        or compact.endswith("rn")
     ):
         return "RN"
 
@@ -454,6 +463,7 @@ def create_pdf_blocks(page_text):
 
     # Individual lines.
     for line in lines:
+
         blocks.append(
             line
         )
@@ -480,11 +490,13 @@ def create_pdf_blocks(page_text):
             )
 
             if block:
+
                 blocks.append(
                     block
                 )
 
     unique = []
+
     seen = set()
 
     for block in blocks:
@@ -602,9 +614,11 @@ def split_pfl_panels(page_text):
         or
         1 not in distinct_numbers
     ):
+
         return lines
 
     if len(distinct_numbers) != len(markers):
+
         return lines
 
     first_marker_index = markers[0]["index"]
@@ -621,7 +635,9 @@ def split_pfl_panels(page_text):
             markers
         ):
 
-            start = marker["index"] + 1
+            start = (
+                marker["index"] + 1
+            )
 
             if position + 1 < len(markers):
 
@@ -681,6 +697,7 @@ def split_pfl_panels(page_text):
             )
 
     if not segments:
+
         return lines
 
     segments.sort(
@@ -752,6 +769,7 @@ def create_pfl_pdf_blocks(page_text):
         )
 
     unique = []
+
     seen = set()
 
     for block in blocks:
@@ -801,6 +819,7 @@ def exact_match(
         return False
 
     if expected_normalized in actual_normalized:
+
         return True
 
     expected_compact = compact_text(
@@ -816,31 +835,173 @@ def exact_match(
         and
         expected_compact in actual_compact
     ):
+
         return True
 
     return False
 
 
-def search_exact_value(
-    expected,
-    pdf_blocks
-):
+# =========================================================
+# BLOCK KEY
+# =========================================================
 
-    for block in pdf_blocks:
+def block_key(block):
 
-        if exact_match(
-            expected,
-            block
+    return normalize_text(
+        block
+    )
+
+
+# =========================================================
+# FIELD-SPECIFIC IDENTIFICATION
+# =========================================================
+
+def contains_rn_pattern(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    patterns = [
+        r"\brn\s*\d{3,}\b",
+        r"\bca\s*\d{3,}\b",
+        r"\brn\s*#?\s*\d+",
+        r"\bregistration\s+number\s*\d+"
+    ]
+
+    for pattern in patterns:
+
+        if re.search(
+            pattern,
+            normalized,
+            flags=re.IGNORECASE
         ):
 
-            return {
-                "status": "PASS",
-                "pdf": block,
-                "difference": "—",
-                "score": 100
-            }
+            return True
 
-    return None
+    return False
+
+
+def contains_size_pattern(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    # Common numeric size / OZ patterns.
+    patterns = [
+
+        # 8 OZ / 8OZ / 8 ounces
+        r"\b\d+(?:\.\d+)?\s*oz\b",
+        r"\b\d+(?:\.\d+)?\s*ounce(?:s)?\b",
+
+        # Size labels
+        r"\bsize\s+\w+",
+        r"\bsize\s*[:\-]?\s*\w+",
+
+        # Common alpha sizes
+        r"\b(?:xxxs|xxs|xs|sm|s|m|l|xl|xxl|xxxl)\b",
+
+        # Waist / inseam measurements
+        r"\b(?:waist|inseam)\s*\d+",
+
+        # Numeric apparel size
+        r"\b(?:size|sz)\s*\d+\b"
+    ]
+
+    for pattern in patterns:
+
+        if re.search(
+            pattern,
+            normalized,
+            flags=re.IGNORECASE
+        ):
+
+            return True
+
+    return False
+
+
+def contains_coo_pattern(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    patterns = [
+        "made in",
+        "madein",
+        "hecho en",
+        "fabrique en",
+        "fabriqué en"
+    ]
+
+    for marker in patterns:
+
+        if normalize_text(
+            marker
+        ) in normalized:
+
+            return True
+
+    return False
+
+
+def contains_content_pattern(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    anchors = FIELD_ANCHORS[
+        "CONTENT"
+    ]
+
+    for anchor in anchors:
+
+        if normalize_text(
+            anchor
+        ) in normalized:
+
+            return True
+
+    return False
+
+
+def contains_care_pattern(text):
+
+    normalized = normalize_text(
+        text
+    )
+
+    if not normalized:
+        return False
+
+    anchors = FIELD_ANCHORS[
+        "CARE"
+    ]
+
+    for anchor in anchors:
+
+        if normalize_text(
+            anchor
+        ) in normalized:
+
+            return True
+
+    return False
 
 
 # =========================================================
@@ -885,11 +1046,17 @@ FIELD_ANCHORS = {
 
     "RN": [
         "rn",
-        "ca"
+        "ca",
+        "registration number",
+        "company rn"
     ],
 
     "SIZE": [
-        "size"
+        "size",
+        "oz",
+        "ounce",
+        "waist",
+        "inseam"
     ],
 
     "COLOR": [
@@ -920,6 +1087,139 @@ FIELD_ANCHORS = {
 
 
 # =========================================================
+# FIELD-SPECIFIC CANDIDATE VALIDATION
+# =========================================================
+
+def is_field_specific_candidate(
+    block,
+    field_type,
+    field_name,
+    expected
+):
+
+    normalized_block = normalize_text(
+        block
+    )
+
+    if not normalized_block:
+        return False
+
+    # -----------------------------------------------------
+    # RN
+    #
+    # RN must actually look like an RN area/value.
+    # This prevents numeric OZ values from becoming RN
+    # candidates and vice versa.
+    # -----------------------------------------------------
+
+    if field_type == "RN":
+
+        return contains_rn_pattern(
+            normalized_block
+        )
+
+
+    # -----------------------------------------------------
+    # SIZE / OZ
+    #
+    # IMPORTANT:
+    # Do NOT accept a generic numeric block.
+    #
+    # This prevents:
+    #
+    # Order Form:
+    # 8 OZ
+    #
+    # PDF:
+    # RN 123456
+    #
+    # from being treated as a SIZE mismatch.
+    # -----------------------------------------------------
+
+    if field_type == "SIZE":
+
+        if contains_rn_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        if contains_coo_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        return contains_size_pattern(
+            normalized_block
+        )
+
+
+    # -----------------------------------------------------
+    # COO
+    # -----------------------------------------------------
+
+    if field_type == "COO":
+
+        return contains_coo_pattern(
+            normalized_block
+        )
+
+
+    # -----------------------------------------------------
+    # CONTENT
+    # -----------------------------------------------------
+
+    if field_type == "CONTENT":
+
+        if contains_rn_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        if contains_coo_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        return contains_content_pattern(
+            normalized_block
+        )
+
+
+    # -----------------------------------------------------
+    # CARE
+    # -----------------------------------------------------
+
+    if field_type == "CARE":
+
+        if contains_rn_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        if contains_coo_pattern(
+            normalized_block
+        ):
+
+            return False
+
+        return contains_care_pattern(
+            normalized_block
+        )
+
+
+    # -----------------------------------------------------
+    # GENERAL FIELD
+    # -----------------------------------------------------
+
+    return True
+
+
+# =========================================================
 # RELEVANCE
 # =========================================================
 
@@ -935,6 +1235,16 @@ def is_relevant_block(
     )
 
     if not normalized_block:
+        return False
+
+    # First apply strict field-specific protection.
+    if not is_field_specific_candidate(
+        block,
+        field_type,
+        field_name,
+        expected
+    ):
+
         return False
 
     anchors = FIELD_ANCHORS.get(
@@ -953,6 +1263,7 @@ def is_relevant_block(
             and
             anchor_norm in normalized_block
         ):
+
             return True
 
     region = get_field_region(
@@ -967,7 +1278,9 @@ def is_relevant_block(
             "shell",
             "liner",
             "polyester",
-            "bleach"
+            "bleach",
+            "size",
+            "oz"
         ]
 
         for marker in english_markers:
@@ -987,7 +1300,8 @@ def is_relevant_block(
             "doublure",
             "polyester",
             "elasthanne",
-            "sans chlore"
+            "sans chlore",
+            "taille"
         ]
 
         for marker in french_markers:
@@ -1009,7 +1323,8 @@ def is_relevant_block(
             "poliéster",
             "poliester",
             "cloro",
-            "hecho en"
+            "hecho en",
+            "talla"
         ]
 
         for marker in spanish_markers:
@@ -1041,6 +1356,7 @@ def token_overlap(
     )
 
     if not expected_tokens:
+
         return 0
 
     common = (
@@ -1074,9 +1390,11 @@ def get_difference(
     )
 
     if not expected_tokens:
+
         return "Content differs."
 
     if not actual_tokens:
+
         return "Expected value is missing from PDF."
 
     matcher = SequenceMatcher(
@@ -1090,6 +1408,7 @@ def get_difference(
     for tag, a1, a2, b1, b2 in matcher.get_opcodes():
 
         if tag == "equal":
+
             continue
 
         expected_part = " ".join(
@@ -1119,6 +1438,7 @@ def get_difference(
             )
 
     if not differences:
+
         return "Content differs."
 
     return "; ".join(
@@ -1127,14 +1447,64 @@ def get_difference(
 
 
 # =========================================================
+# SEARCH EXACT VALUE
+#
+# IMPORTANT:
+# Used blocks are ignored.
+# =========================================================
+
+def search_exact_value(
+    expected,
+    pdf_blocks,
+    used_blocks=None
+):
+
+    if used_blocks is None:
+
+        used_blocks = set()
+
+    for block in pdf_blocks:
+
+        key = block_key(
+            block
+        )
+
+        if key in used_blocks:
+
+            continue
+
+        if exact_match(
+            expected,
+            block
+        ):
+
+            return {
+                "status": "PASS",
+                "pdf": block,
+                "difference": "—",
+                "score": 100,
+                "used_block": key
+            }
+
+    return None
+
+
+# =========================================================
 # PROBABLE MISMATCH
+#
+# STRICT FIELD-AWARE VERSION
 # =========================================================
 
 def search_probable_mismatch(
     expected,
     pdf_blocks,
-    field_name
+    field_name,
+    used_blocks=None
 ):
+
+    if used_blocks is None:
+
+        used_blocks = set()
 
     expected_normalized = normalize_text(
         expected
@@ -1145,6 +1515,7 @@ def search_probable_mismatch(
     )
 
     if not expected_tokens:
+
         return None
 
     field_type = get_field_type(
@@ -1154,6 +1525,19 @@ def search_probable_mismatch(
     candidates = []
 
     for block in pdf_blocks:
+
+        key = block_key(
+            block
+        )
+
+        # -------------------------------------------------
+        # A PDF block already used by another field cannot
+        # be reused.
+        # -------------------------------------------------
+
+        if key in used_blocks:
+
+            continue
 
         if is_relevant_block(
             block,
@@ -1167,6 +1551,7 @@ def search_probable_mismatch(
             )
 
     if not candidates:
+
         return None
 
     best = None
@@ -1182,6 +1567,7 @@ def search_probable_mismatch(
         )
 
         if not actual_tokens:
+
             continue
 
         ratio = fuzz.ratio(
@@ -1218,18 +1604,56 @@ def search_probable_mismatch(
             expected_tokens
         )
 
+        # -------------------------------------------------
+        # RN protection
+        #
+        # RN comparisons must remain RN comparisons.
+        # -------------------------------------------------
+
+        if field_type == "RN":
+
+            if not contains_rn_pattern(
+                block
+            ):
+
+                continue
+
+
+        # -------------------------------------------------
+        # SIZE / OZ protection
+        #
+        # Never allow RN data to become a SIZE mismatch.
+        # -------------------------------------------------
+
+        if field_type == "SIZE":
+
+            if contains_rn_pattern(
+                block
+            ):
+
+                continue
+
+            if not contains_size_pattern(
+                block
+            ):
+
+                continue
+
+
+        # -------------------------------------------------
+        # COO
+        # -------------------------------------------------
+
         if field_type == "COO":
 
             expected_has_made_in = (
                 "made in"
-                in
-                expected_normalized
+                in expected_normalized
             )
 
             actual_has_made_in = (
                 "made in"
-                in
-                actual_normalized
+                in actual_normalized
             )
 
             if (
@@ -1263,6 +1687,10 @@ def search_probable_mismatch(
 
                     if country_similarity < 95:
 
+                        key = block_key(
+                            block
+                        )
+
                         return {
                             "status": "FAIL",
                             "pdf": block,
@@ -1270,8 +1698,14 @@ def search_probable_mismatch(
                                 expected,
                                 block
                             ),
-                            "score": 100
+                            "score": 100,
+                            "used_block": key
                         }
+
+
+        # -------------------------------------------------
+        # General acceptable score
+        # -------------------------------------------------
 
         if expected_word_count <= 2:
 
@@ -1298,6 +1732,7 @@ def search_probable_mismatch(
             )
 
         if not acceptable:
+
             continue
 
         if (
@@ -1306,6 +1741,10 @@ def search_probable_mismatch(
             score > best["score"]
         ):
 
+            key = block_key(
+                block
+            )
+
             best = {
                 "status": "FAIL",
                 "pdf": block,
@@ -1313,7 +1752,8 @@ def search_probable_mismatch(
                     expected,
                     block
                 ),
-                "score": score
+                "score": score,
+                "used_block": key
             }
 
     return best
@@ -1321,13 +1761,23 @@ def search_probable_mismatch(
 
 # =========================================================
 # CHECK FIELD
+#
+# EXACT MATCH FIRST.
+# PROBABLE MISMATCH SECOND.
+#
+# USED BLOCKS ARE SHARED ACROSS THE PAGE.
 # =========================================================
 
 def check_field(
     expected,
     pdf_blocks,
-    field_name
+    field_name,
+    used_blocks=None
 ):
+
+    if used_blocks is None:
+
+        used_blocks = set()
 
     if (
         expected is None
@@ -1346,22 +1796,48 @@ def check_field(
         expected
     ).strip()
 
+    # -----------------------------------------------------
+    # 1. EXACT MATCH
+    # -----------------------------------------------------
+
     exact = search_exact_value(
         expected,
-        pdf_blocks
+        pdf_blocks,
+        used_blocks
     )
 
     if exact:
+
+        used_blocks.add(
+            exact["used_block"]
+        )
+
         return exact
+
+
+    # -----------------------------------------------------
+    # 2. FIELD-SPECIFIC MISMATCH
+    # -----------------------------------------------------
 
     probable = search_probable_mismatch(
         expected,
         pdf_blocks,
-        field_name
+        field_name,
+        used_blocks
     )
 
     if probable:
+
+        used_blocks.add(
+            probable["used_block"]
+        )
+
         return probable
+
+
+    # -----------------------------------------------------
+    # 3. NOT FOUND
+    # -----------------------------------------------------
 
     return {
         "status": "NOT FOUND",
@@ -1402,10 +1878,12 @@ def build_report(
                         "PDF PAGE": page["page"],
                         "EXCEL ROW": "N/A",
                         "FIELD": field,
-                        "ORDER FORM DATA": "No Excel row",
+                        "ORDER FORM DATA":
+                            "No Excel row",
                         "PDF OUTPUT":
                             "No corresponding Order Form row",
-                        "STATUS": "NOT FOUND",
+                        "STATUS":
+                            "NOT FOUND",
                         "DIFFERENCE":
                             "No corresponding Excel row."
                     }
@@ -1430,6 +1908,17 @@ def build_report(
             pdf_blocks = create_pdf_blocks(
                 page["text"]
             )
+
+        # =================================================
+        # IMPORTANT:
+        #
+        # Tracks PDF blocks already consumed on THIS PAGE.
+        #
+        # Once a block is used for one field, another field
+        # cannot use it again.
+        # =================================================
+
+        used_blocks = set()
 
         for field in selected_fields:
 
@@ -1470,7 +1959,8 @@ def build_report(
             result = check_field(
                 value,
                 pdf_blocks,
-                field
+                field,
+                used_blocks
             )
 
             results.append(
@@ -1597,6 +2087,7 @@ def main():
     )
 
     if current_type not in product_types:
+
         current_type = "Other"
 
     product_type = st.selectbox(
@@ -1730,6 +2221,7 @@ def main():
                 for value in df[field].tolist():
 
                     if pd.isna(value):
+
                         continue
 
                     value = str(
@@ -1737,6 +2229,7 @@ def main():
                     ).strip()
 
                     if value:
+
                         values.append(
                             value
                         )
@@ -2163,6 +2656,21 @@ def main():
             static artwork text is not used to generate
             mismatches.
 
+            **Field-aware matching**
+
+            Each selected field is compared only against
+            PDF content that belongs to the same logical
+            field type.
+
+            For example, Size/OZ data is not compared
+            against RN data.
+
+            **Duplicate protection**
+
+            Once a PDF data block has been used to validate
+            one field, it cannot be reused for another field
+            on the same page.
+
             **Page mapping**
 
             PDF Page 1 → Excel Row 2
@@ -2229,3 +2737,11 @@ def main():
         mime="text/csv",
         width="stretch"
     )
+
+
+# =========================================================
+# START APP
+# =========================================================
+
+if __name__ == "__main__":
+    main()
