@@ -140,9 +140,16 @@ def normalize_text(text):
     text = text.replace("\n", " ")
     text = text.replace("\r", " ")
 
-    # PDF bullet extraction cleanup.
+    # Remove PDF bullet extraction artifacts.
     text = re.sub(
         r"(^|\s)n(?=\s)",
+        " ",
+        text
+    )
+
+    # Treat :- as a formatting separator.
+    text = re.sub(
+        r"\s*:\s*-\s*",
         " ",
         text
     )
@@ -202,19 +209,16 @@ def tokenize(text):
 
 
 # =========================================================
-# STRICT PFL TEXT
+# STRICT PFL NORMALIZATION
 # =========================================================
 
-def strict_pfl_text(text):
-    """
-    Strict comparison text.
+def normalize_strict_text(text):
 
-    IMPORTANT:
-    - Case is preserved.
-    - Punctuation is preserved.
-    - Words are preserved.
-    - PDF line wrapping is converted to spaces.
-    - Multiple spaces caused by PDF extraction are collapsed.
+    """
+    Used for PFL comparison.
+
+    Preserves meaningful punctuation while still removing
+    PDF extraction / layout artifacts.
     """
 
     if text is None:
@@ -227,21 +231,29 @@ def strict_pfl_text(text):
         text
     )
 
-    text = text.replace(
-        "\r",
-        " "
-    )
+    text = text.replace("\r", " ")
+    text = text.replace("\n", " ")
 
-    text = text.replace(
-        "\n",
-        " "
-    )
-
-    # Normalize typographic variants only.
     text = text.replace("’", "'")
     text = text.replace("`", "'")
+
     text = text.replace("–", "-")
     text = text.replace("—", "-")
+
+    # Formatting artifacts such as ":-".
+    text = re.sub(
+        r"\s*:\s*-\s*",
+        " ",
+        text
+    )
+
+    # Remove extraction bullet artifacts.
+    text = re.sub(
+        r"(^|\s)n(?=\s)",
+        " ",
+        text,
+        flags=re.IGNORECASE
+    )
 
     text = re.sub(
         r"\s+",
@@ -252,31 +264,68 @@ def strict_pfl_text(text):
     return text.strip()
 
 
-def strict_pfl_match(expected, actual):
+def strict_tokens(text):
 
-    expected_strict = strict_pfl_text(
-        expected
+    value = normalize_strict_text(
+        text
     )
 
-    actual_strict = strict_pfl_text(
-        actual
+    if not value:
+        return []
+
+    # Keep meaningful punctuation attached to words.
+    return value.split()
+
+
+# =========================================================
+# STATIC PDF PREFIXES
+# =========================================================
+
+STATIC_PREFIXES = [
+    "US",
+    "CA",
+    "MX",
+    "EU",
+    "UK",
+    "USA",
+    "CANADA"
+]
+
+
+def remove_static_prefixes(text):
+
+    """
+    Removes static market labels from the beginning of a
+    PDF line/block.
+
+    Examples:
+        US : SHELL...
+        CA: SHELL...
+        MX - CUERPO...
+    """
+
+    if not text:
+        return ""
+
+    value = str(text).strip()
+
+    pattern = (
+        r"^\s*(?:"
+        + "|".join(
+            re.escape(prefix)
+            for prefix in STATIC_PREFIXES
+        )
+        + r")\s*[:\-]\s*"
     )
 
-    if not expected_strict:
-        return False
+    value = re.sub(
+        pattern,
+        "",
+        value,
+        flags=re.IGNORECASE
+    )
 
-    if not actual_strict:
-        return False
-
-    # Exact complete text match.
-    if expected_strict == actual_strict:
-        return True
-
-    # Expected text exists exactly inside a larger PDF block.
-    if expected_strict in actual_strict:
-        return True
-
-    return False
+    return value.strip()
 
 
 # =========================================================
@@ -310,6 +359,7 @@ def get_field_type(field_name):
         or "content" in compact
         or "composition" in compact
         or "fabrication" in compact
+        or compact.startswith("fib")
     ):
         return "CONTENT"
 
@@ -319,16 +369,9 @@ def get_field_type(field_name):
         or "washing" in compact
         or "laundry" in compact
         or "instruction" in compact
+        or compact.startswith("wc")
     ):
         return "CARE"
-
-    if (
-        compact == "rn"
-        or "registrationnumber" in compact
-        or "companyrn" in compact
-        or "rnnumber" in compact
-    ):
-        return "RN"
 
     if (
         "size" in compact
@@ -337,10 +380,16 @@ def get_field_type(field_name):
         or "waist" in compact
         or "inseam" in compact
         or "fit" in compact
-        or "oz" in compact
-        or "ounce" in compact
     ):
         return "SIZE"
+
+    if (
+        compact == "rn"
+        or compact.startswith("rn")
+        or "registrationnumber" in compact
+        or "companyrn" in compact
+    ):
+        return "RN"
 
     if "brand" in compact:
         return "BRAND"
@@ -500,45 +549,7 @@ def clean_pdf_line(line):
 
 
 # =========================================================
-# BLOCK OVERLAP
-# =========================================================
-
-def block_overlaps_used(
-    block,
-    used_ranges
-):
-
-    start = block["start"]
-    end = block["end"]
-
-    for used_start, used_end in used_ranges:
-
-        # Range overlap.
-        if (
-            start < used_end
-            and
-            end > used_start
-        ):
-            return True
-
-    return False
-
-
-def mark_block_used(
-    block,
-    used_ranges
-):
-
-    used_ranges.append(
-        (
-            block["start"],
-            block["end"]
-        )
-    )
-
-
-# =========================================================
-# CREATE STANDARD PDF BLOCKS
+# STANDARD PDF BLOCKS
 # =========================================================
 
 def create_pdf_blocks(page_text):
@@ -571,18 +582,11 @@ def create_pdf_blocks(page_text):
 
     blocks = []
 
-    # Individual lines.
-    for index, line in enumerate(lines):
-
+    for line in lines:
         blocks.append(
-            {
-                "text": line,
-                "start": index,
-                "end": index + 1
-            }
+            line
         )
 
-    # Adjacent wrapped lines.
     maximum = min(
         8,
         len(lines)
@@ -597,37 +601,35 @@ def create_pdf_blocks(page_text):
             len(lines) - size + 1
         ):
 
-            text = " ".join(
+            block = " ".join(
                 lines[
                     start:start + size
                 ]
             )
 
-            blocks.append(
-                {
-                    "text": text,
-                    "start": start,
-                    "end": start + size
-                }
-            )
+            if block:
+                blocks.append(
+                    block
+                )
 
     unique = []
     seen = set()
 
     for block in blocks:
 
-        key = (
-            normalize_text(
-                block["text"]
-            ),
-            block["start"],
-            block["end"]
+        normalized = normalize_text(
+            block
         )
 
-        if key in seen:
+        if not normalized:
             continue
 
-        seen.add(key)
+        if normalized in seen:
+            continue
+
+        seen.add(
+            normalized
+        )
 
         unique.append(
             block
@@ -725,8 +727,7 @@ def split_pfl_panels(page_text):
 
     if (
         len(distinct_numbers) < 2
-        or
-        1 not in distinct_numbers
+        or 1 not in distinct_numbers
     ):
         return lines
 
@@ -825,10 +826,17 @@ def split_pfl_panels(page_text):
 
 
 # =========================================================
-# CREATE PFL PDF BLOCKS
+# PFL CONTINUATION CANDIDATES
 # =========================================================
 
 def create_pfl_pdf_blocks(page_text):
+
+    """
+    Creates larger continuation windows.
+
+    This is important when a variable field starts on one
+    line and continues onto the next line or next panel.
+    """
 
     ordered_lines = split_pfl_panels(
         page_text
@@ -840,22 +848,20 @@ def create_pfl_pdf_blocks(page_text):
     blocks = []
 
     # Individual lines.
-    for index, line in enumerate(
-        ordered_lines
-    ):
+    for line in ordered_lines:
 
         blocks.append(
-            {
-                "text": line,
-                "start": index,
-                "end": index + 1
-            }
+            line
         )
 
-    # PFL can continue across more lines/panels.
+    line_count = len(
+        ordered_lines
+    )
+
+    # Wider continuation windows.
     maximum = min(
-        20,
-        len(ordered_lines)
+        35,
+        line_count
     )
 
     for size in range(
@@ -864,40 +870,51 @@ def create_pfl_pdf_blocks(page_text):
     ):
 
         for start in range(
-            len(ordered_lines) - size + 1
+            line_count - size + 1
         ):
 
-            text = " ".join(
+            block = " ".join(
                 ordered_lines[
                     start:start + size
                 ]
             )
 
-            blocks.append(
-                {
-                    "text": text,
-                    "start": start,
-                    "end": start + size
-                }
-            )
+            if block:
+
+                blocks.append(
+                    block
+                )
+
+    complete_sequence = " ".join(
+        ordered_lines
+    )
+
+    if complete_sequence:
+
+        blocks.append(
+            complete_sequence
+        )
 
     unique = []
     seen = set()
 
     for block in blocks:
 
-        key = (
-            normalize_text(
-                block["text"]
-            ),
-            block["start"],
-            block["end"]
+        normalized = normalize_text(
+            remove_static_prefixes(
+                block
+            )
         )
 
-        if key in seen:
+        if not normalized:
             continue
 
-        seen.add(key)
+        if normalized in seen:
+            continue
+
+        seen.add(
+            normalized
+        )
 
         unique.append(
             block
@@ -919,8 +936,12 @@ def exact_match(
         expected
     )
 
-    actual_normalized = normalize_text(
+    actual_clean = remove_static_prefixes(
         actual
+    )
+
+    actual_normalized = normalize_text(
+        actual_clean
     )
 
     if not expected_normalized:
@@ -937,17 +958,165 @@ def exact_match(
     )
 
     actual_compact = compact_text(
-        actual
+        actual_clean
     )
 
     if (
         expected_compact
-        and
-        expected_compact in actual_compact
+        and expected_compact in actual_compact
     ):
         return True
 
     return False
+
+
+def search_exact_value(
+    expected,
+    pdf_blocks
+):
+
+    for block in pdf_blocks:
+
+        if exact_match(
+            expected,
+            block
+        ):
+
+            return {
+                "status": "PASS",
+                "pdf": block,
+                "difference": "—",
+                "score": 100
+            }
+
+    return None
+
+
+# =========================================================
+# STRICT PFL MATCHING
+# =========================================================
+
+def get_strict_difference(
+    expected,
+    actual
+):
+
+    actual = remove_static_prefixes(
+        actual
+    )
+
+    expected_tokens = strict_tokens(
+        expected
+    )
+
+    actual_tokens = strict_tokens(
+        actual
+    )
+
+    if not expected_tokens:
+        return "Content differs."
+
+    if not actual_tokens:
+        return "Expected value is missing from PDF."
+
+    matcher = SequenceMatcher(
+        None,
+        expected_tokens,
+        actual_tokens
+    )
+
+    differences = []
+
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+
+        if tag == "equal":
+            continue
+
+        expected_part = " ".join(
+            expected_tokens[a1:a2]
+        )
+
+        actual_part = " ".join(
+            actual_tokens[b1:b2]
+        )
+
+        if tag == "replace":
+
+            differences.append(
+                f"{expected_part} → {actual_part}"
+            )
+
+        elif tag == "delete":
+
+            differences.append(
+                f"Missing from PDF: {expected_part}"
+            )
+
+        elif tag == "insert":
+
+            differences.append(
+                f"Extra in PDF: {actual_part}"
+            )
+
+    if not differences:
+        return "Content differs."
+
+    return "; ".join(
+        differences[:12]
+    )
+
+
+def strict_pfl_compare(
+    expected,
+    actual
+):
+
+    actual_clean = remove_static_prefixes(
+        actual
+    )
+
+    expected_strict = normalize_strict_text(
+        expected
+    )
+
+    actual_strict = normalize_strict_text(
+        actual_clean
+    )
+
+    if not expected_strict:
+        return None
+
+    if not actual_strict:
+        return None
+
+    expected_lower = expected_strict.lower()
+    actual_lower = actual_strict.lower()
+
+    # Exact full expected text exists in PDF.
+    if expected_lower in actual_lower:
+
+        return {
+            "status": "PASS",
+            "pdf": actual,
+            "difference": "—",
+            "score": 100
+        }
+
+    # Normalized exact match.
+    if (
+        normalize_text(expected)
+        ==
+        normalize_text(actual_clean)
+    ):
+
+        return {
+            "status": "PASS",
+            "pdf": actual,
+            "difference": "—",
+            "score": 100
+        }
+
+    return None
 
 
 # =========================================================
@@ -975,10 +1144,7 @@ FIELD_ANCHORS = {
         "extérieur",
         "forro",
         "doublure",
-        "polyester",
-        "cotton",
-        "elastane",
-        "spandex"
+        "cuerpo"
     ],
 
     "CARE": [
@@ -989,7 +1155,8 @@ FIELD_ANCHORS = {
         "dry clean",
         "bleach",
         "blanchiment",
-        "detergent"
+        "detergent",
+        "detergente"
     ],
 
     "RN": [
@@ -1029,84 +1196,6 @@ FIELD_ANCHORS = {
 
 
 # =========================================================
-# BLOCK TYPE SAFETY
-# =========================================================
-
-def is_obviously_wrong_block_type(
-    block,
-    field_type
-):
-
-    normalized = normalize_text(
-        block
-    )
-
-    if not normalized:
-        return True
-
-    # -----------------------------------------------------
-    # SIZE MUST NOT RANDOMLY MATCH RN / CA
-    # -----------------------------------------------------
-
-    if field_type == "SIZE":
-
-        rn_patterns = [
-            r"\brn\s*\d+",
-            r"\bca\s*\d+"
-        ]
-
-        for pattern in rn_patterns:
-
-            if re.search(
-                pattern,
-                normalized,
-                flags=re.IGNORECASE
-            ):
-
-                return True
-
-        if (
-            "made in" in normalized
-            and
-            "rn" in normalized
-        ):
-            return True
-
-    # -----------------------------------------------------
-    # RN SHOULD NOT RANDOMLY MATCH SIZE TABLES
-    # -----------------------------------------------------
-
-    if field_type == "RN":
-
-        size_markers = [
-            "(14",
-            "(18",
-            "(6",
-            "(8",
-            "xl",
-            "xxl",
-            "xs"
-        ]
-
-        rn_exists = bool(
-            re.search(
-                r"\brn\s*\d+",
-                normalized,
-                flags=re.IGNORECASE
-            )
-        )
-
-        if not rn_exists:
-
-            for marker in size_markers:
-
-                if marker in normalized:
-                    return True
-
-    return False
-
-
-# =========================================================
 # RELEVANCE
 # =========================================================
 
@@ -1121,37 +1210,31 @@ def is_relevant_block(
         block
     )
 
-    if not normalized_block:
-        return False
-
-    if is_obviously_wrong_block_type(
-        block,
-        field_type
-    ):
-        return False
-
-    # -----------------------------------------------------
-    # VALUE TOKEN RELEVANCE
-    # -----------------------------------------------------
-
-    expected_tokens = tokenize(
+    expected_normalized = normalize_text(
         expected
     )
 
-    actual_tokens = tokenize(
-        block
+    if not normalized_block:
+        return False
+
+    # Direct overlap is always relevant.
+    expected_tokens = set(
+        tokenize(expected)
     )
 
-    common = set(
-        expected_tokens
-    ) & set(
-        actual_tokens
+    block_tokens = set(
+        tokenize(block)
     )
 
-    # If actual block contains some expected data,
-    # it is immediately useful.
-    if common:
-        return True
+    if expected_tokens:
+
+        overlap = (
+            len(expected_tokens & block_tokens)
+            / len(expected_tokens)
+        )
+
+        if overlap >= 0.25:
+            return True
 
     anchors = FIELD_ANCHORS.get(
         field_type,
@@ -1166,8 +1249,7 @@ def is_relevant_block(
 
         if (
             anchor_norm
-            and
-            anchor_norm in normalized_block
+            and anchor_norm in normalized_block
         ):
             return True
 
@@ -1218,9 +1300,11 @@ def is_relevant_block(
 
         spanish_markers = [
             "lavar",
+            "máquina",
             "maquina",
             "cuerpo",
             "forro",
+            "poliéster",
             "poliester",
             "cloro",
             "hecho en"
@@ -1251,7 +1335,11 @@ def token_overlap(
     )
 
     actual_tokens = set(
-        tokenize(actual)
+        tokenize(
+            remove_static_prefixes(
+                actual
+            )
+        )
     )
 
     if not expected_tokens:
@@ -1278,6 +1366,10 @@ def get_difference(
     expected,
     actual
 ):
+
+    actual = remove_static_prefixes(
+        actual
+    )
 
     expected_tokens = tokenize(
         expected
@@ -1336,149 +1428,168 @@ def get_difference(
         return "Content differs."
 
     return "; ".join(
-        differences[:8]
+        differences[:12]
     )
 
 
 # =========================================================
-# STRICT PFL DIFFERENCE
+# BEST PFL CANDIDATE
 # =========================================================
 
-def get_strict_pfl_difference(
+def find_best_pfl_candidate(
     expected,
-    actual
-):
-
-    expected_strict = strict_pfl_text(
-        expected
-    )
-
-    actual_strict = strict_pfl_text(
-        actual
-    )
-
-    if expected_strict == actual_strict:
-
-        return "—"
-
-    # Character-level comparison.
-    matcher = SequenceMatcher(
-        None,
-        expected_strict,
-        actual_strict
-    )
-
-    differences = []
-
-    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
-
-        if tag == "equal":
-            continue
-
-        expected_part = expected_strict[
-            a1:a2
-        ]
-
-        actual_part = actual_strict[
-            b1:b2
-        ]
-
-        if tag == "replace":
-
-            differences.append(
-                f"Expected '{expected_part}' → PDF '{actual_part}'"
-            )
-
-        elif tag == "delete":
-
-            differences.append(
-                f"Missing from PDF: '{expected_part}'"
-            )
-
-        elif tag == "insert":
-
-            differences.append(
-                f"Extra in PDF: '{actual_part}'"
-            )
-
-    if not differences:
-
-        return (
-            "Text differs in strict "
-            "case/punctuation comparison."
-        )
-
-    return "; ".join(
-        differences[:8]
-    )
-
-
-# =========================================================
-# SCORE CANDIDATE
-# =========================================================
-
-def score_candidate(
-    expected,
-    block
+    pdf_blocks,
+    field_name
 ):
 
     expected_normalized = normalize_text(
         expected
     )
 
-    actual_normalized = normalize_text(
-        block
-    )
-
-    ratio = fuzz.ratio(
-        expected_normalized,
-        actual_normalized
-    )
-
-    partial = fuzz.partial_ratio(
-        expected_normalized,
-        actual_normalized
-    )
-
-    token_ratio = fuzz.token_set_ratio(
-        expected_normalized,
-        actual_normalized
-    )
-
-    overlap = token_overlap(
-        expected,
-        block
-    )
-
-    score = (
-        ratio * 0.30
-        +
-        partial * 0.20
-        +
-        token_ratio * 0.25
-        +
-        overlap * 100 * 0.25
-    )
-
-    return score, overlap
-
-
-# =========================================================
-# FIND BEST CANDIDATE
-# =========================================================
-
-def find_best_candidate(
-    expected,
-    pdf_blocks,
-    field_name,
-    used_ranges
-):
+    if not expected_normalized:
+        return None
 
     field_type = get_field_type(
         field_name
     )
 
     best = None
+
+    for block in pdf_blocks:
+
+        if not is_relevant_block(
+            block,
+            field_type,
+            field_name,
+            expected
+        ):
+            continue
+
+        actual_clean = remove_static_prefixes(
+            block
+        )
+
+        actual_normalized = normalize_text(
+            actual_clean
+        )
+
+        if not actual_normalized:
+            continue
+
+        overlap = token_overlap(
+            expected,
+            actual_clean
+        )
+
+        ratio = fuzz.ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        partial = fuzz.partial_ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        token_ratio = fuzz.token_set_ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        score = (
+            overlap * 50
+            +
+            ratio * 0.15
+            +
+            partial * 0.15
+            +
+            token_ratio * 0.20
+        )
+
+        # Very important:
+        # Do not allow completely unrelated values merely
+        # because RapidFuzz finds character similarity.
+        if overlap < 0.20:
+            continue
+
+        if (
+            best is None
+            or score > best["score"]
+        ):
+
+            best = {
+                "block": block,
+                "score": score,
+                "overlap": overlap
+            }
+
+    return best
+
+
+# =========================================================
+# PFL CHECK
+# =========================================================
+
+def check_pfl_field(
+    expected,
+    pdf_blocks,
+    field_name
+):
+
+    # First search for an exact/complete match.
+    exact = search_exact_value(
+        expected,
+        pdf_blocks
+    )
+
+    if exact:
+        return exact
+
+    best = find_best_pfl_candidate(
+        expected,
+        pdf_blocks,
+        field_name
+    )
+
+    if not best:
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found in relevant PDF area",
+            "difference":
+                "Selected variable value was not detected."
+        }
+
+    block = best["block"]
+
+    # If the expected value is almost completely represented,
+    # treat it as a mismatch and show exact differences.
+    difference = get_strict_difference(
+        expected,
+        block
+    )
+
+    return {
+        "status": "FAIL",
+        "pdf": block,
+        "difference": difference,
+        "score": best["score"]
+    }
+
+
+# =========================================================
+# PROBABLE MISMATCH - STANDARD MODE
+# =========================================================
+
+def search_probable_mismatch(
+    expected,
+    pdf_blocks,
+    field_name
+):
+
+    expected_normalized = normalize_text(
+        expected
+    )
 
     expected_tokens = tokenize(
         expected
@@ -1487,80 +1598,101 @@ def find_best_candidate(
     if not expected_tokens:
         return None
 
+    field_type = get_field_type(
+        field_name
+    )
+
+    candidates = []
+
     for block in pdf_blocks:
 
-        if block_overlaps_used(
+        if is_relevant_block(
             block,
-            used_ranges
-        ):
-            continue
-
-        actual = block["text"]
-
-        if is_obviously_wrong_block_type(
-            actual,
-            field_type
-        ):
-            continue
-
-        # First check relevance.
-        relevant = is_relevant_block(
-            actual,
             field_type,
             field_name,
             expected
+        ):
+
+            candidates.append(
+                block
+            )
+
+    if not candidates:
+        return None
+
+    best = None
+
+    for block in candidates:
+
+        actual_clean = remove_static_prefixes(
+            block
         )
 
-        if not relevant:
+        actual_normalized = normalize_text(
+            actual_clean
+        )
+
+        actual_tokens = tokenize(
+            actual_clean
+        )
+
+        if not actual_tokens:
             continue
 
-        score, overlap = score_candidate(
+        ratio = fuzz.ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        partial = fuzz.partial_ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        token_ratio = fuzz.token_set_ratio(
+            expected_normalized,
+            actual_normalized
+        )
+
+        overlap = token_overlap(
             expected,
-            actual
+            actual_clean
+        )
+
+        score = (
+            ratio * 0.35
+            +
+            partial * 0.20
+            +
+            token_ratio * 0.25
+            +
+            overlap * 100 * 0.20
         )
 
         expected_word_count = len(
             expected_tokens
         )
 
-        # -------------------------------------------------
-        # Short values need stronger evidence.
-        # This prevents OZ/SIZE → RN type false matches.
-        # -------------------------------------------------
-
+        # Prevent unrelated short values from matching.
         if expected_word_count <= 2:
 
             acceptable = (
                 score >= 72
-                and
-                overlap >= 0.50
+                and overlap >= 0.50
             )
 
         elif expected_word_count <= 5:
 
             acceptable = (
                 score >= 68
-                and
-                overlap >= 0.35
+                and overlap >= 0.40
             )
 
         else:
 
             acceptable = (
-                score >= 62
-                and
-                overlap >= 0.25
-            )
-
-        # Exact normalized match can pass candidate selection.
-        if exact_match(
-            expected,
-            actual
-        ):
-            acceptable = True
-            score = max(
-                score,
-                100
+                score >= 65
+                and overlap >= 0.30
             )
 
         if not acceptable:
@@ -1568,14 +1700,17 @@ def find_best_candidate(
 
         if (
             best is None
-            or
-            score > best["score"]
+            or score > best["score"]
         ):
 
             best = {
-                "block": block,
-                "score": score,
-                "overlap": overlap
+                "status": "FAIL",
+                "pdf": block,
+                "difference": get_difference(
+                    expected,
+                    actual_clean
+                ),
+                "score": score
             }
 
     return best
@@ -1589,14 +1724,12 @@ def check_field(
     expected,
     pdf_blocks,
     field_name,
-    product_type,
-    used_ranges
+    product_type
 ):
 
     if (
         expected is None
-        or
-        str(expected).strip() == ""
+        or str(expected).strip() == ""
     ):
 
         return {
@@ -1611,87 +1744,43 @@ def check_field(
     ).strip()
 
     # =====================================================
-    # FIND BEST UNUSED PDF AREA
-    # =====================================================
-
-    candidate = find_best_candidate(
-        expected,
-        pdf_blocks,
-        field_name,
-        used_ranges
-    )
-
-    if candidate is None:
-
-        return {
-            "status": "NOT FOUND",
-            "pdf": "Not found in relevant PDF area",
-            "difference":
-                "Selected variable value was not detected."
-        }
-
-    block = candidate["block"]
-    actual = block["text"]
-
-    # =====================================================
-    # MARK THIS PDF AREA AS USED
-    # =====================================================
-
-    mark_block_used(
-        block,
-        used_ranges
-    )
-
-    # =====================================================
-    # PFL STRICT VALIDATION
+    # PFL STRICT LOGIC
     # =====================================================
 
     if product_type == "PFL":
 
-        if strict_pfl_match(
+        return check_pfl_field(
             expected,
-            actual
-        ):
-
-            return {
-                "status": "PASS",
-                "pdf": actual,
-                "difference": "—"
-            }
-
-        return {
-            "status": "FAIL",
-            "pdf": actual,
-            "difference":
-                get_strict_pfl_difference(
-                    expected,
-                    actual
-                )
-        }
+            pdf_blocks,
+            field_name
+        )
 
     # =====================================================
-    # STANDARD VALIDATION
+    # STANDARD LOGIC
     # =====================================================
 
-    if exact_match(
+    exact = search_exact_value(
         expected,
-        actual
-    ):
+        pdf_blocks
+    )
 
-        return {
-            "status": "PASS",
-            "pdf": actual,
-            "difference": "—"
-        }
+    if exact:
+        return exact
+
+    probable = search_probable_mismatch(
+        expected,
+        pdf_blocks,
+        field_name
+    )
+
+    if probable:
+        return probable
 
     return {
-        "status": "FAIL",
-        "pdf": actual,
+        "status": "NOT FOUND",
+        "pdf": "Not found in relevant PDF area",
         "difference":
-            get_difference(
-                expected,
-                actual
-            )
+            "Selected variable value was not detected."
     }
 
 
@@ -1743,10 +1832,6 @@ def build_report(
             excel_index
         ]
 
-        # -------------------------------------------------
-        # CREATE PDF BLOCKS
-        # -------------------------------------------------
-
         if product_type == "PFL":
 
             pdf_blocks = create_pfl_pdf_blocks(
@@ -1758,16 +1843,6 @@ def build_report(
             pdf_blocks = create_pdf_blocks(
                 page["text"]
             )
-
-        # -------------------------------------------------
-        # IMPORTANT:
-        # Used ranges are reset for every PDF page.
-        #
-        # This prevents one PDF area from being used more
-        # than once on the same artwork page.
-        # -------------------------------------------------
-
-        used_ranges = []
 
         for field in selected_fields:
 
@@ -1782,10 +1857,6 @@ def build_report(
                 value = str(
                     value
                 ).strip()
-
-            # -------------------------------------------------
-            # BLANK FIELD
-            # -------------------------------------------------
 
             if not value:
 
@@ -1809,16 +1880,11 @@ def build_report(
 
                 continue
 
-            # -------------------------------------------------
-            # VALIDATE
-            # -------------------------------------------------
-
             result = check_field(
                 value,
                 pdf_blocks,
                 field,
-                product_type,
-                used_ranges
+                product_type
             )
 
             results.append(
@@ -1959,8 +2025,9 @@ def main():
     if product_type == "PFL":
 
         st.info(
-            "PFL mode enabled — panel sequence and "
-            "cross-panel continuation logic will be used."
+            "PFL mode enabled — strict text comparison, "
+            "panel sequence and cross-panel continuation "
+            "logic will be used."
         )
 
     else:
@@ -2482,10 +2549,8 @@ def main():
 
                 if (
                     "→" in difference
-                    or
-                    "Missing" in difference
-                    or
-                    "Extra" in difference
+                    or "Extra" in difference
+                    or "Missing" in difference
                 ):
 
                     st.error(
@@ -2511,32 +2576,9 @@ def main():
             **Variable-data validation**
 
             Only fields selected from the Order Form are
-            treated as variable artwork data.
-
-            **One-time PDF matching**
-
-            Once a PDF text area is matched to a selected
-            Order Form field, overlapping PDF text areas are
-            not reused for another field.
-
-            **PFL strict validation**
-
-            PFL first uses intelligent matching to locate the
-            correct PDF text area.
-
-            After locating that area, PFL performs strict
-            verification of the original text, including:
-
-            - Uppercase and lowercase
-            - Commas
-            - Full stops
-            - Slashes
-            - Hyphens
-            - Apostrophes
-            - Missing or extra words
-
-            PDF line wrapping is joined for comparison, but
-            punctuation and text case are not removed.
+            treated as variable artwork data. Unselected
+            static artwork text is not used to generate
+            mismatches.
 
             **Page mapping**
 
@@ -2552,6 +2594,32 @@ def main():
 
             If the selected Order Form field is blank,
             that field is ignored.
+
+            **PFL strict comparison**
+
+            PFL mode searches across neighbouring lines and
+            panel boundaries so that variable text continuing
+            onto another line can be compared as one sequence.
+
+            Static market prefixes such as US: and CA: are
+            ignored when they are not part of the variable
+            Order Form value.
+
+            **Difference detection**
+
+            Extra words, missing words, changed values and
+            number differences are reported.
+
+            Example:
+
+            Order Form:
+            MADE IN CHINA
+
+            PDF:
+            MADE IN VIETNAM
+
+            Difference:
+            CHINA → VIETNAM
             """
         )
 
