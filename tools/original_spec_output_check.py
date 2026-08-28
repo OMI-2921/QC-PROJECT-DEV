@@ -303,7 +303,8 @@ canvas {
 const MODE = "__MODE__";
 
 const BLINK_SPEED = __BLINK_SPEED__;
-const BLINK_INTERVAL = 1000 / BLINK_SPEED;
+// 1.0 should feel like the previous 1.5 speed.
+const BLINK_INTERVAL = 1000 / (BLINK_SPEED * 1.5);
 
 const ORIGINAL_OPACITY = 0.80;
 
@@ -1072,7 +1073,7 @@ def main():
             "⚡ Blink Speed",
             min_value=0.25,
             max_value=1.5,
-            value=0.5,
+            value=1.0,
             step=0.25,
             key=blink_speed_key
         )
