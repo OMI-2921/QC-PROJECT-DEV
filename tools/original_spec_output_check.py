@@ -7,6 +7,17 @@ import streamlit.components.v1 as components
 
 
 # =========================================================
+# SESSION STATE
+# =========================================================
+
+if "spec_reset_id" not in st.session_state:
+    st.session_state["spec_reset_id"] = 0
+
+if "spec_compare_started" not in st.session_state:
+    st.session_state["spec_compare_started"] = False
+
+
+# =========================================================
 # PDF HELPERS
 # =========================================================
 
@@ -291,7 +302,8 @@ canvas {
 
 const MODE = "__MODE__";
 
-const BLINK_SPEED = __BLINK_SPEED__ * 1000;
+const BLINK_SPEED = __BLINK_SPEED__;
+const BLINK_INTERVAL = 1000 / BLINK_SPEED;
 
 const ORIGINAL_OPACITY = 0.80;
 
@@ -546,7 +558,7 @@ function onImageLoaded() {
 
                     draw();
 
-                }, BLINK_SPEED);
+                }, BLINK_INTERVAL);
             }
 
         }, 350);
@@ -806,34 +818,64 @@ def main():
         """
         <style>
         .stTabs [data-baseweb="tab-list"] {
-            gap: 10px;
+            gap: 12px;
             background: transparent;
-            padding: 4px 0 10px 0;
+            padding: 6px 0 14px 0;
         }
 
         .stTabs [data-baseweb="tab"] {
-            height: 42px;
-            border-radius: 10px;
-            padding: 0 22px;
-            border: 1px solid #2f3640;
-            background: #171b22;
-            color: #d7dde6;
-            font-weight: 700;
-            transition: all 0.18s ease;
+            height: 46px;
+            min-width: 150px;
+            border-radius: 14px;
+            padding: 0 24px;
+            border: 1px solid #3a4655;
+            background: linear-gradient(180deg, #1b222c, #141a22);
+            color: #cfd7e3;
+            font-weight: 800;
+            letter-spacing: .2px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.14);
+            transition:
+                transform 0.16s ease,
+                background 0.18s ease,
+                border-color 0.18s ease,
+                box-shadow 0.18s ease,
+                color 0.18s ease;
         }
 
         .stTabs [data-baseweb="tab"]:hover {
             transform: translateY(-2px);
-            background: #222a35;
-            border-color: #5a6675;
-            box-shadow: 0 5px 14px rgba(0,0,0,0.16);
+            background: linear-gradient(180deg, #263342, #1b2632);
+            border-color: #65809c;
+            color: #ffffff;
+            box-shadow: 0 7px 18px rgba(0,0,0,0.24);
+        }
+
+        .stTabs [data-baseweb="tab"]:active {
+            transform: scale(0.97);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.24);
         }
 
         .stTabs [aria-selected="true"] {
-            background: linear-gradient(135deg, #24364a, #182432) !important;
-            border-color: #4b8fbe !important;
+            background: linear-gradient(135deg, #315a79, #1f3348) !important;
+            border-color: #6fb6e8 !important;
             color: #ffffff !important;
-            box-shadow: 0 5px 16px rgba(34, 115, 170, 0.22);
+            box-shadow:
+                0 7px 22px rgba(42, 126, 185, 0.28),
+                inset 0 1px 0 rgba(255,255,255,0.10);
+            animation: activeTabPulse 1.8s ease-in-out infinite;
+        }
+
+        @keyframes activeTabPulse {
+            0%, 100% {
+                box-shadow:
+                    0 7px 22px rgba(42, 126, 185, 0.24),
+                    inset 0 1px 0 rgba(255,255,255,0.10);
+            }
+            50% {
+                box-shadow:
+                    0 9px 26px rgba(42, 126, 185, 0.34),
+                    inset 0 1px 0 rgba(255,255,255,0.14);
+            }
         }
 
         .stTabs [data-baseweb="tab-highlight"] {
@@ -850,6 +892,34 @@ def main():
         "Visual comparison between Original Specification and Final Output"
     )
 
+    # =====================================================
+    # NEW START
+    # =====================================================
+
+    reset_col_left, reset_col_right = st.columns([7, 1])
+
+    with reset_col_right:
+        if st.button(
+            "↻ NEW START",
+            key="spec_new_start",
+            width="stretch"
+        ):
+            st.session_state["spec_reset_id"] = (
+                st.session_state.get("spec_reset_id", 0) + 1
+            )
+
+            st.session_state["spec_compare_started"] = False
+
+            st.rerun()
+
+    reset_id = st.session_state.get("spec_reset_id", 0)
+
+    original_upload_key = f"original_spec_upload_{reset_id}"
+    output_upload_key = f"output_spec_upload_{reset_id}"
+    page_selector_key = f"spec_page_selector_{reset_id}"
+    compare_key = f"spec_compare_{reset_id}"
+    blink_speed_key = f"blink_speed_{reset_id}"
+
     st.divider()
 
 
@@ -864,7 +934,7 @@ def main():
         original_spec = st.file_uploader(
             "📄 Upload Original Spec",
             type=["pdf"],
-            key="original_spec_upload"
+            key=original_upload_key
         )
 
     with col2:
@@ -872,7 +942,7 @@ def main():
         output_file = st.file_uploader(
             "📄 Upload Output",
             type=["pdf"],
-            key="output_spec_upload"
+            key=output_upload_key
         )
 
 
@@ -914,7 +984,7 @@ def main():
             options=list(range(max_pages)),
             format_func=lambda x:
                 f"Page {x + 1}",
-            key="spec_page_selector"
+            key=page_selector_key
         )
 
     else:
@@ -928,6 +998,7 @@ def main():
 
     if st.button(
         "🔍 COMPARE",
+        key=compare_key,
         type="primary",
         use_container_width=True
     ):
@@ -998,12 +1069,12 @@ def main():
     with blink_tab:
 
         blink_speed = st.slider(
-            "⚡ Blink Speed (seconds)",
+            "⚡ Blink Speed",
             min_value=0.25,
-            max_value=2.0,
+            max_value=1.5,
             value=0.5,
             step=0.25,
-            key="blink_speed"
+            key=blink_speed_key
         )
 
         comparison_viewer(
