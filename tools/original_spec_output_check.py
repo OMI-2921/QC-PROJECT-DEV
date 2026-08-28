@@ -181,8 +181,8 @@ html, body {
 }
 
 #viewer {
-    width: min(100%, 1180px);
-    height: 760px;
+    width: min(100%, 980px);
+    height: 620px;
     background: #ffffff;
     border: 1px solid #333;
     border-radius: 12px;
@@ -345,16 +345,30 @@ let blinkShowOriginal = true;
 // RESIZE
 // =========================================================
 
-function resizeCanvas() {
+let hasInitialFit = false;
+let resizeTimer = null;
 
-    const rect =
-        viewer.getBoundingClientRect();
+function resizeCanvas(refit = false) {
 
-    canvas.width = rect.width;
+    const rect = viewer.getBoundingClientRect();
 
-    canvas.height = rect.height;
+    const newWidth = Math.max(1, Math.round(rect.width));
+    const newHeight = Math.max(1, Math.round(rect.height));
 
-    draw();
+    const changed =
+        canvas.width !== newWidth ||
+        canvas.height !== newHeight;
+
+    if (!changed) return;
+
+    canvas.width = newWidth;
+    canvas.height = newHeight;
+
+    if (refit && original.width && output.width) {
+        fitImage();
+    } else {
+        draw();
+    }
 }
 
 
@@ -375,7 +389,7 @@ function fitImage() {
 
     if (!original.width || !output.width) return;
 
-    const padding = 56;
+    const padding = 44;
     const base = getBaseSize();
 
     const scaleX =
@@ -513,22 +527,16 @@ function onImageLoaded() {
 
     if (loaded === 2) {
 
-        // Wait briefly so the Streamlit component
-        // receives its final width and height.
+        // Give Streamlit's iframe/layout time to reach its final size.
         setTimeout(function() {
 
-            resizeCanvas();
-
-            // Start every mode centered and fitted
+            resizeCanvas(false);
             fitImage();
+            hasInitialFit = true;
 
-            // Make sure Blink always starts
-            // from the centered Original Spec.
             blinkShowOriginal = true;
-
             draw();
 
-            // Start blink only after correct positioning
             if (MODE === "blink") {
 
                 setInterval(function() {
@@ -541,7 +549,7 @@ function onImageLoaded() {
                 }, BLINK_SPEED);
             }
 
-        }, 200);
+        }, 350);
     }
 }
 
@@ -737,11 +745,19 @@ viewer.addEventListener(
 
 window.addEventListener(
     "resize",
-    resizeCanvas
+    function() {
+        resizeCanvas(hasInitialFit);
+    }
 );
 
 const resizeObserver = new ResizeObserver(function() {
-    resizeCanvas();
+
+    clearTimeout(resizeTimer);
+
+    resizeTimer = setTimeout(function() {
+        resizeCanvas(hasInitialFit);
+    }, 80);
+
 });
 
 resizeObserver.observe(viewer);
@@ -775,7 +791,7 @@ resizeObserver.observe(viewer);
 
     components.html(
         html,
-        height=805,
+        height=670,
         scrolling=False
     )
 
