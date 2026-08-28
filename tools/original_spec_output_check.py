@@ -162,21 +162,34 @@ html, body {
     overflow: hidden;
 }
 
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    width: 100%;
+    height: 100%;
+}
+
 #wrapper {
     width: 100%;
+    height: 100%;
     display: flex;
     justify-content: center;
+    align-items: center;
+    padding: 0 8px;
 }
 
 #viewer {
-    width: 1100px;
-    height: 750px;
+    width: min(100%, 1180px);
+    height: 760px;
     background: #ffffff;
     border: 1px solid #333;
     border-radius: 12px;
     position: relative;
     overflow: hidden;
     cursor: grab;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.18);
 }
 
 #viewer:active {
@@ -204,27 +217,37 @@ canvas {
 
 #controls {
     position: absolute;
-    bottom: 12px;
+    bottom: 16px;
     left: 50%;
     transform: translateX(-50%);
     display: flex;
     gap: 8px;
-    background: rgba(20,20,20,0.9);
+    background: rgba(20,20,20,0.94);
     padding: 8px;
-    border-radius: 8px;
+    border-radius: 10px;
+    z-index: 20;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.28);
 }
 
 #controls button {
     background: #252525;
     color: white;
     border: 1px solid #555;
-    padding: 6px 12px;
-    border-radius: 5px;
+    min-width: 42px;
+    padding: 7px 13px;
+    border-radius: 7px;
     cursor: pointer;
+    font-weight: 700;
+    transition: transform 0.15s ease, background 0.15s ease;
 }
 
 #controls button:hover {
     background: #444;
+    transform: translateY(-1px);
+}
+
+#controls button:active {
+    transform: scale(0.96);
 }
 
 </style>
@@ -339,32 +362,48 @@ function resizeCanvas() {
 // FIT IMAGE
 // =========================================================
 
+function getBaseSize() {
+
+    return {
+        width: Math.max(original.width, output.width),
+        height: Math.max(original.height, output.height)
+    };
+}
+
+
 function fitImage() {
 
-    if (!original.width) return;
+    if (!original.width || !output.width) return;
 
-    const padding = 40;
+    const padding = 56;
+    const base = getBaseSize();
 
     const scaleX =
-        (canvas.width - padding)
-        / original.width;
+        (canvas.width - padding) / base.width;
 
     const scaleY =
-        (canvas.height - padding)
-        / original.height;
+        (canvas.height - padding) / base.height;
 
-    scale =
-        Math.min(scaleX, scaleY);
+    scale = Math.min(scaleX, scaleY);
 
     offsetX =
-        (canvas.width -
-        original.width * scale) / 2;
+        (canvas.width - base.width * scale) / 2;
 
     offsetY =
-        (canvas.height -
-        original.height * scale) / 2;
+        (canvas.height - base.height * scale) / 2;
 
     draw();
+}
+
+
+function getDrawPosition(image) {
+
+    const base = getBaseSize();
+
+    return {
+        x: offsetX + ((base.width - image.width) * scale) / 2,
+        y: offsetY + ((base.height - image.height) * scale) / 2
+    };
 }
 
 
@@ -395,13 +434,16 @@ function draw() {
 
     if (MODE === "overlay") {
 
+        const originalPos = getDrawPosition(original);
+        const outputPos = getDrawPosition(output);
+
         ctx.globalAlpha =
             ORIGINAL_OPACITY;
 
         ctx.drawImage(
             original,
-            offsetX,
-            offsetY,
+            originalPos.x,
+            originalPos.y,
             original.width * scale,
             original.height * scale
         );
@@ -412,8 +454,8 @@ function draw() {
 
         ctx.drawImage(
             output,
-            offsetX,
-            offsetY,
+            outputPos.x,
+            outputPos.y,
             output.width * scale,
             output.height * scale
         );
@@ -436,10 +478,12 @@ function draw() {
                 ? original
                 : output;
 
+        const activePos = getDrawPosition(activeImage);
+
         ctx.drawImage(
             activeImage,
-            offsetX,
-            offsetY,
+            activePos.x,
+            activePos.y,
             activeImage.width * scale,
             activeImage.height * scale
         );
@@ -696,6 +740,12 @@ window.addEventListener(
     resizeCanvas
 );
 
+const resizeObserver = new ResizeObserver(function() {
+    resizeCanvas();
+});
+
+resizeObserver.observe(viewer);
+
 
 </script>
 
@@ -725,33 +775,8 @@ window.addEventListener(
 
     components.html(
         html,
-        height=680,
+        height=805,
         scrolling=False
-    )
-
-
-# =========================================================
-# DATA CHECK
-# =========================================================
-
-def data_check_view():
-
-    st.subheader("🔍 Data Check")
-
-    st.info(
-        "Automatic text and difference validation "
-        "will be added here next."
-    )
-
-    st.selectbox(
-        "Difference Classification",
-        [
-            "Select Type",
-            "STATIC",
-            "VARIABLE",
-            "IGNORE"
-        ],
-        key="spec_data_classification"
     )
 
 
@@ -760,6 +785,48 @@ def data_check_view():
 # =========================================================
 
 def main():
+
+    st.markdown(
+        """
+        <style>
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 10px;
+            background: transparent;
+            padding: 4px 0 10px 0;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            height: 42px;
+            border-radius: 10px;
+            padding: 0 22px;
+            border: 1px solid #2f3640;
+            background: #171b22;
+            color: #d7dde6;
+            font-weight: 700;
+            transition: all 0.18s ease;
+        }
+
+        .stTabs [data-baseweb="tab"]:hover {
+            transform: translateY(-2px);
+            background: #222a35;
+            border-color: #5a6675;
+            box-shadow: 0 5px 14px rgba(0,0,0,0.16);
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, #24364a, #182432) !important;
+            border-color: #4b8fbe !important;
+            color: #ffffff !important;
+            box-shadow: 0 5px 16px rgba(34, 115, 170, 0.22);
+        }
+
+        .stTabs [data-baseweb="tab-highlight"] {
+            display: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
 
     st.title("🔍 ORIGINAL SPEC TO OUTPUT CHECK")
 
@@ -887,10 +954,9 @@ def main():
     # MODES
     # =====================================================
 
-    overlay_tab, blink_tab, data_tab = st.tabs([
-        "🟥🟢 OVERLAY",
-        "👁 BLINK",
-        "🔍 DATA CHECK"
+    overlay_tab, blink_tab = st.tabs([
+        "🟥🟢  OVERLAY",
+        "👁  BLINK"
     ])
 
 
@@ -930,14 +996,6 @@ def main():
             mode="blink",
             blink_speed=blink_speed
         )
-
-
-    # DATA CHECK
-
-    with data_tab:
-
-        data_check_view()
-
 
 # =========================================================
 # RUN
