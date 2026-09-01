@@ -1,7 +1,7 @@
-streamlit==1.62.0
+streamlit
 pandas
 openpyxl
 pymupdf
 rapidfuzz
-Pillow
 pytesseract
+Pillow
