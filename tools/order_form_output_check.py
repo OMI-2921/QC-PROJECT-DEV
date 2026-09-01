@@ -2145,7 +2145,8 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
 
 
 def main():
-    """Render Tool 1: Order Form → Output Check."""
+
+    st.info("PROJECT 2 • EXCEL EXPORT VERSION • BUILD 2026-09-01")
 
     _apply_tool_css()
 
