@@ -914,6 +914,100 @@ def normalize_composition(values):
     )
 
 
+
+
+def analyze_content_difference(expected, actual):
+    """
+    Produce a human-friendly Content difference.
+
+    The QC user should see the actual issue, not a reordered list of
+    percentages/materials. In particular, a material spelling error such as
+    POLYSTER vs POLYESTER is reported directly.
+    """
+    expected_values = extract_content_values(expected)
+    actual_values = extract_content_values(actual)
+
+    if not expected_values or not actual_values:
+        return (
+            f"Expected: {expected} | Found: {actual}"
+        )
+
+    # Compare composition entries in their original order.
+    max_len = max(len(expected_values), len(actual_values))
+    issues = []
+
+    from difflib import SequenceMatcher
+
+    for i in range(max_len):
+        exp = expected_values[i] if i < len(expected_values) else None
+        act = actual_values[i] if i < len(actual_values) else None
+
+        if exp is None:
+            issues.append(f"Extra content: {act}")
+            continue
+
+        if act is None:
+            issues.append(f"Missing content: {exp}")
+            continue
+
+        exp_match = re.fullmatch(
+            r"(?P<pct>\d+(?:\.\d+)?)%\s*(?P<material>.+)",
+            normalize_text(exp),
+            re.IGNORECASE
+        )
+        act_match = re.fullmatch(
+            r"(?P<pct>\d+(?:\.\d+)?)%\s*(?P<material>.+)",
+            normalize_text(act),
+            re.IGNORECASE
+        )
+
+        if not exp_match or not act_match:
+            if normalize_text(exp) != normalize_text(act):
+                issues.append(
+                    f"Content mismatch: {exp} → {act}"
+                )
+            continue
+
+        exp_pct = exp_match.group("pct")
+        act_pct = act_match.group("pct")
+        exp_material = exp_match.group("material").strip()
+        act_material = act_match.group("material").strip()
+
+        if exp_pct != act_pct and normalize_text(exp_material) != normalize_text(act_material):
+            issues.append(
+                f"Percentage and material mismatch: {exp} → {act}"
+            )
+            continue
+
+        if exp_pct != act_pct:
+            issues.append(
+                f"Percentage mismatch: {exp_pct}% → {act_pct}% ({exp_material})"
+            )
+            continue
+
+        if normalize_text(exp_material) != normalize_text(act_material):
+            similarity = SequenceMatcher(
+                None,
+                normalize_text(exp_material),
+                normalize_text(act_material),
+                autojunk=False
+            ).ratio()
+
+            # High similarity with same percentage = likely spelling/wording error.
+            if similarity >= 0.70:
+                issues.append(
+                    f"Spelling mistake: {exp_material.upper()} → {act_material.upper()}"
+                )
+            else:
+                issues.append(
+                    f"Material mismatch: {exp_material.upper()} → {act_material.upper()}"
+                )
+
+    if issues:
+        return "; ".join(issues)
+
+    return "Content differs."
+
 def composition_matches(expected, actual):
     expected_values = normalize_composition(
         extract_content_values(expected)
@@ -1371,9 +1465,9 @@ def check_field(
                     return {
                         "status": "FAIL",
                         "pdf": text,
-                        "difference": (
-                            f"Expected: {expected} | "
-                            f"Found: {' | '.join(actual_values)}"
+                        "difference": analyze_content_difference(
+                            expected,
+                            text
                         ),
                         "match_type": "CONTENT_MISMATCH"
                     }
