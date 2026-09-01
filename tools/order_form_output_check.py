@@ -9,489 +9,201 @@ from PIL import Image
 from rapidfuzz import fuzz
 from difflib import SequenceMatcher
 
-
-# =========================================================
-# PAGE CONFIGURATION
-# =========================================================
-
-st.set_page_config(
-    page_title="PDF Proofreader",
-    page_icon="🔍",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-
-# =========================================================
-# DARK UI
-# =========================================================
-
-st.markdown(
-    """
-    <style>
-
-    html,
-    body,
-    [data-testid="stAppViewContainer"],
-    [data-testid="stApp"],
-    .stApp,
-    .main,
-    [data-testid="stMain"] {
-        background-color: #0e1117 !important;
-        color: #ffffff !important;
-    }
-
-    [data-testid="stHeader"] {
-        background-color: #0e1117 !important;
-    }
-
-    .stApp,
-    .stApp p,
-    .stApp label,
-    .stApp span,
-    .stApp div {
-        color: #ffffff;
-    }
-
-    .main-title {
-        color: #ffffff !important;
-        font-size: 34px;
-        font-weight: 700;
-        margin-top: 5px;
-        margin-bottom: 4px;
-    }
-
-    .sub-title {
-        color: #b8c0cc !important;
-        font-size: 15px;
-        margin-bottom: 30px;
-    }
-
-    .section-title {
-        color: #ffffff !important;
-        font-size: 20px;
-        font-weight: 700;
-        margin-top: 12px;
-        margin-bottom: 10px;
-    }
-
-    [data-testid="stFileUploader"] {
-        background-color: #161b22 !important;
-        border: 1px solid #4b5563 !important;
-        border-radius: 12px !important;
-        padding: 8px !important;
-    }
-
-    [data-testid="stFileUploaderDropzone"] {
-        background-color: #161b22 !important;
-        border: 1px solid #4b5563 !important;
-        border-radius: 10px !important;
-    }
-
-    [data-testid="stFileUploaderDropzoneInstructions"] {
-        color: #ffffff !important;
-    }
-
-    [data-testid="stFileUploaderDropzoneInstructions"] span {
-        color: #ffffff !important;
-    }
-
-    [data-testid="stFileUploader"] button {
-        background-color: #111827 !important;
-        color: #ffffff !important;
-        border: 1px solid #6b7280 !important;
-        border-radius: 8px !important;
-    }
-
-    [data-testid="stFileUploader"] button:hover {
-        background-color: #1f2937 !important;
-        color: #ffffff !important;
-    }
-
-    [data-baseweb="select"] > div {
-        background-color: #161b22 !important;
-        color: #ffffff !important;
-        border: 1px solid #4b5563 !important;
-        border-radius: 10px !important;
-    }
-
-    [data-baseweb="select"] input {
-        color: #ffffff !important;
-    }
-
-    [data-baseweb="select"] span {
-        color: #ffffff !important;
-    }
-
-    [data-baseweb="popover"] {
-        background-color: #161b22 !important;
-    }
-
-    [role="option"] {
-        background-color: #161b22 !important;
-        color: #ffffff !important;
-    }
-
-    [role="option"]:hover {
-        background-color: #263241 !important;
-    }
-
-    [data-baseweb="tag"] {
-        background-color: #2563eb !important;
-        color: #ffffff !important;
-    }
-
-    [data-baseweb="tag"] span {
-        color: #ffffff !important;
-    }
-
-    div.stButton > button {
-        background-color: #2196F3 !important;
-        color: #ffffff !important;
-        border: 2px solid #000000 !important;
-        border-radius: 12px !important;
-        font-size: 18px !important;
-        font-weight: 700 !important;
-        height: 54px !important;
-        width: 100% !important;
-        box-shadow: none !important;
-    }
-
-    div.stButton > button:hover {
-        background-color: #1976D2 !important;
-        color: #ffffff !important;
-        border: 2px solid #000000 !important;
-    }
-
-    div.stDownloadButton > button {
-        background-color: #1f2937 !important;
-        color: #ffffff !important;
-        border: 1px solid #6b7280 !important;
-        border-radius: 10px !important;
-        font-weight: 600 !important;
-    }
-
-    div.stDownloadButton > button:hover {
-        background-color: #374151 !important;
-        color: #ffffff !important;
-    }
-
-    [data-testid="stDataFrame"] {
-        border: 1px solid #374151 !important;
-        border-radius: 10px !important;
-    }
-
-    [data-testid="stMetric"] {
-        background-color: #161b22 !important;
-        border: 1px solid #374151 !important;
-        border-radius: 10px !important;
-        padding: 12px !important;
-    }
-
-    [data-testid="stMetricLabel"] {
-        color: #b8c0cc !important;
-    }
-
-    [data-testid="stMetricValue"] {
-        color: #ffffff !important;
-    }
-
-    hr {
-        border-color: #30363d !important;
-    }
-
-    .stCaption {
-        color: #9ca3af !important;
-    }
-
-    [data-testid="stAlert"] {
-        border-radius: 10px !important;
-    }
-
-    [data-testid="stSpinner"] {
-        color: #ffffff !important;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# =========================================================
-# APPLICATION NAVIGATION / HOME DASHBOARD
-# =========================================================
-
-if "screen" not in st.session_state:
-    st.session_state["screen"] = "home"
-
-if "reset_id" not in st.session_state:
-    st.session_state["reset_id"] = 0
-
-if "report" not in st.session_state:
-    st.session_state["report"] = None
-
-# ---------------------------------------------------------
-# HOME DASHBOARD THEME
-# ---------------------------------------------------------
-
-st.markdown(
-    """
-    <style>
-    .dashboard-wrap {
-        max-width: 1250px;
-        margin: 0 auto;
-        padding: 24px 10px 40px 10px;
-    }
-
-    .dashboard-kicker {
-        text-align: center;
-        color: #60a5fa !important;
-        font-size: 13px;
-        font-weight: 700;
-        letter-spacing: 3px;
-        text-transform: uppercase;
-        margin-top: 10px;
-    }
-
-    .dashboard-title {
-        text-align: center;
-        color: #ffffff !important;
-        font-size: 48px;
-        font-weight: 800;
-        letter-spacing: 1px;
-        margin: 4px 0 6px 0;
-    }
-
-    .dashboard-subtitle {
-        text-align: center;
-        color: #9ca3af !important;
-        font-size: 16px;
-        margin-bottom: 34px;
-    }
-
-    .tool-card {
-        min-height: 265px;
-        padding: 28px 24px 20px 24px;
-        border-radius: 20px;
-        border: 1px solid #303b4d;
-        background: linear-gradient(145deg, #151b26 0%, #0f141d 100%);
-        box-shadow: 0 14px 35px rgba(0,0,0,.28);
-        margin-bottom: 8px;
-    }
-
-    .tool-icon {
-        width: 58px;
-        height: 58px;
-        border-radius: 16px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: #172554;
-        border: 1px solid #2563eb;
-        color: #93c5fd;
-        font-size: 29px;
-        margin-bottom: 20px;
-    }
-
-    .tool-card h3 {
-        color: #ffffff !important;
-        font-size: 20px;
-        line-height: 1.25;
-        margin: 0 0 10px 0;
-    }
-
-    .tool-card p {
-        color: #9ca3af !important;
-        font-size: 14px;
-        line-height: 1.55;
-        min-height: 66px;
-        margin: 0;
-    }
-
-    .coming-card .tool-icon {
-        background: #211b31;
-        border-color: #7c3aed;
-        color: #c4b5fd;
-    }
-
-    .coming-badge {
-        display: inline-block;
-        margin-top: 12px;
-        padding: 5px 10px;
-        border-radius: 999px;
-        background: #27272a;
-        color: #a1a1aa !important;
-        font-size: 11px;
-        font-weight: 700;
-        letter-spacing: .7px;
-    }
-
-    .feature-strip {
-        margin-top: 18px;
-        padding: 16px 20px;
-        border: 1px solid #263244;
-        border-radius: 16px;
-        background: #111827;
-        text-align: center;
-        color: #cbd5e1 !important;
-        font-size: 13px;
-    }
-
-    .feature-strip span {
-        margin: 0 18px;
-        color: #cbd5e1 !important;
-    }
-
-    .dashboard-footer {
-        text-align: center;
-        color: #64748b !important;
-        font-size: 12px;
-        margin-top: 26px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-def show_home():
-    st.markdown('<div class="dashboard-wrap">', unsafe_allow_html=True)
-    st.markdown('<div class="dashboard-kicker">QUALITY CONTROL PLATFORM</div>', unsafe_allow_html=True)
-    st.markdown('<div class="dashboard-title">QC PROOFREADER</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="dashboard-subtitle">Smart artwork validation for Order Forms, specifications and production output.</div>',
-        unsafe_allow_html=True
-    )
-
-    cards = [
-        (
-            "📄",
-            "ORDER-FORM<br>TO OUTPUT-CHECK",
-            "Validate selected variable Order Form data against PDF artwork, including panel-aware PFL checking.",
-            "active"
-        ),
-        (
-            "🔍",
-            "ORIGINAL SPEC<br>TO OUTPUT-CHECK",
-            "Compare production artwork directly against the approved original specification.",
-            "coming"
-        ),
-        (
-            "🔄",
-            "SPEC + ORDER FORM<br>+ OUTPUT CHECK",
-            "Cross-check the specification, Order Form and final output together in one workflow.",
-            "coming"
-        ),
-        (
-            "⚙️",
-            "MORE QC<br>TOOLS",
-            "Additional artwork and production-quality utilities can be added here later.",
-            "coming"
-        ),
-    ]
-
-    cols = st.columns(4, gap="large")
-    for col, (icon, title, description, state) in zip(cols, cards):
-        with col:
-            badge = "<div class=\"coming-badge\">COMING SOON</div>" if state == "coming" else ""
-            card_class = "tool-card coming-card" if state == "coming" else "tool-card"
-            st.markdown(
-                f'<div class="{card_class}">'
-                f'<div class="tool-icon">{icon}</div>'
-                f'<h3>{title}</h3>'
-                f'<p>{description}</p>'
-                f'{badge}'
-                f'</div>',
-                unsafe_allow_html=True
-            )
-
-            if state == "active":
-                if st.button("🚀  START NOW", key="open_order_output", use_container_width=True):
-                    st.session_state["screen"] = "order_output"
-                    st.rerun()
-            else:
-                st.button("Coming Soon", key=f"soon_{title}", disabled=True, use_container_width=True)
+def _apply_tool_css():
+    # =========================================================
+    # DARK UI
+    # =========================================================
 
     st.markdown(
-        '<div class="feature-strip">'
-        '<span>✓ Accurate</span><span>⚡ Fast</span><span>◈ Field-Aware</span><span>✓ QC Focused</span>'
-        '</div>',
+        """
+        <style>
+
+        html,
+        body,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stApp"],
+        .stApp,
+        .main,
+        [data-testid="stMain"] {
+            background-color: #0e1117 !important;
+            color: #ffffff !important;
+        }
+
+        [data-testid="stHeader"] {
+            background-color: #0e1117 !important;
+        }
+
+        .stApp,
+        .stApp p,
+        .stApp label,
+        .stApp span,
+        .stApp div {
+            color: #ffffff;
+        }
+
+        .main-title {
+            color: #ffffff !important;
+            font-size: 34px;
+            font-weight: 700;
+            margin-top: 5px;
+            margin-bottom: 4px;
+        }
+
+        .sub-title {
+            color: #b8c0cc !important;
+            font-size: 15px;
+            margin-bottom: 30px;
+        }
+
+        .section-title {
+            color: #ffffff !important;
+            font-size: 20px;
+            font-weight: 700;
+            margin-top: 12px;
+            margin-bottom: 10px;
+        }
+
+        [data-testid="stFileUploader"] {
+            background-color: #161b22 !important;
+            border: 1px solid #4b5563 !important;
+            border-radius: 12px !important;
+            padding: 8px !important;
+        }
+
+        [data-testid="stFileUploaderDropzone"] {
+            background-color: #161b22 !important;
+            border: 1px solid #4b5563 !important;
+            border-radius: 10px !important;
+        }
+
+        [data-testid="stFileUploaderDropzoneInstructions"] {
+            color: #ffffff !important;
+        }
+
+        [data-testid="stFileUploaderDropzoneInstructions"] span {
+            color: #ffffff !important;
+        }
+
+        [data-testid="stFileUploader"] button {
+            background-color: #111827 !important;
+            color: #ffffff !important;
+            border: 1px solid #6b7280 !important;
+            border-radius: 8px !important;
+        }
+
+        [data-testid="stFileUploader"] button:hover {
+            background-color: #1f2937 !important;
+            color: #ffffff !important;
+        }
+
+        [data-baseweb="select"] > div {
+            background-color: #161b22 !important;
+            color: #ffffff !important;
+            border: 1px solid #4b5563 !important;
+            border-radius: 10px !important;
+        }
+
+        [data-baseweb="select"] input {
+            color: #ffffff !important;
+        }
+
+        [data-baseweb="select"] span {
+            color: #ffffff !important;
+        }
+
+        [data-baseweb="popover"] {
+            background-color: #161b22 !important;
+        }
+
+        [role="option"] {
+            background-color: #161b22 !important;
+            color: #ffffff !important;
+        }
+
+        [role="option"]:hover {
+            background-color: #263241 !important;
+        }
+
+        [data-baseweb="tag"] {
+            background-color: #2563eb !important;
+            color: #ffffff !important;
+        }
+
+        [data-baseweb="tag"] span {
+            color: #ffffff !important;
+        }
+
+        div.stButton > button {
+            background-color: #2196F3 !important;
+            color: #ffffff !important;
+            border: 2px solid #000000 !important;
+            border-radius: 12px !important;
+            font-size: 18px !important;
+            font-weight: 700 !important;
+            height: 54px !important;
+            width: 100% !important;
+            box-shadow: none !important;
+        }
+
+        div.stButton > button:hover {
+            background-color: #1976D2 !important;
+            color: #ffffff !important;
+            border: 2px solid #000000 !important;
+        }
+
+        div.stDownloadButton > button {
+            background-color: #1f2937 !important;
+            color: #ffffff !important;
+            border: 1px solid #6b7280 !important;
+            border-radius: 10px !important;
+            font-weight: 600 !important;
+        }
+
+        div.stDownloadButton > button:hover {
+            background-color: #374151 !important;
+            color: #ffffff !important;
+        }
+
+        [data-testid="stDataFrame"] {
+            border: 1px solid #374151 !important;
+            border-radius: 10px !important;
+        }
+
+        [data-testid="stMetric"] {
+            background-color: #161b22 !important;
+            border: 1px solid #374151 !important;
+            border-radius: 10px !important;
+            padding: 12px !important;
+        }
+
+        [data-testid="stMetricLabel"] {
+            color: #b8c0cc !important;
+        }
+
+        [data-testid="stMetricValue"] {
+            color: #ffffff !important;
+        }
+
+        hr {
+            border-color: #30363d !important;
+        }
+
+        .stCaption {
+            color: #9ca3af !important;
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 10px !important;
+        }
+
+        [data-testid="stSpinner"] {
+            color: #ffffff !important;
+        }
+
+        </style>
+        """,
         unsafe_allow_html=True
     )
-    st.markdown(
-        '<div class="dashboard-footer">QC Proofreader • Artwork Quality Control</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-if st.session_state["screen"] == "home":
-    show_home()
-    st.stop()
-
-
-# =========================================================
-# TITLE
-# =========================================================
-
-st.markdown(
-    '<div class="main-title">🔍 PDF Proofreader</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    '<div class="sub-title">'
-    'Compare selected variable Order Form fields against PDF artwork.'
-    '</div>',
-    unsafe_allow_html=True
-)
-
-
-# =========================================================
-# TOOL NAVIGATION
-# =========================================================
-
-nav_left, nav_right = st.columns([1, 1])
-
-with nav_left:
-    if st.button("← HOME", key="back_home", use_container_width=True):
-        st.session_state["screen"] = "home"
-        st.rerun()
-
-with nav_right:
-    if st.button("🆕 NEW START", key="new_start", use_container_width=True):
-        st.session_state["reset_id"] += 1
-        st.session_state["report"] = None
-        st.rerun()
-
-
-# =========================================================
-# PRODUCT TYPE
-# =========================================================
-
-product_type = st.selectbox(
-    "Select Product Type",
-    options=[
-        "----- SELECT -----",
-        "PFL",
-        "HTL",
-        "Other"
-    ],
-    index=0,
-    help=(
-        "PFL = panelled artwork where variable data may continue across panels. "
-        "HTL / Other = standard continuous-data comparison."
-    )
-)
-
-if product_type == "----- SELECT -----":
-    st.info("Please select a Product Type before starting the comparison.")
-
-
-# =========================================================
-# NORMALIZATION
-# =========================================================
 
 def normalize_text(text):
 
@@ -2322,467 +2034,504 @@ def style_status(value):
 
 
 # =========================================================
-# UPLOAD AREA
-# =========================================================
 
-left_column, right_column = st.columns(2)
+def main():
+    """Render Tool 1: Order Form → Output Check."""
 
-with left_column:
+    _apply_tool_css()
 
+    # =========================================================
+    # TOOL 1 SESSION STATE
+    # =========================================================
+    if "of_reset_id" not in st.session_state:
+        st.session_state["of_reset_id"] = 0
+
+    if "of_report" not in st.session_state:
+        st.session_state["of_report"] = None
+
+    # =========================================================
+    # TITLE
+    # =========================================================
     st.markdown(
-        '<div class="section-title">📊 Order Form</div>',
+        '<div class="main-title">🔍 PDF Proofreader</div>',
         unsafe_allow_html=True
     )
 
-    excel_file = st.file_uploader(
-        "Upload Excel Order Form",
-        type=["xlsx", "xls"],
-        key=f"excel_upload_{st.session_state['reset_id']}"
-    )
-
-with right_column:
-
     st.markdown(
-        '<div class="section-title">📄 Output Artwork</div>',
+        '<div class="sub-title">'
+        'Compare selected variable Order Form fields against PDF artwork.'
+        '</div>',
         unsafe_allow_html=True
     )
 
-    output_file = st.file_uploader(
-        "Upload Output Artwork",
-        type=["pdf", "jpg", "jpeg", "png"],
-        key=f"output_upload_{st.session_state['reset_id']}"
+    # =========================================================
+    # TOOL NAVIGATION
+    # =========================================================
+    nav_left, nav_right = st.columns([1, 1])
+
+    with nav_left:
+        if st.button("← HOME", key="of_back_home", width="stretch"):
+            st.session_state["selected_tool"] = None
+            st.session_state["of_report"] = None
+            st.rerun()
+
+    with nav_right:
+        if st.button(
+            "🆕 NEW START",
+            key="of_new_start",
+            width="stretch"
+        ):
+            st.session_state["of_reset_id"] += 1
+            st.session_state["of_report"] = None
+            st.rerun()
+
+    # =========================================================
+    # PRODUCT TYPE
+    # =========================================================
+    product_type = st.selectbox(
+        "Select Product Type",
+        options=[
+            "----- SELECT -----",
+            "PFL",
+            "HTL",
+            "Other"
+        ],
+        index=0,
+        key=f"of_product_type_{st.session_state['of_reset_id']}",
+        help=(
+            "PFL = panelled artwork where variable data may continue "
+            "across panels. HTL / Other = standard continuous-data comparison."
+        )
     )
 
+    if product_type == "----- SELECT -----":
+        st.info(
+            "Please select a Product Type before starting the comparison."
+        )
 
-# =========================================================
-# LOAD ORDER FORM
-# =========================================================
+    # =========================================================
+    # UPLOAD AREA
+    # =========================================================
+    left_column, right_column = st.columns(2)
 
-df = None
+    with left_column:
+        st.markdown(
+            '<div class="section-title">📊 Order Form</div>',
+            unsafe_allow_html=True
+        )
 
-if excel_file:
+        excel_file = st.file_uploader(
+            "Upload Excel Order Form",
+            type=["xlsx", "xls"],
+            key=f"excel_upload_{st.session_state['of_reset_id']}"
+        )
 
-    try:
-        df = load_excel(excel_file)
-    except Exception as error:
-        st.error(f"Unable to read the Excel Order Form: {error}")
-        st.stop()
+    with right_column:
+        st.markdown(
+            '<div class="section-title">📄 Output Artwork</div>',
+            unsafe_allow_html=True
+        )
 
+        output_file = st.file_uploader(
+            "Upload Output Artwork",
+            type=["pdf", "jpg", "jpeg", "png"],
+            key=f"output_upload_{st.session_state['of_reset_id']}"
+        )
 
-# =========================================================
-# COMPARISON METHOD
-# =========================================================
+    # =========================================================
+    # LOAD ORDER FORM
+    # =========================================================
+    df = None
 
-comparison_method = None
-selected_fields = []
+    if excel_file:
+        try:
+            df = load_excel(excel_file)
+        except Exception as error:
+            st.error(
+                f"Unable to read the Excel Order Form: {error}"
+            )
+            return
 
-if excel_file and output_file:
+    # =========================================================
+    # COMPARISON METHOD
+    # =========================================================
+    comparison_method = None
+    selected_fields = []
 
-    st.divider()
-
-    st.markdown(
-        '<div class="section-title">⚙️ Comparison Method</div>',
-        unsafe_allow_html=True
-    )
-
-    st.caption(
-        "Choose how the Order Form data should be matched to the Output. "
-        "Nothing is selected automatically."
-    )
-
-    comparison_method = st.radio(
-        "Comparison Method",
-        options=["Auto Detect", "Select Fields"],
-        index=None,
-        horizontal=True,
-        key=f"comparison_method_{st.session_state['reset_id']}"
-    )
-
-    if comparison_method == "Select Fields":
+    if excel_file and output_file:
+        st.divider()
 
         st.markdown(
-            '<div class="section-title">Select Variable Fields to Validate</div>',
+            '<div class="section-title">⚙️ Comparison Method</div>',
             unsafe_allow_html=True
         )
 
         st.caption(
-            "Only the fields selected below will participate in the comparison."
+            "Choose how the Order Form data should be matched to the Output. "
+            "Nothing is selected automatically."
         )
 
-        selected_fields = st.multiselect(
-            "Select the fields from your Order Form",
-            options=[str(column) for column in df.columns],
-            default=[],
-            label_visibility="collapsed",
-            key=f"selected_fields_{st.session_state['reset_id']}"
+        comparison_method = st.radio(
+            "Comparison Method",
+            options=["Auto Detect", "Select Fields"],
+            index=None,
+            horizontal=True,
+            key=f"comparison_method_{st.session_state['of_reset_id']}"
         )
 
-        if selected_fields:
-            preview_rows = []
+        if comparison_method == "Select Fields":
+            st.markdown(
+                '<div class="section-title">'
+                'Select Variable Fields to Validate'
+                '</div>',
+                unsafe_allow_html=True
+            )
 
-            for field in selected_fields:
-                values = []
+            st.caption(
+                "Only the fields selected below will participate in the comparison."
+            )
 
-                for value in df[field].tolist():
-                    if pd.isna(value):
-                        continue
+            selected_fields = st.multiselect(
+                "Select the fields from your Order Form",
+                options=[str(column) for column in df.columns],
+                default=[],
+                label_visibility="collapsed",
+                key=f"selected_fields_{st.session_state['of_reset_id']}"
+            )
 
-                    value = str(value).strip()
+            if selected_fields:
+                preview_rows = []
 
-                    if value:
-                        values.append(value)
+                for field in selected_fields:
+                    values = []
 
-                preview_rows.append({
-                    "Excel Field": field,
-                    "Values": len(values),
-                    "Preview": " | ".join(values[:3])
-                })
+                    for value in df[field].tolist():
+                        if pd.isna(value):
+                            continue
 
-            with st.expander("🔎 Preview Selected Fields"):
-                st.dataframe(
-                    pd.DataFrame(preview_rows),
-                    width="stretch",
-                    hide_index=True
-                )
-        else:
-            st.info("Select at least one Order Form field to continue.")
+                        value = str(value).strip()
 
+                        if value:
+                            values.append(value)
 
-# =========================================================
-# FILE INFORMATION
-#
-# Page count is metadata only. Output text/OCR is NOT extracted here.
-# =========================================================
+                    preview_rows.append({
+                        "Excel Field": field,
+                        "Values": len(values),
+                        "Preview": " | ".join(values[:3])
+                    })
 
-if excel_file and output_file:
-
-    try:
-        output_page_count = get_output_page_count(output_file)
-    except Exception as error:
-        output_page_count = 0
-        st.warning(f"Unable to determine output page count: {error}")
-
-    st.markdown(
-        '<div class="section-title">📌 File Information</div>',
-        unsafe_allow_html=True
-    )
-
-    info1, info2, info3 = st.columns(3)
-
-    with info1:
-        st.metric("Excel Data Rows", len(df))
-
-    with info2:
-        st.metric("Output Pages", output_page_count)
-
-    with info3:
-        extension = str(output_file.name).split(".")[-1].upper()
-        st.metric("Output Type", extension)
-
-    if output_page_count and len(df) != output_page_count:
-        st.warning(
-            "⚠️ Excel row count and output page count do not have the same count. "
-            "The existing mapping will still use Output Page 1 → Excel Row 2, "
-            "Output Page 2 → Excel Row 3, and so on."
-        )
-    elif output_page_count:
-        st.success("✅ Excel rows and output pages match.")
-
-
-# =========================================================
-# COMPARE BUTTON
-#
-# Extraction and comparison begin ONLY after this button is pressed.
-# =========================================================
-
-if excel_file and output_file:
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    compare_ready = (
-        comparison_method is not None
-        and (
-            comparison_method == "Auto Detect"
-            or bool(selected_fields)
-        )
-        and product_type != "----- SELECT -----"
-    )
-
-    if st.button(
-        "🔍  COMPARE & PROOFREAD",
-        width="stretch",
-        key=f"compare_button_{st.session_state['reset_id']}",
-        disabled=not compare_ready
-    ):
-
-        try:
-            with st.spinner("Reading output and preparing comparison..."):
-
-                # -------------------------------------------------
-                # EXTRACTION LAYER
-                # -------------------------------------------------
-                # This is the first point at which output text is read.
-                # -------------------------------------------------
-                output_pages = extract_output_pages(output_file)
-
-                if not output_pages:
-                    raise ValueError("No readable output pages were detected.")
-
-                # -------------------------------------------------
-                # COMPARISON LAYER
-                # -------------------------------------------------
-                if comparison_method == "Auto Detect":
-
-                    detected_fields = auto_detect_fields(
-                        df,
-                        output_pages,
-                        product_type
+                with st.expander("🔎 Preview Selected Fields"):
+                    st.dataframe(
+                        pd.DataFrame(preview_rows),
+                        width="stretch",
+                        hide_index=True
                     )
+            else:
+                st.info(
+                    "Select at least one Order Form field to continue."
+                )
 
-                    if not detected_fields:
-                        st.session_state["report"] = pd.DataFrame([
-                            {
-                                "FIELD NO": 1,
-                                "PDF PAGE": "—",
-                                "EXCEL ROW": "—",
-                                "FIELD": "Auto Detect",
-                                "ORDER FORM DATA": "—",
-                                "PDF OUTPUT": "—",
-                                "STATUS": "NOT FOUND",
-                                "DIFFERENCE": (
-                                    "No relevant Order Form fields could be "
-                                    "reliably associated with the output."
-                                )
-                            }
-                        ])
-                    else:
-                        st.session_state["report"] = build_report(
+    # =========================================================
+    # FILE INFORMATION
+    # Page count is metadata only. Output text/OCR is NOT extracted here.
+    # =========================================================
+    if excel_file and output_file:
+        try:
+            output_page_count = get_output_page_count(output_file)
+        except Exception as error:
+            output_page_count = 0
+            st.warning(
+                f"Unable to determine output page count: {error}"
+            )
+
+        st.markdown(
+            '<div class="section-title">📌 File Information</div>',
+            unsafe_allow_html=True
+        )
+
+        info1, info2, info3 = st.columns(3)
+
+        with info1:
+            st.metric("Excel Data Rows", len(df))
+
+        with info2:
+            st.metric("Output Pages", output_page_count)
+
+        with info3:
+            extension = str(output_file.name).split(".")[-1].upper()
+            st.metric("Output Type", extension)
+
+        if output_page_count and len(df) != output_page_count:
+            st.warning(
+                "⚠️ Excel row count and output page count do not have the same "
+                "count. The existing mapping will still use Output Page 1 → "
+                "Excel Row 2, Output Page 2 → Excel Row 3, and so on."
+            )
+        elif output_page_count:
+            st.success("✅ Excel rows and output pages match.")
+
+    # =========================================================
+    # COMPARE BUTTON
+    # Extraction and comparison start ONLY after COMPARE.
+    # =========================================================
+    if excel_file and output_file:
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        compare_ready = (
+            comparison_method is not None
+            and (
+                comparison_method == "Auto Detect"
+                or bool(selected_fields)
+            )
+            and product_type != "----- SELECT -----"
+        )
+
+        if st.button(
+            "🔍  COMPARE & PROOFREAD",
+            width="stretch",
+            key=f"of_compare_button_{st.session_state['of_reset_id']}",
+            disabled=not compare_ready
+        ):
+            try:
+                with st.spinner(
+                    "Reading output and preparing comparison..."
+                ):
+                    # =====================================================
+                    # EXTRACTION LAYER
+                    # =====================================================
+                    output_pages = extract_output_pages(output_file)
+
+                    if not output_pages:
+                        raise ValueError(
+                            "No readable output pages were detected."
+                        )
+
+                    # =====================================================
+                    # COMPARISON LAYER
+                    # =====================================================
+                    if comparison_method == "Auto Detect":
+                        detected_fields = auto_detect_fields(
                             df,
                             output_pages,
-                            detected_fields,
                             product_type
                         )
 
-                    st.session_state["report_selected_fields"] = detected_fields
+                        if not detected_fields:
+                            st.session_state["of_report"] = pd.DataFrame([
+                                {
+                                    "FIELD NO": 1,
+                                    "PDF PAGE": "—",
+                                    "EXCEL ROW": "—",
+                                    "FIELD": "Auto Detect",
+                                    "ORDER FORM DATA": "—",
+                                    "PDF OUTPUT": "—",
+                                    "STATUS": "NOT FOUND",
+                                    "DIFFERENCE": (
+                                        "No relevant Order Form fields could be "
+                                        "reliably associated with the output."
+                                    )
+                                }
+                            ])
+                        else:
+                            st.session_state["of_report"] = build_report(
+                                df,
+                                output_pages,
+                                detected_fields,
+                                product_type
+                            )
 
-                else:
-                    st.session_state["report"] = build_report(
-                        df,
-                        output_pages,
-                        selected_fields,
-                        product_type
+                        st.session_state["of_report_selected_fields"] = (
+                            detected_fields
+                        )
+
+                    else:
+                        st.session_state["of_report"] = build_report(
+                            df,
+                            output_pages,
+                            selected_fields,
+                            product_type
+                        )
+
+                        st.session_state["of_report_selected_fields"] = (
+                            selected_fields
+                        )
+
+                    st.session_state["of_report_product_type"] = product_type
+                    st.session_state["of_report_comparison_method"] = (
+                        comparison_method
                     )
 
-                    st.session_state["report_selected_fields"] = selected_fields
+            except Exception as error:
+                st.error(
+                    f"Unable to process the Output Artwork: {error}"
+                )
 
-                st.session_state["report_product_type"] = product_type
-                st.session_state["report_comparison_method"] = comparison_method
+    # =========================================================
+    # SAVED REPORT
+    # =========================================================
+    report = st.session_state.get("of_report")
 
-        except Exception as error:
-            st.error(f"Unable to process the Output Artwork: {error}")
+    if report is not None:
+        st.divider()
 
-
-# =========================================================
-# SAVED REPORT
-#
-# Stored in session state so the report remains visible after
-# normal Streamlit reruns until NEW START is selected.
-# =========================================================
-
-report = st.session_state.get("report")
-
-if report is not None:
-
-    st.divider()
-
-    st.markdown(
-        '<div class="section-title">QC Report</div>',
-        unsafe_allow_html=True
-    )
-
-    report_product_type = st.session_state.get(
-        "report_product_type",
-        product_type
-    )
-
-    report_method = st.session_state.get("report_comparison_method", "Select Fields")
-    report_fields = st.session_state.get("report_selected_fields", [])
-
-    st.caption(
-        f"Comparison method: {report_method} • Product type: {report_product_type}"
-    )
-
-    if report_method == "Auto Detect" and report_fields:
-        st.caption("Auto-detected fields: " + ", ".join(report_fields))
-
-    # =================================================
-    # COUNTS
-    # =================================================
-
-    pass_count = int(
-        (report["STATUS"] == "PASS").sum()
-    )
-
-    fail_count = int(
-        (report["STATUS"] == "FAIL").sum()
-    )
-
-    not_found_count = int(
-        (report["STATUS"] == "NOT FOUND").sum()
-    )
-
-    skip_count = int(
-        (report["STATUS"] == "SKIP").sum()
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric("PASS", pass_count)
-
-    with col2:
-        st.metric("FAIL", fail_count)
-
-    with col3:
-        st.metric("NOT FOUND", not_found_count)
-
-    with col4:
-        st.metric("IGNORED", skip_count)
-
-    # =================================================
-    # REPORT TABLE
-    # =================================================
-
-    styled_report = (
-        report
-        .style
-        .map(
-            style_status,
-            subset=["STATUS"]
-        )
-    )
-
-    st.dataframe(
-        styled_report,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # =================================================
-    # CONCLUSION
-    # =================================================
-
-    st.divider()
-
-    if fail_count > 0:
-        st.error(
-            f"❌ FAIL — {fail_count} variable-data mismatch(es) detected."
+        st.markdown(
+            '<div class="section-title">QC Report</div>',
+            unsafe_allow_html=True
         )
 
-    elif not_found_count > 0:
-        st.warning(
-            f"⚠️ REVIEW — {not_found_count} selected variable "
-            f"field(s) could not be located."
+        report_product_type = st.session_state.get(
+            "of_report_product_type",
+            product_type
         )
 
-    else:
-        st.success(
-            "✅ PASS — All selected variable fields matched the PDF artwork."
+        report_method = st.session_state.get(
+            "of_report_comparison_method",
+            "Select Fields"
         )
 
-    # =================================================
-    # LOGIC EXPLANATION
-    # =================================================
-
-    with st.expander("ℹ️ How this validation works"):
-        st.write(
-            """
-            **Variable-data validation**
-
-            Only the fields selected from the Order Form are treated as
-            variable artwork data.
-
-            **Static PDF content is ignored.**
-
-            PDF bullets/keystrokes such as `n`, regional prefixes,
-            addresses, phone numbers and other unselected static artwork
-            content do not create failures.
-
-            **Page mapping**
-
-            PDF Page 1 → Excel Row 2
-
-            PDF Page 2 → Excel Row 3
-
-            PDF Page 3 → Excel Row 4
-
-            and so on.
-
-            **PFL mode**
-
-            Panel-numbered artwork is treated as a continuous stream so
-            selected variable data can continue from one panel into the
-            next panel.
-
-            **Mismatch detection**
-
-            If the selected Order Form value is present in the PDF → PASS.
-
-            If the expected value is absent but a relevant alternative
-            value is detected → FAIL.
-
-            If an Order Form field is blank, that field is not required
-            and is ignored.
-            """
+        report_fields = st.session_state.get(
+            "of_report_selected_fields",
+            []
         )
 
-    # =================================================
-    # DOWNLOAD REPORT
-    # =================================================
+        st.caption(
+            f"Comparison method: {report_method} • "
+            f"Product type: {report_product_type}"
+        )
 
-    csv_data = (
-        report
-        .to_csv(index=False)
-        .encode("utf-8-sig")
-    )
+        if report_method == "Auto Detect" and report_fields:
+            st.caption(
+                "Auto-detected fields: " + ", ".join(report_fields)
+            )
 
-    st.download_button(
-        label="⬇️ Download QC Report",
-        data=csv_data,
-        file_name="PDF_Proofreading_QC_Report.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="download_qc_report"
-    )
+        pass_count = int(
+            (report["STATUS"] == "PASS").sum()
+        )
 
+        fail_count = int(
+            (report["STATUS"] == "FAIL").sum()
+        )
 
-# =========================================================
-# INITIAL INSTRUCTIONS
-# =========================================================
+        not_found_count = int(
+            (report["STATUS"] == "NOT FOUND").sum()
+        )
 
-if not excel_file:
+        skip_count = int(
+            (report["STATUS"] == "SKIP").sum()
+        )
 
-    st.caption(
-        "Upload an Order Form to begin."
-    )
+        col1, col2, col3, col4 = st.columns(4)
 
+        with col1:
+            st.metric("PASS", pass_count)
 
-elif not pdf_file:
+        with col2:
+            st.metric("FAIL", fail_count)
 
-    st.caption(
-        "Upload the Output Artwork to continue."
-    )
+        with col3:
+            st.metric("NOT FOUND", not_found_count)
 
+        with col4:
+            st.metric("IGNORED", skip_count)
 
-elif product_type == "----- SELECT -----":
+        styled_report = (
+            report
+            .style
+            .map(
+                style_status,
+                subset=["STATUS"]
+            )
+        )
 
-    st.caption(
-        "Select the Product Type to continue."
-    )
+        st.dataframe(
+            styled_report,
+            width="stretch",
+            hide_index=True
+        )
 
+        st.divider()
 
-elif not selected_fields:
+        if fail_count > 0:
+            st.error(
+                f"❌ FAIL — {fail_count} variable-data mismatch(es) detected."
+            )
+        elif not_found_count > 0:
+            st.warning(
+                f"⚠️ REVIEW — {not_found_count} selected variable "
+                f"field(s) could not be located."
+            )
+        else:
+            st.success(
+                "✅ PASS — All selected variable fields matched the PDF artwork."
+            )
 
-    st.caption(
-        "Select the variable fields you want to validate."
-    )
+        with st.expander("ℹ️ How this validation works"):
+            st.write(
+                """
+                **Variable-data validation**
+
+                Only the fields selected from the Order Form are treated as
+                variable artwork data.
+
+                **Static PDF content is ignored.**
+
+                PDF bullets/keystrokes such as `n`, regional prefixes,
+                addresses, phone numbers and other unselected static artwork
+                content do not create failures.
+
+                **Page mapping**
+
+                PDF Page 1 → Excel Row 2
+
+                PDF Page 2 → Excel Row 3
+
+                PDF Page 3 → Excel Row 4
+
+                and so on.
+
+                **PFL mode**
+
+                Panel-numbered artwork is treated as a continuous stream so
+                selected variable data can continue from one panel into the
+                next panel.
+
+                **Mismatch detection**
+
+                If the selected Order Form value is present in the PDF → PASS.
+
+                If the expected value is absent but a relevant alternative
+                value is detected → FAIL.
+
+                If an Order Form field is blank, that field is not required
+                and is ignored.
+                """
+            )
+
+        csv_data = (
+            report
+            .to_csv(index=False)
+            .encode("utf-8-sig")
+        )
+
+        st.download_button(
+            label="⬇️ Download QC Report",
+            data=csv_data,
+            file_name="PDF_Proofreading_QC_Report.csv",
+            mime="text/csv",
+            width="stretch",
+            key=f"of_download_qc_report_{st.session_state['of_reset_id']}"
+        )
+
+    # =========================================================
+    # INITIAL INSTRUCTIONS
+    # =========================================================
+    if not excel_file:
+        st.caption("Upload an Order Form to begin.")
+    elif not output_file:
+        st.caption("Upload the Output Artwork to continue.")
+    elif product_type == "----- SELECT -----":
+        st.caption("Select the Product Type to continue.")
+    elif comparison_method is None:
+        st.caption("Select a Comparison Method to continue.")
+    elif comparison_method == "Select Fields" and not selected_fields:
+        st.caption("Select the variable fields you want to validate.")
