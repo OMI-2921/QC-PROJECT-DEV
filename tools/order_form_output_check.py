@@ -4,8 +4,13 @@ import fitz
 import re
 import unicodedata
 import io
+from io import BytesIO
 
 from PIL import Image
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 def _apply_tool_css():
     # =========================================================
@@ -1947,6 +1952,198 @@ def style_status(value):
     return ""
 
 
+
+def create_excel_report(report, product_type, comparison_method, selected_fields):
+    """Create a professional Excel QC report with Summary and Field Comparison sheets."""
+
+    output = BytesIO()
+    wb = Workbook()
+
+    # ---------------------------------------------------------
+    # COLORS
+    # ---------------------------------------------------------
+    NAVY = "1F4E78"
+    LIGHT_BLUE = "D9EAF7"
+    GREEN = "238636"
+    RED = "DA3633"
+    AMBER = "9E6A03"
+    GREY = "555555"
+    WHITE = "FFFFFF"
+    LIGHT_BORDER = "D9E1F2"
+
+    # ---------------------------------------------------------
+    # COUNTS
+    # ---------------------------------------------------------
+    pass_count = int((report["STATUS"] == "PASS").sum()) if not report.empty else 0
+    fail_count = int((report["STATUS"] == "FAIL").sum()) if not report.empty else 0
+    not_found_count = int((report["STATUS"] == "NOT FOUND").sum()) if not report.empty else 0
+    skip_count = int((report["STATUS"] == "SKIP").sum()) if not report.empty else 0
+    total_checks = len(report)
+
+    if fail_count > 0:
+        overall = "FAIL"
+    elif not_found_count > 0:
+        overall = "REVIEW"
+    else:
+        overall = "PASS"
+
+    # =========================================================
+    # SUMMARY
+    # =========================================================
+    ws = wb.active
+    ws.title = "Summary"
+
+    ws.merge_cells("A1:F2")
+    ws["A1"] = "PDF PROOFREADING QC REPORT"
+    ws["A1"].font = Font(bold=True, size=20, color=WHITE)
+    ws["A1"].fill = PatternFill("solid", fgColor=NAVY)
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+    summary = [
+        ("Comparison Method", comparison_method or "—"),
+        ("Product Type", product_type or "—"),
+        ("Selected / Detected Fields", len(selected_fields or [])),
+        ("Total Field Checks", total_checks),
+        ("PASS", pass_count),
+        ("FAIL", fail_count),
+        ("NOT FOUND", not_found_count),
+        ("IGNORED / SKIP", skip_count),
+        ("Overall Result", overall),
+    ]
+
+    for r, (label, value) in enumerate(summary, start=4):
+        ws.cell(r, 1, label)
+        ws.cell(r, 2, value)
+        ws.cell(r, 1).font = Font(bold=True)
+        ws.cell(r, 1).fill = PatternFill("solid", fgColor=LIGHT_BLUE)
+        ws.cell(r, 1).alignment = Alignment(vertical="center")
+        ws.cell(r, 2).alignment = Alignment(vertical="center", wrap_text=True)
+
+    result_cell = ws["B12"]
+    result_color = GREEN if overall == "PASS" else RED if overall == "FAIL" else AMBER
+    result_cell.fill = PatternFill("solid", fgColor=result_color)
+    result_cell.font = Font(bold=True, color=WHITE)
+    result_cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 28
+    ws.freeze_panes = "A4"
+
+    # Small finding section
+    finding_row = 15
+    ws.merge_cells(start_row=finding_row, start_column=1, end_row=finding_row, end_column=6)
+    ws.cell(finding_row, 1, "QC NOTES")
+    ws.cell(finding_row, 1).font = Font(bold=True, color=WHITE)
+    ws.cell(finding_row, 1).fill = PatternFill("solid", fgColor=NAVY)
+
+    notes = []
+    if fail_count:
+        notes.append(f"{fail_count} FAIL result(s) require review.")
+    if not_found_count:
+        notes.append(f"{not_found_count} field(s) could not be reliably located.")
+    if skip_count:
+        notes.append(f"{skip_count} blank/ignored field check(s) were skipped.")
+    if not notes:
+        notes.append("All checked fields passed.")
+
+    for idx, note in enumerate(notes, start=finding_row + 1):
+        ws.merge_cells(start_row=idx, start_column=1, end_row=idx, end_column=6)
+        ws.cell(idx, 1, "• " + note)
+        ws.cell(idx, 1).alignment = Alignment(wrap_text=True, vertical="top")
+
+    # =========================================================
+    # FIELD COMPARISON
+    # =========================================================
+    comparison = wb.create_sheet("Field Comparison")
+
+    headers = list(report.columns)
+    header_fill = PatternFill("solid", fgColor=NAVY)
+
+    for col_idx, header in enumerate(headers, start=1):
+        cell = comparison.cell(1, col_idx, header)
+        cell.font = Font(bold=True, color=WHITE)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for row_idx, row in enumerate(report.itertuples(index=False), start=2):
+        for col_idx, value in enumerate(row, start=1):
+            cell = comparison.cell(row_idx, col_idx, value)
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    # Status colors
+    status_col = None
+    for idx, header in enumerate(headers, start=1):
+        if header == "STATUS":
+            status_col = idx
+            break
+
+    if status_col:
+        for row_idx in range(2, comparison.max_row + 1):
+            cell = comparison.cell(row_idx, status_col)
+            status = str(cell.value or "")
+
+            if status == "PASS":
+                cell.fill = PatternFill("solid", fgColor=GREEN)
+                cell.font = Font(color=WHITE, bold=True)
+            elif status == "FAIL":
+                cell.fill = PatternFill("solid", fgColor=RED)
+                cell.font = Font(color=WHITE, bold=True)
+            elif status == "NOT FOUND":
+                cell.fill = PatternFill("solid", fgColor=AMBER)
+                cell.font = Font(color=WHITE, bold=True)
+            elif status == "SKIP":
+                cell.fill = PatternFill("solid", fgColor=GREY)
+                cell.font = Font(color=WHITE, bold=True)
+
+    # Table
+    if comparison.max_row >= 2 and comparison.max_column >= 1:
+        ref = f"A1:{get_column_letter(comparison.max_column)}{comparison.max_row}"
+        table = Table(displayName="QCFieldComparison", ref=ref)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        comparison.add_table(table)
+
+    # Widths
+    width_map = {
+        "FIELD NO": 12,
+        "PDF PAGE": 12,
+        "EXCEL ROW": 12,
+        "FIELD": 24,
+        "ORDER FORM DATA": 42,
+        "PDF OUTPUT": 52,
+        "STATUS": 16,
+        "DIFFERENCE": 58,
+        "MATCH TYPE": 22,
+    }
+
+    for col_idx, header in enumerate(headers, start=1):
+        letter = get_column_letter(col_idx)
+        comparison.column_dimensions[letter].width = width_map.get(header, 20)
+
+    comparison.row_dimensions[1].height = 32
+    for row_idx in range(2, comparison.max_row + 1):
+        comparison.row_dimensions[row_idx].height = 55
+
+    comparison.freeze_panes = "A2"
+    comparison.auto_filter.ref = comparison.dimensions
+
+    thin = Side(style="thin", color=LIGHT_BORDER)
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for row in comparison.iter_rows():
+        for cell in row:
+            cell.border = border
+
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
 def main():
     """Render Tool 1: Order Form → Output Check."""
 
@@ -2421,19 +2618,20 @@ def main():
                 """
             )
 
-        csv_data = (
-            report
-            .to_csv(index=False)
-            .encode("utf-8-sig")
+        excel_data = create_excel_report(
+            report=report,
+            product_type=report_product_type,
+            comparison_method=report_method,
+            selected_fields=report_fields
         )
 
         st.download_button(
-            label="⬇️ Download QC Report",
-            data=csv_data,
-            file_name="PDF_Proofreading_QC_Report.csv",
-            mime="text/csv",
+            label="⬇️ Download Excel QC Report",
+            data=excel_data,
+            file_name="PDF_Proofreading_QC_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             width="stretch",
-            key=f"of_download_qc_report_{st.session_state['of_reset_id']}"
+            key=f"of_download_excel_qc_report_{st.session_state['of_reset_id']}"
         )
 
     # =========================================================
