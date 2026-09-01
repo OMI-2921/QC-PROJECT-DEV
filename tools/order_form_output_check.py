@@ -6,7 +6,6 @@ import unicodedata
 import io
 
 from PIL import Image
-from difflib import SequenceMatcher
 
 def _apply_tool_css():
     # =========================================================
@@ -204,828 +203,20 @@ def _apply_tool_css():
         unsafe_allow_html=True
     )
 
-def normalize_text(text):
 
-    if text is None:
-        return ""
+# =========================================================
+# OPTIMIZED COMPARISON ENGINE
+# =========================================================
 
-    text = str(text)
-
-    text = unicodedata.normalize(
-        "NFKC",
-        text
-    )
-
-    text = text.lower()
-
-    # -----------------------------------------------------
-    # Normalize common PDF characters
-    # -----------------------------------------------------
-
-    text = text.replace("’", "'")
-    text = text.replace("`", "'")
-    text = text.replace("–", "-")
-    text = text.replace("—", "-")
-
-    # -----------------------------------------------------
-    # PDF line breaks
-    # -----------------------------------------------------
-
-    text = text.replace("\n", " ")
-    text = text.replace("\r", " ")
-
-    # -----------------------------------------------------
-    # IMPORTANT:
-    #
-    # The PDF may extract bullets as "n".
-    # We DO NOT want that "n" to become real content.
-    # -----------------------------------------------------
-
-    text = re.sub(
-        r"(^|\s)n(?=\s)",
-        " ",
-        text
-    )
-
-    # -----------------------------------------------------
-    # Separators
-    # -----------------------------------------------------
-
-    text = re.sub(
-        r"[,.;:|/\\]+",
-        " ",
-        text
-    )
-
-    text = re.sub(
-        r"-+",
-        " ",
-        text
-    )
-
-    # -----------------------------------------------------
-    # Remove remaining punctuation
-    # -----------------------------------------------------
-
-    text = re.sub(
-        r"[^\w%#'\s]",
-        " ",
-        text
-    )
-
-    # -----------------------------------------------------
-    # Apostrophe differences ignored
-    # -----------------------------------------------------
-
-    text = text.replace(
-        "'",
-        ""
-    )
-
-    # -----------------------------------------------------
-    # Multiple spaces
-    # -----------------------------------------------------
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-def compact_text(text):
-
-    return normalize_text(
-        text
-    ).replace(
-        " ",
-        ""
-    )
-
-
-def tokenize(text):
-
-    value = normalize_text(
-        text
-    )
-
-    if not value:
-        return []
-
-    return value.split()
+import pandas as pd
+import re
+import unicodedata
+import io
+from PIL import Image
 
 
 # =========================================================
-# FIELD TYPE DETECTION
-#
-# This is NOT deciding what to check.
-# The user-selected field is always checked.
-#
-# This only helps us locate the correct variable
-# information inside the PDF.
-# =========================================================
-
-def get_field_type(field_name):
-
-    field = normalize_text(
-        field_name
-    )
-
-    compact = field.replace(
-        " ",
-        ""
-    )
-
-    # Common variable identifiers / production data
-    # These are useful in Auto Detect mode.
-    if (
-        "sku" in compact
-        or "itemcode" in compact
-        or "itemnumber" in compact
-        or "itemno" in compact
-        or "stylecode" in compact
-        or "style" == compact
-    ):
-        return "IDENTIFIER"
-
-    if (
-        "batch" in compact
-        or "lotnumber" in compact
-        or "lotno" in compact
-        or "lot" == compact
-    ):
-        return "BATCH"
-
-    if (
-        "quantity" in compact
-        or "qty" == compact
-        or "units" in compact
-        or "pieces" in compact
-        or "pcs" == compact
-    ):
-        return "QUANTITY"
-
-    # Country of Origin
-
-    if (
-        "coo" in compact
-        or "countryoforigin" in compact
-        or "countryorigin" in compact
-        or "madein" in compact
-        or "origin" in compact
-    ):
-
-        return "COO"
-
-
-    # Fiber / Fabric / Content
-
-    if (
-        "fiber" in compact
-        or "fibre" in compact
-        or "fabric" in compact
-        or "content" in compact
-        or "composition" in compact
-        or "fabrication" in compact
-    ):
-
-        return "CONTENT"
-
-
-    # Care / Washing
-
-    if (
-        "care" in compact
-        or "wash" in compact
-        or "washing" in compact
-        or "laundry" in compact
-        or "instruction" in compact
-    ):
-
-        return "CARE"
-
-
-    # Size
-
-    if (
-        "size" in compact
-        or "sizeline" in compact
-        or "alpha" in compact
-        or "waist" in compact
-        or "inseam" in compact
-        or "fit" in compact
-    ):
-
-        return "SIZE"
-
-
-    # RN
-
-    if (
-        compact == "rn"
-        or "registrationnumber" in compact
-        or "companyrn" in compact
-    ):
-
-        return "RN"
-
-
-    # Brand
-
-    if (
-        "brand" in compact
-    ):
-
-        return "BRAND"
-
-
-    # Color
-
-    if (
-        "color" in compact
-        or "colour" in compact
-    ):
-
-        return "COLOR"
-
-
-    # Gender
-
-    if (
-        "gender" in compact
-    ):
-
-        return "GENDER"
-
-
-    # Attribute
-
-    if (
-        "attribute" in compact
-        or "technology" in compact
-        or "feature" in compact
-        or "description" in compact
-    ):
-
-        return "ATTRIBUTE"
-
-
-    return "GENERAL"
-
-
-# =========================================================
-# FIELD LANGUAGE / REGION DETECTION
-# =========================================================
-
-def get_field_region(field_name):
-
-    field = normalize_text(
-        field_name
-    )
-
-    compact = field.replace(
-        " ",
-        ""
-    )
-
-    # English
-
-    if (
-        "_en" in str(field_name).lower()
-        or compact.endswith("en")
-        or "english" in compact
-    ):
-
-        return "EN"
-
-
-    # French / Canada
-
-    if (
-        "_fr" in str(field_name).lower()
-        or compact.endswith("fr")
-        or "french" in compact
-        or "canada" in compact
-    ):
-
-        return "FR"
-
-
-    # Spanish
-
-    if (
-        "_sp" in str(field_name).lower()
-        or compact.endswith("sp")
-        or "spanish" in compact
-        or "espanol" in compact
-        or "span" in compact
-    ):
-
-        return "SP"
-
-
-    return ""
-
-
-# =========================================================
-# LOAD EXCEL
-# =========================================================
-
-def load_excel(file):
-
-    file.seek(0)
-
-    df = pd.read_excel(
-        file,
-        header=0
-    )
-
-    df.columns = [
-        str(column).strip()
-        for column in df.columns
-    ]
-
-    return df
-
-
-# =========================================================
-# OUTPUT EXTRACTION LAYER
-#
-# Extraction is deliberately separate from comparison.
-# The comparison engine always receives the same structure:
-#     [{"page": 1, "text": "..."}, ...]
-#
-# Readable PDF  -> direct PDF text extraction
-# Scanned PDF   -> OCR only when the page has no usable text
-# JPG / PNG     -> OCR
-# =========================================================
-
-def _usable_text(text):
-    """Return True when a PDF page appears to have a usable text layer."""
-
-    if not text:
-        return False
-
-    value = str(text).strip()
-    if not value:
-        return False
-
-    # Ignore pages whose text layer contains only a few stray characters.
-    alnum = re.sub(r"[^\w%#]", "", value, flags=re.UNICODE)
-    return len(alnum) >= 6
-
-
-def _ocr_image(image):
-    """OCR one PIL image. OCR stays completely behind the scenes."""
-
-    try:
-        import pytesseract
-    except ImportError as exc:
-        raise RuntimeError(
-            "OCR support is not installed. Add pytesseract to requirements.txt."
-        ) from exc
-
-    try:
-        # English + French + Spanish cover the multilingual artwork commonly
-        # encountered by this validator. Tesseract uses whichever installed
-        # language data is available.
-        return pytesseract.image_to_string(
-            image,
-            lang="eng+fra+spa"
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "OCR could not run. Make sure Tesseract OCR and its language "
-            "data are installed in the Streamlit environment."
-        ) from exc
-
-
-def _render_pdf_page(page):
-    """Render a PDF page at a useful OCR resolution."""
-
-    pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(2.5, 2.5),
-        alpha=False
-    )
-
-    image = Image.open(
-        io.BytesIO(pixmap.tobytes("png"))
-    ).convert("RGB")
-
-    return image
-
-
-def get_output_page_count(file):
-    """Get page count without extracting/comparing output text."""
-
-    name = str(getattr(file, "name", "")).lower()
-
-    if name.endswith(".pdf"):
-        file.seek(0)
-        pdf_bytes = file.read()
-        document = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-        count = len(document)
-        document.close()
-        return count
-
-    if name.endswith((".jpg", ".jpeg", ".png")):
-        return 1
-
-    return 0
-
-
-def extract_output_pages(file):
-    """
-    Extract output into the common comparison representation.
-
-    This function is called ONLY after the user presses COMPARE.
-    """
-
-    name = str(getattr(file, "name", "")).lower()
-
-    # ---------------------------------------------------------
-    # READABLE PDF / SCANNED PDF
-    # ---------------------------------------------------------
-    if name.endswith(".pdf"):
-
-        file.seek(0)
-        pdf_bytes = file.read()
-
-        document = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf"
-        )
-
-        pages = []
-
-        for page_number, page in enumerate(document):
-
-            direct_text = page.get_text("text") or ""
-
-            if _usable_text(direct_text):
-                # Normal/readable PDF: use the existing direct extraction path.
-                text = direct_text
-                source_type = "pdf_text"
-            else:
-                # No usable text layer: render and OCR this page only.
-                image = _render_pdf_page(page)
-                text = _ocr_image(image)
-                source_type = "ocr"
-
-            pages.append({
-                "page": page_number + 1,
-                "text": text,
-                "source_type": source_type
-            })
-
-        document.close()
-        return pages
-
-    # ---------------------------------------------------------
-    # JPG / JPEG / PNG
-    # ---------------------------------------------------------
-    if name.endswith((".jpg", ".jpeg", ".png")):
-
-        file.seek(0)
-        image = Image.open(file).convert("RGB")
-
-        text = _ocr_image(image)
-
-        return [{
-            "page": 1,
-            "text": text,
-            "source_type": "ocr"
-        }]
-
-    raise ValueError(
-        "Unsupported output format. Please upload PDF, JPG, JPEG, or PNG."
-    )
-
-
-# Backward-compatible name for any internal code that still calls load_pdf.
-# It now supports the same PDF behavior as the new extraction layer.
-def load_pdf(file):
-    return extract_output_pages(file)
-
-
-# =========================================================
-# CLEAN PDF LINE
-# =========================================================
-
-def clean_pdf_line(line):
-
-    if not line:
-        return ""
-
-    line = str(line).strip()
-
-    # -----------------------------------------------------
-    # Remove PDF bullet/keystroke "n"
-    #
-    # Examples:
-    #
-    # n US :
-    # n CA :
-    # n MX :
-    #
-    # becomes:
-    #
-    # US :
-    # CA :
-    # MX :
-    # -----------------------------------------------------
-
-    line = re.sub(
-        r"^\s*n\s+(?=[A-Za-z])",
-        "",
-        line
-    )
-
-    return line.strip()
-
-
-# =========================================================
-# CREATE SMART PDF BLOCKS
-# =========================================================
-
-def create_pdf_blocks(page_text):
-
-    if not page_text:
-        return []
-
-    raw_lines = page_text.splitlines()
-
-    lines = []
-
-    for raw_line in raw_lines:
-
-        line = clean_pdf_line(
-            raw_line
-        )
-
-        if not line:
-            continue
-
-        if len(line) > 1500:
-            continue
-
-        lines.append(
-            line
-        )
-
-
-    if not lines:
-        return []
-
-
-    blocks = []
-
-
-    # -----------------------------------------------------
-    # INDIVIDUAL LINES
-    #
-    # Important because many variable fields are contained
-    # inside one PDF line.
-    # -----------------------------------------------------
-
-    for line in lines:
-
-        blocks.append(
-            line
-        )
-
-
-    # -----------------------------------------------------
-    # ADJACENT LINE BLOCKS
-    #
-    # Used for wrapped care/content text.
-    # -----------------------------------------------------
-
-    maximum = min(
-        8,
-        len(lines)
-    )
-
-    for size in range(
-        2,
-        maximum + 1
-    ):
-
-        for start in range(
-            len(lines) - size + 1
-        ):
-
-            block = " ".join(
-                lines[
-                    start:start + size
-                ]
-            )
-
-            if block:
-
-                blocks.append(
-                    block
-                )
-
-
-    # -----------------------------------------------------
-    # Full page is deliberately NOT used as the primary
-    # comparison block.
-    #
-    # This prevents unrelated static/regional information
-    # from being mixed with variable data.
-    # -----------------------------------------------------
-
-
-    # -----------------------------------------------------
-    # Remove duplicates
-    # -----------------------------------------------------
-
-    unique = []
-
-    seen = set()
-
-    for block in blocks:
-
-        normalized = normalize_text(
-            block
-        )
-
-        if not normalized:
-            continue
-
-        if normalized in seen:
-            continue
-
-        seen.add(
-            normalized
-        )
-
-        unique.append(
-            block
-        )
-
-    return unique
-
-
-# =========================================================
-# FIELD-SAFE NORMALIZATION
-# =========================================================
-
-def normalize_symbol_text(text):
-    """Normalize symbol values without stripping the symbol itself."""
-    if text is None:
-        return ""
-    try:
-        if pd.isna(text):
-            return ""
-    except Exception:
-        pass
-
-    value = unicodedata.normalize("NFKC", str(text))
-    value = value.replace("\u200b", "").replace("\ufeff", "")
-    value = re.sub(r"\s+", "", value)
-    return value.casefold()
-
-
-def normalize_value_for_field(text, field_name):
-    field_type = get_field_type(field_name)
-    if field_type == "SYMBOL":
-        return normalize_symbol_text(text)
-    return normalize_text(text)
-
-
-def normalize_for_search(text):
-    """Normalization used for matching continuous PDF content."""
-    return normalize_text(text)
-
-
-# =========================================================
-# FIELD TYPE DEFINITIONS
-# =========================================================
-
-FIELD_ANCHORS = {
-    "IDENTIFIER": [
-        "sku", "item code", "item no", "item number",
-        "style", "style code", "product code"
-    ],
-    "BATCH": ["batch", "lot"],
-    "QUANTITY": ["quantity", "qty", "units", "pcs"],
-    "COO": ["made in", "fabrique en", "hecho en"],
-    "CONTENT": [
-        "%", "shell", "liner", "lining", "body", "fabric",
-        "fiber", "fibre", "content", "composition", "material"
-    ],
-    "CARE": [
-        "machine wash", "wash", "laver", "lavar", "bleach",
-        "blanchiment", "dry clean", "detergent", "detergente"
-    ],
-    "SIZE": ["size"],
-    "RN": ["rn", "ca"],
-    "BRAND": ["brand"],
-    "COLOR": ["color", "colour"],
-    "GENDER": ["boys", "girls", "women", "men", "unisex"],
-    "ATTRIBUTE": ["attribute", "technology", "feature", "description"],
-    "SYMBOL": [],
-    "GENERAL": []
-}
-
-
-def get_field_type(field_name):
-    field = normalize_text(field_name)
-    compact = field.replace(" ", "").replace("_", "").replace("-", "")
-
-    if "symbol" in compact or compact in {"caremark", "caresymbol", "washsymbol"}:
-        return "SYMBOL"
-
-    if (
-        "sku" in compact or "itemcode" in compact or
-        "itemnumber" in compact or "itemno" in compact or
-        "stylecode" in compact or compact == "style" or
-        "productcode" in compact
-    ):
-        return "IDENTIFIER"
-
-    if "batch" in compact or "lotnumber" in compact or "lotno" in compact or compact == "lot":
-        return "BATCH"
-
-    if (
-        "quantity" in compact or compact == "qty" or "units" in compact or
-        "pieces" in compact or compact == "pcs"
-    ):
-        return "QUANTITY"
-
-    if (
-        "coo" in compact or "countryoforigin" in compact or
-        "countryorigin" in compact or "madein" in compact or compact == "origin"
-    ):
-        return "COO"
-
-    if (
-        "fiber" in compact or "fibre" in compact or "fabric" in compact or
-        "content" in compact or "composition" in compact or
-        "fabrication" in compact or "material" in compact
-    ):
-        return "CONTENT"
-
-    if (
-        "care" in compact or "wash" in compact or "washing" in compact or
-        "laundry" in compact or "instruction" in compact
-    ):
-        return "CARE"
-
-    if (
-        "size" in compact or "sizeline" in compact or "alpha" in compact or
-        "waist" in compact or "inseam" in compact or compact == "fit"
-    ):
-        return "SIZE"
-
-    if compact == "rn" or "registrationnumber" in compact or "companyrn" in compact:
-        return "RN"
-
-    if "brand" in compact:
-        return "BRAND"
-
-    if "color" in compact or "colour" in compact:
-        return "COLOR"
-
-    if "gender" in compact:
-        return "GENDER"
-
-    if "attribute" in compact or "technology" in compact or "feature" in compact or "description" in compact:
-        return "ATTRIBUTE"
-
-    return "GENERAL"
-
-
-# =========================================================
-# FIELD LANGUAGE / REGION DETECTION
-# =========================================================
-
-def get_field_region(field_name):
-    original = str(field_name).lower()
-    field = normalize_text(field_name)
-    compact = field.replace(" ", "")
-
-    if "_en" in original or compact.endswith("en") or "english" in compact:
-        return "EN"
-
-    if "_fr" in original or compact.endswith("fr") or "french" in compact or "canada" in compact:
-        return "FR"
-
-    if "_sp" in original or compact.endswith("sp") or "spanish" in compact or "espanol" in compact or "span" in compact:
-        return "SP"
-
-    return ""
-
-
-# =========================================================
-# DATA HELPERS
+# BASIC DATA HELPERS
 # =========================================================
 
 def is_blank_value(value):
@@ -1039,313 +230,641 @@ def is_blank_value(value):
     return str(value).strip() == ""
 
 
+def normalize_text(text):
+    if is_blank_value(text):
+        return ""
+
+    value = unicodedata.normalize("NFKC", str(text))
+    value = value.casefold()
+
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    value = value.replace("’", "'").replace("`", "'")
+    value = value.replace("–", "-").replace("—", "-")
+    value = value.replace("\r", " ").replace("\n", " ")
+
+    # Common PDF bullet extraction artefact.
+    value = re.sub(r"(^|\s)n(?=\s)", " ", value)
+
+    # Treat punctuation/separators as spacing differences.
+    value = re.sub(r"[,.;:|/\\]+", " ", value)
+    value = re.sub(r"-+", " ", value)
+    value = re.sub(r"[^\w%#'\s]", " ", value, flags=re.UNICODE)
+
+    # Apostrophe differences should not create a mismatch.
+    value = value.replace("'", "")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def normalize_symbol_text(text):
+    if is_blank_value(text):
+        return ""
+    value = unicodedata.normalize("NFKC", str(text))
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    value = re.sub(r"\s+", "", value)
+    return value.casefold()
+
+
+def compact_text(text):
+    return normalize_text(text).replace(" ", "")
+
+
+def tokenize(text):
+    value = normalize_text(text)
+    return value.split() if value else []
+
+
+def normalize_numeric(value):
+    if is_blank_value(value):
+        return None
+    text = normalize_text(value)
+    # Keep only a clean integer/decimal when the value is numeric.
+    match = re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        number = float(match.group(0))
+        if number.is_integer():
+            return str(int(number))
+        return str(number).rstrip("0").rstrip(".")
+    except Exception:
+        return None
+
+
 def get_available_fields(df):
-    """Only populated columns are offered to the user."""
-    available = []
+    """Only columns containing at least one populated cell are selectable."""
+    result = []
     for column in df.columns:
-        if not df[column].apply(lambda value: not is_blank_value(value)).any():
-            continue
-        available.append(str(column))
-    return available
+        if df[column].map(lambda value: not is_blank_value(value)).any():
+            result.append(str(column))
+    return result
 
 
-def get_difference(expected, actual):
-    """Produce a compact, deterministic difference explanation."""
-    expected_tokens = tokenize(expected)
-    actual_tokens = tokenize(actual)
-
-    if not expected_tokens:
-        return "Expected value is blank."
-    if not actual_tokens:
-        return "Expected value is missing from the output."
-
-    matcher = SequenceMatcher(None, expected_tokens, actual_tokens)
-    differences = []
-
-    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
-        if tag == "equal":
-            continue
-
-        expected_part = " ".join(expected_tokens[a1:a2]).strip()
-        actual_part = " ".join(actual_tokens[b1:b2]).strip()
-
-        if tag == "replace":
-            differences.append(f"{expected_part} → {actual_part}")
-        elif tag == "delete":
-            differences.append(f"Missing: {expected_part}")
-        elif tag == "insert":
-            differences.append(f"Extra: {actual_part}")
-
-    return "; ".join(differences[:8]) or "Content differs."
-
-
-def token_overlap(expected, actual):
-    expected_tokens = set(tokenize(expected))
-    actual_tokens = set(tokenize(actual))
-    if not expected_tokens:
-        return 0.0
-    return len(expected_tokens & actual_tokens) / len(expected_tokens)
+def load_excel(file):
+    file.seek(0)
+    df = pd.read_excel(file, header=0)
+    df.columns = [str(column).strip() for column in df.columns]
+    return df
 
 
 # =========================================================
-# PDF SEARCH UNITS
+# FIELD CLASSIFICATION
 # =========================================================
 
-FIELD_SEARCH_CACHE = {}
+ADMIN_FIELD_PATTERNS = (
+    r"^sr$",
+    r"^sr\.?\s*no\.?$",
+    r"^serial",
+    r"^job\s*(?:no|number)?$",
+    r"^order\s*(?:no|number|date)?$",
+    r"^ticket\s*(?:no|number)?$",
+    r"^created",
+    r"^modified",
+    r"^timestamp",
+)
 
 
-def build_search_units(page_text, product_type="Other"):
-    """
-    Build non-duplicated search units from one PDF page.
+def get_field_region(field_name):
+    original = str(field_name).casefold()
+    normalized = normalize_text(field_name).replace(" ", "")
 
-    Each unit keeps a line range so a matched unit can be marked consumed.
-    This prevents the same artwork data from being reconsidered through
-    multiple overlapping blocks.
-    """
-    if not page_text:
-        return []
+    if (
+        "_en" in original
+        or normalized.endswith("en")
+        or "english" in normalized
+    ):
+        return "EN"
 
-    raw_lines = page_text.splitlines()
-    lines = []
-    for index, raw in enumerate(raw_lines):
-        line = clean_pdf_line(raw)
-        if not line or len(line) > 1500:
-            continue
-        lines.append({"line_index": index, "text": line})
+    if (
+        "_fr" in original
+        or normalized.endswith("fr")
+        or "french" in normalized
+        or "canada" in normalized
+    ):
+        return "FR"
 
-    if not lines:
-        return []
+    if (
+        "_sp" in original
+        or normalized.endswith("sp")
+        or "spanish" in normalized
+        or "espanol" in normalized
+    ):
+        return "SP"
 
-    units = []
-    unit_id = 0
-
-    # Individual lines are the primary units.
-    for item in lines:
-        units.append({
-            "unit_id": unit_id,
-            "text": item["text"],
-            "start_line": item["line_index"],
-            "end_line": item["line_index"]
-        })
-        unit_id += 1
-
-    max_window = 24 if product_type == "PFL" else 8
-    max_window = min(max_window, len(lines))
-
-    for window in range(2, max_window + 1):
-        for start in range(len(lines) - window + 1):
-            end = start + window - 1
-            text = " ".join(item["text"] for item in lines[start:end + 1])
-            if not text:
-                continue
-            units.append({
-                "unit_id": unit_id,
-                "text": text,
-                "start_line": lines[start]["line_index"],
-                "end_line": lines[end]["line_index"]
-            })
-            unit_id += 1
-
-    # Remove only exact duplicate text while retaining the first/smallest unit.
-    unique = []
-    seen = set()
-    for unit in units:
-        signature = normalize_text(unit["text"])
-        if not signature or signature in seen:
-            continue
-        seen.add(signature)
-        unique.append(unit)
-
-    return unique
+    return ""
 
 
-def get_page_units(page, product_type):
-    cache_key = (page.get("page"), product_type, page.get("text", ""))
-    if cache_key not in FIELD_SEARCH_CACHE:
-        FIELD_SEARCH_CACHE[cache_key] = build_search_units(
-            page.get("text", ""),
-            product_type
+def get_field_type(field_name):
+    field = normalize_text(field_name)
+    compact = field.replace(" ", "").replace("_", "").replace("-", "")
+
+    # Explicit sequence fields such as OSZ1, OSZ2 ...
+    if re.fullmatch(r"osz\d+", compact):
+        return "OSZ"
+
+    if "symbol" in compact or compact in {"caremark", "caresymbol", "washsymbol"}:
+        return "SYMBOL"
+
+    if (
+        compact == "rn"
+        or "rnno" in compact
+        or "rnnumber" in compact
+        or "registrationnumber" in compact
+        or "companyrn" in compact
+        or compact.startswith("rn")
+    ):
+        return "RN"
+
+    if (
+        "sku" in compact
+        or "itemcode" in compact
+        or "itemnumber" in compact
+        or "itemno" in compact
+        or "stylecode" in compact
+        or compact == "style"
+        or "productcode" in compact
+    ):
+        return "IDENTIFIER"
+
+    if "batch" in compact or "lotnumber" in compact or "lotno" in compact or compact == "lot":
+        return "BATCH"
+
+    if (
+        "quantity" in compact
+        or compact == "qty"
+        or "units" in compact
+        or "pieces" in compact
+        or compact == "pcs"
+    ):
+        return "QUANTITY"
+
+    if (
+        "coo" in compact
+        or "countryoforigin" in compact
+        or "countryorigin" in compact
+        or "madein" in compact
+        or compact == "origin"
+    ):
+        return "COO"
+
+    if (
+        "fiber" in compact
+        or "fibre" in compact
+        or "fabric" in compact
+        or "content" in compact
+        or "composition" in compact
+        or "fabrication" in compact
+        or "material" in compact
+    ):
+        return "CONTENT"
+
+    if (
+        "care" in compact
+        or "wash" in compact
+        or "washing" in compact
+        or "laundry" in compact
+        or "instruction" in compact
+    ):
+        return "CARE"
+
+    if (
+        "size" in compact
+        or "sizeline" in compact
+        or "alpha" in compact
+        or "waist" in compact
+        or "inseam" in compact
+        or compact == "fit"
+    ):
+        return "SIZE"
+
+    if "brand" in compact:
+        return "BRAND"
+
+    if "color" in compact or "colour" in compact:
+        return "COLOR"
+
+    if "gender" in compact:
+        return "GENDER"
+
+    if "attribute" in compact or "technology" in compact or "feature" in compact:
+        return "ATTRIBUTE"
+
+    return "GENERAL"
+
+
+def is_admin_field(field_name):
+    normalized = normalize_text(field_name)
+    return any(re.match(pattern, normalized) for pattern in ADMIN_FIELD_PATTERNS)
+
+
+# =========================================================
+# PDF/OCR EXTRACTION
+# =========================================================
+
+def _usable_text(text):
+    if not text or not str(text).strip():
+        return False
+    alnum = re.sub(r"[^\w%#]", "", str(text), flags=re.UNICODE)
+    return len(alnum) >= 6
+
+
+def _ocr_image(image):
+    try:
+        import pytesseract
+    except ImportError as exc:
+        raise RuntimeError(
+            "OCR support is not installed. Add pytesseract to requirements.txt."
+        ) from exc
+
+    try:
+        return pytesseract.image_to_string(
+            image,
+            lang="eng+fra+spa"
         )
-    return FIELD_SEARCH_CACHE[cache_key]
+    except Exception as exc:
+        raise RuntimeError(
+            "OCR could not run. Make sure Tesseract OCR and its language data "
+            "are installed in the Streamlit environment."
+        ) from exc
 
 
-def unit_is_available(unit, consumed):
-    """A unit is unavailable if its line span or signature was consumed."""
-    if unit["unit_id"] in consumed.get("unit_ids", set()):
-        return False
-
-    for line_index in range(unit["start_line"], unit["end_line"] + 1):
-        if line_index in consumed.get("line_ids", set()):
-            return False
-
-    signature = normalize_text(unit["text"])
-    if signature and signature in consumed.get("signatures", set()):
-        return False
-
-    return True
-
-
-def consume_unit(unit, consumed, value_key=None):
-    consumed.setdefault("unit_ids", set()).add(unit["unit_id"])
-    consumed.setdefault("line_ids", set()).update(
-        range(unit["start_line"], unit["end_line"] + 1)
+def _render_pdf_page(page):
+    pixmap = page.get_pixmap(
+        matrix=fitz.Matrix(2.5, 2.5),
+        alpha=False
     )
-    signature = normalize_text(unit["text"])
-    if signature:
-        consumed.setdefault("signatures", set()).add(signature)
-    if value_key:
-        consumed.setdefault("value_keys", set()).add(value_key)
+    return Image.open(
+        io.BytesIO(pixmap.tobytes("png"))
+    ).convert("RGB")
+
+
+def get_output_page_count(file):
+    name = str(getattr(file, "name", "")).casefold()
+
+    if name.endswith(".pdf"):
+        file.seek(0)
+        data = file.read()
+        document = fitz.open(stream=data, filetype="pdf")
+        count = len(document)
+        document.close()
+        return count
+
+    if name.endswith((".jpg", ".jpeg", ".png")):
+        return 1
+
+    return 0
+
+
+def extract_output_pages(file):
+    name = str(getattr(file, "name", "")).casefold()
+
+    if name.endswith(".pdf"):
+        file.seek(0)
+        data = file.read()
+        document = fitz.open(stream=data, filetype="pdf")
+        pages = []
+
+        for page_number, page in enumerate(document, start=1):
+            direct_text = page.get_text("text") or ""
+
+            if _usable_text(direct_text):
+                text = direct_text
+                source_type = "pdf_text"
+            else:
+                text = _ocr_image(_render_pdf_page(page))
+                source_type = "ocr"
+
+            pages.append({
+                "page": page_number,
+                "text": text,
+                "source_type": source_type
+            })
+
+        document.close()
+        return pages
+
+    if name.endswith((".jpg", ".jpeg", ".png")):
+        file.seek(0)
+        image = Image.open(file).convert("RGB")
+        return [{
+            "page": 1,
+            "text": _ocr_image(image),
+            "source_type": "ocr"
+        }]
+
+    raise ValueError(
+        "Unsupported output format. Please upload PDF, JPG, JPEG, or PNG."
+    )
+
+
+def clean_pdf_line(line):
+    if not line:
+        return ""
+    line = str(line).replace("\u200b", "").replace("\ufeff", "").strip()
+    line = re.sub(r"^\s*n\s+(?=[A-Za-z])", "", line)
+    return line.strip()
 
 
 # =========================================================
-# EXACT MATCH
+# ATOMIC PAGE MODEL
 # =========================================================
 
-def exact_value_in_unit(expected, unit_text, field_name):
-    """Deterministic equality test; no fuzzy threshold is used."""
-    field_type = get_field_type(field_name)
+def build_page_lines(page_text, product_type):
+    """
+    Create atomic lines. We do NOT create overlapping blocks and then consume
+    blocks, because consuming an overlapping block can accidentally consume
+    unrelated values. Instead, every decision is tied to actual line IDs.
+    """
+    raw_lines = str(page_text or "").splitlines()
+    lines = []
 
-    if field_type == "SYMBOL":
-        expected_norm = normalize_symbol_text(expected)
-        actual_norm = normalize_symbol_text(unit_text)
-        return bool(expected_norm and expected_norm in actual_norm)
+    panel_pattern = re.compile(
+        r"^\s*(?:panel\s*)?(\d{1,3})\s*$",
+        re.IGNORECASE
+    )
 
+    for raw_index, raw in enumerate(raw_lines):
+        line = clean_pdf_line(raw)
+        if not line:
+            continue
+        if len(line) > 1500:
+            continue
+
+        # PFL: remove only explicit panel labels. Do not discard standalone
+        # numeric lines because those may be genuine OSZ/size data.
+        if product_type == "PFL" and re.match(r"^\s*panel\s*[-#: ]?\d{1,3}\s*$", line, re.IGNORECASE):
+            continue
+
+        lines.append({
+            "line_id": len(lines),
+            "raw_index": raw_index,
+            "text": line,
+            "norm": normalize_text(line)
+        })
+
+    return lines
+
+
+def build_page_state(page, product_type):
+    lines = build_page_lines(
+        page.get("text", ""),
+        product_type
+    )
+    return {
+        "page": page.get("page"),
+        "source_type": page.get("source_type", "pdf_text"),
+        "lines": lines,
+        "consumed": set(),
+        "osz_runs": extract_standalone_numeric_runs_from_lines(lines),
+    }
+
+
+def extract_standalone_numeric_runs_from_lines(lines):
+    runs = []
+    current = []
+
+    for line in lines:
+        if re.fullmatch(r"[-+]?\d+", line["norm"]):
+            current.append(line)
+        else:
+            if current:
+                runs.append(current)
+                current = []
+
+    if current:
+        runs.append(current)
+
+    return [run for run in runs if run]
+
+
+def line_is_available(line, state):
+    return line["line_id"] not in state["consumed"]
+
+
+def consume_lines(state, lines):
+    for line in lines:
+        state["consumed"].add(line["line_id"])
+
+
+def join_lines(lines):
+    return " ".join(
+        line["text"]
+        for line in lines
+    ).strip()
+
+
+# =========================================================
+# SAFE EXACT MATCHING
+# =========================================================
+
+def normalized_contains(expected, actual):
     expected_norm = normalize_text(expected)
-    actual_norm = normalize_text(unit_text)
+    actual_norm = normalize_text(actual)
 
     if not expected_norm or not actual_norm:
         return False
 
-    if expected_norm in actual_norm:
+    # IMPORTANT: for multi-word text, substring is acceptable because artwork
+    # may include a label around it. For a single numeric token, this function
+    # must NOT be used because 2 must never match inside RN# 55285.
+    if len(expected_norm.split()) <= 1 and normalize_numeric(expected_norm):
+        return False
+
+    return expected_norm in actual_norm
+
+
+def safe_exact_match(expected, actual, field_name):
+    field_type = get_field_type(field_name)
+
+    if field_type == "SYMBOL":
+        exp = normalize_symbol_text(expected)
+        act = normalize_symbol_text(actual)
+        return bool(exp and exp == act)
+
+    # Numeric value: exact numeric token only.
+    numeric_expected = normalize_numeric(expected)
+    if numeric_expected is not None:
+        actual_norm = normalize_text(actual)
+        actual_numbers = re.findall(
+            r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9])",
+            actual_norm
+        )
+        return numeric_expected in {
+            normalize_numeric(number)
+            for number in actual_numbers
+        }
+
+    exp = normalize_text(expected)
+    act = normalize_text(actual)
+
+    if not exp or not act:
+        return False
+
+    # Full normalized text / token sequence.
+    if exp == act:
         return True
 
-    compact_expected = compact_text(expected)
-    compact_actual = compact_text(unit_text)
+    if exp in act:
+        return True
+
+    # Space-independent comparison is only for longer textual values.
+    compact_exp = compact_text(expected)
+    compact_act = compact_text(actual)
 
     return bool(
-        compact_expected
-        and compact_expected in compact_actual
+        len(exp.split()) > 1
+        and compact_exp
+        and compact_exp in compact_act
     )
 
 
-def find_exact_value(
-    expected,
-    field_name,
-    page_units,
-    consumed
-):
-    """
-    Find the first smallest available unit containing the expected value.
-    Once used, its data is consumed and cannot be re-used by later fields.
-    """
-    field_type = get_field_type(field_name)
-    value_key = normalize_value_for_field(expected, field_name)
-
-    if not value_key:
+def find_exact_lines(expected, field_name, state, max_window=8):
+    """Find the smallest unused contiguous line span containing the expected value."""
+    lines = state["lines"]
+    available = [line for line in lines if line_is_available(line, state)]
+    if not available:
         return None
 
-    # Prevent the same normalized expected value from being claimed repeatedly
-    # on the same page unless it appears in a genuinely different unused unit.
-    for unit in page_units:
-        if not unit_is_available(unit, consumed):
-            continue
-        if exact_value_in_unit(expected, unit["text"], field_name):
-            consume_unit(unit, consumed, value_key=value_key)
-            return {
-                "status": "PASS",
-                "pdf": unit["text"],
-                "difference": "—",
-                "match_type": "EXACT"
-            }
+    field_type = get_field_type(field_name)
+    numeric_expected = normalize_numeric(expected)
+
+    # Numeric scalar values must never be matched as substrings in mixed text.
+    # This is the critical protection against 2/4/6 matching inside RN# 55285.
+    if numeric_expected is not None:
+        search_window = 1
+        for line in available:
+            if field_type in {"OSZ", "RN"}:
+                continue
+            if field_type not in {"QUANTITY", "BATCH"} and normalize_text(line["text"]) == numeric_expected:
+                return [line]
+
+        return None
+
+    preferred_single_line = field_type in {
+        "SYMBOL", "RN", "IDENTIFIER", "OSZ", "SIZE", "COLOR",
+        "GENDER", "BATCH", "QUANTITY"
+    }
+    search_window = 1 if preferred_single_line else max_window
+
+    for window_size in range(1, search_window + 1):
+        for start in range(0, len(available) - window_size + 1):
+            candidate = available[start:start + window_size]
+            ids = [line["line_id"] for line in candidate]
+
+            if ids != list(range(ids[0], ids[-1] + 1)):
+                continue
+
+            text = join_lines(candidate)
+
+            if safe_exact_match(expected, text, field_name):
+                return candidate
 
     return None
 
 
 # =========================================================
-# STRUCTURED VALUE EXTRACTION
+# STRUCTURED EXTRACTORS
 # =========================================================
 
 def extract_coo_value(text):
-    if not text:
+    normalized = normalize_text(text)
+    if not normalized:
         return None
 
-    normalized = normalize_text(text)
-
     patterns = [
-        r"\bmade\s+in\s+([a-z][a-z\s\-]+)",
-        r"\bfabrique\s+en\s+([a-z][a-z\s\-]+)",
-        r"\bhecho\s+en\s+([a-z][a-z\s\-]+)",
+        r"\bmade\s+in\s+([a-z][a-z\s\-]*)",
+        r"\bfabrique\s+en\s+([a-z][a-z\s\-]*)",
+        r"\bhecho\s+en\s+([a-z][a-z\s\-]*)",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, normalized, re.IGNORECASE)
+        match = re.search(pattern, normalized)
         if not match:
             continue
-
-        value = match.group(0).strip()
-        value = re.split(
-            r"\b(?:rn|ca|sku|size|color|colour|care|wash)\b",
-            value,
+        full = match.group(0).strip()
+        full = re.split(
+            r"\b(?:rn|ca|sku|size|color|colour|wash|machine)\b",
+            full,
             maxsplit=1
         )[0].strip()
-        return value
+        return full
 
     return None
 
 
-def extract_content_values(text):
-    if not text:
-        return []
-
+def coo_language(text):
     normalized = normalize_text(text)
-    pattern = re.compile(
-        r"(\d{1,3}(?:\.\d+)?)\s*%\s*"
-        r"([a-z][a-z0-9\s\-]*)",
+    if "made in" in normalized:
+        return "EN"
+    if "fabrique en" in normalized:
+        return "FR"
+    if "hecho en" in normalized:
+        return "SP"
+    return ""
+
+
+def extract_rn_value(text):
+    normalized = normalize_text(text)
+    if not normalized:
+        return None
+
+    match = re.search(
+        r"\b(?:rn|ca)\s*[#:.-]?\s*([0-9][0-9a-z\-\/]*)",
+        normalized,
         re.IGNORECASE
     )
-
-    results = []
-    for match in pattern.finditer(normalized):
-        percentage = match.group(1)
-        material = match.group(2).strip()
-        material = re.split(
-            r"\b(?:shell|liner|lining|body|exclusive|rn|ca|made in)\b",
-            material,
-            maxsplit=1
-        )[0].strip()
-        material = re.sub(r"\s+", " ", material)
-        if material:
-            results.append(f"{percentage}% {material}")
-
-    return results
+    return match.group(1) if match else None
 
 
-def normalize_composition(values):
-    normalized = []
-    for value in values:
-        value_norm = normalize_text(value)
-        if value_norm:
-            normalized.append(value_norm)
-    return normalized
+def extract_identifier_value(text):
+    normalized = normalize_text(text)
+    patterns = [
+        r"\bsku\s*[:#-]?\s*([a-z0-9][a-z0-9_\-/]*)",
+        r"\bitem\s*(?:code|no|number)\s*[:#-]?\s*([a-z0-9][a-z0-9_\-/]*)",
+        r"\bstyle\s*(?:code|no|number)?\s*[:#-]?\s*([a-z0-9][a-z0-9_\-/]*)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
 
 
-def composition_matches(expected, actual):
-    expected_values = normalize_composition(
-        extract_content_values(expected)
+def extract_size_value(text):
+    normalized = normalize_text(text)
+    match = re.search(
+        r"\bsize\s*[:#-]?\s*([a-z0-9][a-z0-9\s\-/]*)",
+        normalized,
+        re.IGNORECASE
     )
-    actual_values = normalize_composition(
-        extract_content_values(actual)
+    if not match:
+        return None
+    value = re.split(
+        r"\b(?:rn|ca|made|color|colour|sku|style)\b",
+        match.group(1),
+        maxsplit=1
+    )[0].strip()
+    return value or None
+
+
+def extract_color_value(text):
+    normalized = normalize_text(text)
+    match = re.search(
+        r"\b(?:color|colour)\s*[:#-]?\s*([a-z][a-z\s\-/]*)",
+        normalized,
+        re.IGNORECASE
     )
-
-    if not expected_values or not actual_values:
-        return False
-
-    return sorted(expected_values) == sorted(actual_values)
+    if not match:
+        return None
+    value = re.split(
+        r"\b(?:size|rn|ca|made|country|sku|style)\b",
+        match.group(1),
+        maxsplit=1
+    )[0].strip()
+    return value or None
 
 
 def extract_gender_value(text):
-    if not text:
-        return None
     normalized = normalize_text(text)
     for value in [
         "boys", "girls", "women", "men", "unisex",
@@ -1356,471 +875,389 @@ def extract_gender_value(text):
     return None
 
 
-def extract_color_value(text):
-    if not text:
-        return None
-
+def extract_content_values(text):
     normalized = normalize_text(text)
+    if not normalized:
+        return []
 
-    patterns = [
-        r"\bcolor\s*[:\-]?\s*([a-z][a-z\s\-]*)",
-        r"\bcolour\s*[:\-]?\s*([a-z][a-z\s\-]*)"
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if not match:
-            continue
-        value = re.split(
-            r"\b(?:size|rn|ca|made|country|sku|style)\b",
-            match.group(1),
-            maxsplit=1
-        )[0].strip()
-        if value:
-            return value
-
-    return None
-
-
-def extract_size_value(text):
-    if not text:
-        return None
-
-    normalized = normalize_text(text)
-    match = re.search(
-        r"\bsize\s*[:\-]?\s*([a-z0-9][a-z0-9\s\-\/]*)",
-        normalized,
+    # Stop material capture at another percentage sign or common section label.
+    pattern = re.compile(
+        r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s*"
+        r"(?P<material>[a-z][a-z0-9\s\-]*?)(?=\s+\d{1,3}(?:\.\d+)?\s*%|$)",
         re.IGNORECASE
     )
 
-    if not match:
-        return None
-
-    value = re.split(
-        r"\b(?:rn|ca|made|color|colour|sku|style)\b",
-        match.group(1),
-        maxsplit=1
-    )[0].strip()
-
-    return value or None
-
-
-def extract_identifier_value(text):
-    if not text:
-        return None
-
-    normalized = normalize_text(text)
-
-    patterns = [
-        r"\bsku\s*[:#\-]?\s*([a-z0-9][a-z0-9\-_\/]*)",
-        r"\bitem\s*(?:code|no|number)\s*[:#\-]?\s*([a-z0-9][a-z0-9\-_\/]*)",
-        r"\bstyle\s*(?:code|no|number)?\s*[:#\-]?\s*([a-z0-9][a-z0-9\-_\/]*)",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-
-    return None
+    values = []
+    for match in pattern.finditer(normalized):
+        material = match.group("material").strip()
+        material = re.sub(
+            r"\b(?:shell|liner|lining|body|rn|ca|made|size|color|colour)\b.*$",
+            "",
+            material,
+        ).strip()
+        if material:
+            values.append(
+                f"{match.group('pct')}% {material}"
+            )
+    return values
 
 
-def extract_rn_value(text):
-    if not text:
-        return None
-
-    normalized = normalize_text(text)
-
-    match = re.search(
-        r"\b(?:rn|ca)\s*[:#\-]?\s*([a-z0-9\-\/]+)",
-        normalized,
-        re.IGNORECASE
+def normalize_composition(values):
+    return sorted(
+        normalize_text(value)
+        for value in values
+        if normalize_text(value)
     )
 
-    if match:
-        return match.group(1).strip()
 
-    return None
+def composition_matches(expected, actual):
+    expected_values = normalize_composition(
+        extract_content_values(expected)
+    )
+    actual_values = normalize_composition(
+        extract_content_values(actual)
+    )
+    return bool(expected_values and expected_values == actual_values)
 
 
 # =========================================================
-# FIELD RELEVANCE
+# FIELD-SPECIFIC REGIONS
 # =========================================================
 
-def is_relevant_block(
-    block,
-    field_type,
-    field_name
-):
-    normalized_block = normalize_text(block)
+FIELD_ANCHORS = {
+    "COO": ["made in", "fabrique en", "hecho en"],
+    "CARE": ["machine wash", "wash", "laver", "laver", "lavar", "bleach", "dry clean"],
+    "CONTENT": ["%", "shell", "liner", "lining", "body", "fiber", "fibre", "content", "composition"],
+    "RN": ["rn", "ca"],
+    "IDENTIFIER": ["sku", "item code", "item no", "item number", "style", "style code"],
+    "SIZE": ["size"],
+    "COLOR": ["color", "colour"],
+    "GENDER": ["boys", "girls", "women", "men", "unisex"],
+    "BATCH": ["batch", "lot"],
+    "QUANTITY": ["quantity", "qty", "units", "pcs"],
+    "BRAND": ["brand"],
+    "ATTRIBUTE": ["attribute", "technology", "feature"],
+    "SYMBOL": [],
+    "OSZ": [],
+    "GENERAL": [],
+}
 
-    if not normalized_block:
+
+def line_relevant_for_field(line_text, field_name):
+    field_type = get_field_type(field_name)
+    normalized = normalize_text(line_text)
+
+    if not normalized:
         return False
 
     if field_type == "SYMBOL":
-        # Symbols have no reliable word anchor; the selected field's exact
-        # value is the evidence. Unknown symbol alternatives are not guessed.
-        return True
+        return False
 
-    anchors = FIELD_ANCHORS.get(
-        field_type,
-        []
-    )
+    if field_type == "OSZ":
+        # OSZ values are resolved from a sequence, not generic relevance.
+        return False
 
-    for anchor in anchors:
+    for anchor in FIELD_ANCHORS.get(field_type, []):
         anchor_norm = normalize_text(anchor)
-        if anchor_norm and anchor_norm in normalized_block:
+        if anchor_norm and anchor_norm in normalized:
             return True
 
     region = get_field_region(field_name)
 
-    if region == "EN":
-        for marker in [
-            "made in", "machine wash", "shell", "liner",
-            "cotton", "polyester", "bleach", "rn"
-        ]:
-            if normalize_text(marker) in normalized_block:
-                return True
+    region_markers = {
+        "EN": ["made in", "machine wash", "shell", "liner", "polyester", "bleach"],
+        "FR": ["fabrique en", "laver", "extérieur", "doublure", "polyester", "sans chlore"],
+        "SP": ["hecho en", "lavar", "forro", "poliester", "cloro"],
+    }
 
-    elif region == "FR":
-        for marker in [
-            "fabrique en", "laver", "extérieur", "doublure",
-            "polyester", "sans chlore", "rn"
-        ]:
-            if normalize_text(marker) in normalized_block:
-                return True
-
-    elif region == "SP":
-        for marker in [
-            "hecho en", "lavar", "forro", "poliester", "cloro", "rn"
-        ]:
-            if normalize_text(marker) in normalized_block:
-                return True
+    for marker in region_markers.get(region, []):
+        if normalize_text(marker) in normalized:
+            return True
 
     return False
 
 
-# =========================================================
-# DIFFERENCE SEARCH — FIELD SPECIFIC ONLY
-# =========================================================
-
-def search_field_mismatch(
-    expected,
-    page_units,
-    field_name,
-    consumed
-):
-    """
-    Look for a conflicting value ONLY when the field has a safe field-specific
-    detector. There is intentionally no generic fuzzy fallback.
-    """
+def collect_region_from_anchor(state, field_name):
+    """Collect a meaningful field region without crossing another major field."""
+    lines = state["lines"]
     field_type = get_field_type(field_name)
-    expected_norm = normalize_text(expected)
 
-    for unit in page_units:
-        if not unit_is_available(unit, consumed):
+    start_idx = None
+
+    for idx, line in enumerate(lines):
+        if not line_is_available(line, state):
+            continue
+        if line_relevant_for_field(line["text"], field_name):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return None
+
+    region = []
+
+    stop_types = {
+        "COO": ("RN", "CONTENT", "CARE"),
+        "CONTENT": ("COO", "RN", "CARE"),
+        "CARE": ("COO", "CONTENT", "RN"),
+    }
+
+    stop_patterns = {
+        "COO": [r"\b(?:rn|ca)\s*[#:.-]?\s*\w+"],
+        "CONTENT": [r"\b(?:made in|rn|ca)\b"],
+        "CARE": [r"\b(?:made in|rn|ca)\b"],
+    }
+
+    for idx in range(start_idx, len(lines)):
+        line = lines[idx]
+
+        if not line_is_available(line, state):
+            break
+
+        text = line["text"]
+        norm = line["norm"]
+
+        if idx > start_idx:
+            if field_type in stop_types:
+                if any(
+                    any(marker in norm for marker in FIELD_ANCHORS.get(stop_type, []))
+                    for stop_type in stop_types[field_type]
+                ):
+                    break
+
+            if field_type in stop_patterns:
+                if any(re.search(pattern, norm) for pattern in stop_patterns[field_type]):
+                    break
+
+        region.append(line)
+
+        # Avoid swallowing an entire page.
+        if len(region) >= 20:
+            break
+
+    return region or None
+
+
+# =========================================================
+# OSZ SEQUENCE DETECTION
+# =========================================================
+
+def get_osz_index(field_name):
+    compact = normalize_text(field_name).replace(" ", "")
+    match = re.fullmatch(r"osz(\d+)", compact)
+    return int(match.group(1)) if match else None
+
+
+def extract_standalone_numeric_runs(state):
+    runs = []
+    current = []
+
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            if current:
+                runs.append(current)
+                current = []
             continue
 
-        block = unit["text"]
-        block_norm = normalize_text(block)
+        norm = normalize_text(line["text"])
 
-        if not is_relevant_block(block, field_type, field_name):
+        # Standalone integer only. This deliberately excludes RN# 55285,
+        # dates, dimensions, item codes and mixed text.
+        if re.fullmatch(r"[-+]?\d+", norm):
+            current.append(line)
+        else:
+            if current:
+                runs.append(current)
+                current = []
+
+    if current:
+        runs.append(current)
+
+    return [run for run in runs if run]
+
+
+def find_osz_value(
+    expected,
+    field_name,
+    state,
+    osz_group_size=1
+):
+    expected_num = normalize_numeric(expected)
+    index = get_osz_index(field_name)
+
+    if expected_num is None or index is None:
+        return None
+
+    # Explicit OSZ label, when available.
+    label_pattern = re.compile(
+        rf"\bosz\s*{index}\s*[:#=-]?\s*(\d+)\b",
+        re.IGNORECASE
+    )
+
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            continue
+        match = label_pattern.search(line["text"])
+        if not match:
             continue
 
-        # -------------------------------------------------
-        # COO
-        # -------------------------------------------------
-        if field_type == "COO":
-            actual_coo = extract_coo_value(block)
-            if not actual_coo:
-                continue
+        actual = normalize_numeric(match.group(1))
+        consume_lines(state, [line])
+        if actual == expected_num:
+            return {
+                "status": "PASS",
+                "pdf": line["text"],
+                "difference": "—",
+                "match_type": "OSZ_LABEL"
+            }
+        return {
+            "status": "FAIL",
+            "pdf": line["text"],
+            "difference": f"Expected: {expected} | Found: {match.group(1)}",
+            "match_type": "OSZ_LABEL_MISMATCH"
+        }
 
-            expected_coo = extract_coo_value(expected)
-            expected_target = normalize_text(
-                expected_coo if expected_coo else expected
-            )
-            actual_target = normalize_text(actual_coo)
+    # Stable sequence mapping. The run is captured before any OSZ field is
+    # consumed, so OSZ2 always remains the second original sequence value.
+    runs = [run for run in state.get("osz_runs", []) if len(run) >= index]
+    if not runs:
+        return None
 
-            if expected_target and expected_target != actual_target:
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_coo}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
+    runs.sort(key=lambda run: (-len(run), run[0]["line_id"]))
+    run = runs[0]
+    line = run[index - 1]
 
-        # -------------------------------------------------
-        # CONTENT
-        # -------------------------------------------------
-        elif field_type == "CONTENT":
-            expected_composition = extract_content_values(expected)
-            actual_composition = extract_content_values(block)
+    if not line_is_available(line, state):
+        return None
 
-            if not expected_composition or not actual_composition:
-                continue
+    actual = normalize_numeric(line["text"])
 
-            expected_set = set(normalize_composition(expected_composition))
-            actual_set = set(normalize_composition(actual_composition))
+    if actual == expected_num:
+        consume_lines(state, [line])
+        return {
+            "status": "PASS",
+            "pdf": line["text"],
+            "difference": "—",
+            "match_type": "OSZ_SEQUENCE"
+        }
 
-            # Only consider it a mismatch when the candidate shares at least
-            # one explicit composition component with the expected value.
-            if expected_set & actual_set and expected_set != actual_set:
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {' | '.join(actual_composition)}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # GENDER
-        # -------------------------------------------------
-        elif field_type == "GENDER":
-            actual_gender = extract_gender_value(block)
-            if not actual_gender:
-                continue
-
-            expected_gender = extract_gender_value(expected)
-            expected_target = normalize_text(
-                expected_gender if expected_gender else expected
-            )
-
-            if expected_target != normalize_text(actual_gender):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_gender}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # COLOR
-        # -------------------------------------------------
-        elif field_type == "COLOR":
-            actual_color = extract_color_value(block)
-            if not actual_color:
-                continue
-
-            expected_color = re.sub(
-                r"^(?:color|colour)\s*[:\-]?\s*",
-                "",
-                expected_norm
-            )
-
-            if expected_color != normalize_text(actual_color):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_color}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # SIZE
-        # -------------------------------------------------
-        elif field_type == "SIZE":
-            actual_size = extract_size_value(block)
-            if not actual_size:
-                continue
-
-            expected_size = re.sub(
-                r"^size\s*[:\-]?\s*",
-                "",
-                expected_norm
-            )
-
-            if expected_size != normalize_text(actual_size):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_size}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # IDENTIFIER
-        # -------------------------------------------------
-        elif field_type == "IDENTIFIER":
-            actual_identifier = extract_identifier_value(block)
-            if not actual_identifier:
-                continue
-
-            expected_identifier = re.sub(
-                r"^(?:sku|item\s*(?:code|no|number)|style\s*(?:code|no|number)?)\s*[:#\-]?\s*",
-                "",
-                expected_norm
-            )
-
-            if expected_identifier != normalize_text(actual_identifier):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_identifier}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # RN
-        # -------------------------------------------------
-        elif field_type == "RN":
-            actual_rn = extract_rn_value(block)
-            if not actual_rn:
-                continue
-
-            expected_rn = extract_rn_value(expected)
-            expected_target = normalize_text(
-                expected_rn if expected_rn else expected
-            )
-
-            if expected_target != normalize_text(actual_rn):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_rn}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # BATCH
-        # -------------------------------------------------
-        elif field_type == "BATCH":
-            match = re.search(
-                r"\b(?:batch|lot)\s*[:#\-]?\s*([a-z0-9\-_\/]+)",
-                block_norm,
-                re.IGNORECASE
-            )
-            if not match:
-                continue
-
-            actual_value = match.group(1)
-            expected_value = normalize_text(expected)
-
-            if expected_value != normalize_text(actual_value):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_value}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # QUANTITY
-        # -------------------------------------------------
-        elif field_type == "QUANTITY":
-            match = re.search(
-                r"\b(?:quantity|qty|units|pcs)\s*[:#\-]?\s*(\d+)",
-                block_norm,
-                re.IGNORECASE
-            )
-            if not match:
-                continue
-
-            actual_value = match.group(1)
-            expected_value = normalize_text(expected)
-
-            if expected_value != normalize_text(actual_value):
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": (
-                        f"Expected: {expected} | "
-                        f"Found: {actual_value}"
-                    ),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # CARE
-        # -------------------------------------------------
-        elif field_type == "CARE":
-            # Care is one of the few long-text fields for which a controlled
-            # token comparison is useful. It is still limited to a care-relevant
-            # block; unrelated PDF text is never considered.
-            expected_tokens = tokenize(expected)
-            actual_tokens = tokenize(block)
-
-            if not expected_tokens or not actual_tokens:
-                continue
-
-            expected_important = [
-                token for token in expected_tokens if len(token) >= 3
-            ]
-
-            if not expected_important:
-                continue
-
-            common = [
-                token for token in expected_important
-                if token in actual_tokens
-            ]
-
-            overlap = (
-                len(common) / len(expected_important)
-                if expected_important else 0
-            )
-
-            # Require strong overlap and at least one actual difference.
-            if overlap >= 0.60 and normalize_text(expected) != block_norm:
-                consume_unit(unit, consumed)
-                return {
-                    "status": "FAIL",
-                    "pdf": block,
-                    "difference": get_difference(expected, block),
-                    "match_type": "FIELD_MISMATCH"
-                }
-
-        # -------------------------------------------------
-        # ATTRIBUTE / GENERAL / BRAND / SYMBOL
-        # -------------------------------------------------
-        # No generic fuzzy fallback is used here. If an unknown field value is
-        # not found exactly, the safe result is NOT FOUND rather than a guessed FAIL.
+    if actual is not None:
+        consume_lines(state, [line])
+        return {
+            "status": "FAIL",
+            "pdf": line["text"],
+            "difference": f"Expected: {expected} | Found: {line['text']}",
+            "match_type": "OSZ_SEQUENCE_MISMATCH"
+        }
 
     return None
 
 
 # =========================================================
-# CHECK ONE FIELD
+# DIFFERENCE DESCRIPTION
 # =========================================================
+
+def describe_text_difference(expected, actual):
+    """Explanation only; never used as a PASS/FAIL decision."""
+    expected_tokens = tokenize(expected)
+    actual_tokens = tokenize(actual)
+
+    if not expected_tokens:
+        return "Expected value is blank."
+    if not actual_tokens:
+        return "Expected value is missing from the output."
+
+    from difflib import SequenceMatcher
+
+    matcher = SequenceMatcher(
+        None,
+        expected_tokens,
+        actual_tokens,
+        autojunk=False
+    )
+
+    differences = []
+
+    for tag, a1, a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+
+        left = " ".join(expected_tokens[a1:a2]).strip()
+        right = " ".join(actual_tokens[b1:b2]).strip()
+
+        if tag == "replace":
+            differences.append(f"{left} → {right}")
+        elif tag == "delete":
+            differences.append(f"Missing: {left}")
+        elif tag == "insert":
+            differences.append(f"Extra: {right}")
+
+    return "; ".join(differences[:8]) or "Content differs."
+
+
+# =========================================================
+# FIELD CHECKERS
+# =========================================================
+
+def find_care_region(state, field_name):
+    region = get_field_region(field_name)
+    marker_sets = {
+        "EN": ["machine wash", "wash", "bleach", "dry clean", "tumble dry", "cool iron"],
+        "FR": ["laver", "blanchiment", "nettoyage", "sécher", "repasser"],
+        "SP": ["lavar", "cloro", "secadora", "plancha", "limpieza en seco"],
+        "": ["machine wash", "wash", "bleach", "dry clean", "laver", "lavar"],
+    }
+    markers = [normalize_text(m) for m in marker_sets.get(region, marker_sets[""]) if normalize_text(m)]
+
+    lines = state["lines"]
+    start = None
+    for idx, line in enumerate(lines):
+        if not line_is_available(line, state):
+            continue
+        if any(marker in line["norm"] for marker in markers):
+            start = idx
+            break
+
+    if start is None:
+        return None
+
+    region_lines = []
+    for idx in range(start, len(lines)):
+        line = lines[idx]
+        if not line_is_available(line, state):
+            break
+
+        if idx > start:
+            if extract_coo_value(line["text"]) or extract_rn_value(line["text"]):
+                break
+            if extract_content_values(line["text"]):
+                break
+
+            # A non-text/symbol line, an isolated number, or a new obvious
+            # technical line ends the care region. This is essential so symbols,
+            # RN and OSZ data are not swallowed by the care matcher.
+            ascii_letters = len(re.findall(r"[A-Za-z]", line["text"]))
+            if ascii_letters == 0:
+                break
+
+            if re.fullmatch(r"\s*[-+]?\d+(?:\.\d+)?\s*", line["text"]):
+                break
+
+        region_lines.append(line)
+        if len(region_lines) >= 20:
+            break
+
+    return region_lines or None
+
 
 def check_field(
     expected,
-    page_units,
     field_name,
-    consumed
+    state,
+    osz_group_size=1
 ):
+    """Deterministic field validation. PASS is always attempted first."""
+
     if is_blank_value(expected):
         return {
             "status": "SKIP",
@@ -1830,156 +1267,489 @@ def check_field(
         }
 
     expected = str(expected).strip()
+    field_type = get_field_type(field_name)
 
-    # 1. PASS must always be attempted first.
-    exact = find_exact_value(
+    # -----------------------------------------------------
+    # OSZ sequence
+    # -----------------------------------------------------
+    if field_type == "OSZ":
+        result = find_osz_value(
+            expected,
+            field_name,
+            state,
+            osz_group_size=osz_group_size
+        )
+        if result:
+            return result
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "OSZ sequence/value was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # Symbol: exact symbol/text only. Never substring-match.
+    # -----------------------------------------------------
+    if field_type == "SYMBOL":
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+
+            if normalize_symbol_text(expected) == normalize_symbol_text(line["text"]):
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "SYMBOL_EXACT"
+                }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Symbol/value was not detected exactly.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # CONTENT: parse the composition before any generic text check.
+    # -----------------------------------------------------
+    if field_type == "CONTENT":
+        expected_values = normalize_composition(
+            extract_content_values(expected)
+        )
+
+        if expected_values:
+            # Search contiguous windows, but only over unconsumed lines.
+            available = [
+                line for line in state["lines"]
+                if line_is_available(line, state)
+            ]
+
+            max_window = min(8, len(available))
+
+            for size in range(1, max_window + 1):
+                for start in range(0, len(available) - size + 1):
+                    candidate = available[start:start + size]
+                    ids = [line["line_id"] for line in candidate]
+                    if ids != list(range(ids[0], ids[-1] + 1)):
+                        continue
+
+                    text = join_lines(candidate)
+                    actual_values = normalize_composition(
+                        extract_content_values(text)
+                    )
+
+                    if expected_values == actual_values:
+                        consume_lines(state, candidate)
+                        return {
+                            "status": "PASS",
+                            "pdf": text,
+                            "difference": "—",
+                            "match_type": "CONTENT_EXACT"
+                        }
+
+            # If we have a relevant composition region with overlapping
+            # components, report the actual composition as FAIL.
+            for line in state["lines"]:
+                if not line_is_available(line, state):
+                    continue
+                text = line["text"]
+                actual_values = normalize_composition(
+                    extract_content_values(text)
+                )
+                if not actual_values:
+                    continue
+                if set(expected_values) & set(actual_values):
+                    consume_lines(state, [line])
+                    return {
+                        "status": "FAIL",
+                        "pdf": text,
+                        "difference": (
+                            f"Expected: {expected} | "
+                            f"Found: {' | '.join(actual_values)}"
+                        ),
+                        "match_type": "CONTENT_MISMATCH"
+                    }
+
+            return {
+                "status": "NOT FOUND",
+                "pdf": "Not found",
+                "difference": "Expected composition was not detected.",
+                "match_type": "NOT_FOUND"
+            }
+
+    # -----------------------------------------------------
+    # RN
+    # -----------------------------------------------------
+    if field_type == "RN":
+        expected_rn = extract_rn_value(expected)
+        expected_target = normalize_text(
+            expected_rn if expected_rn else expected
+        )
+
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+
+            actual_rn = extract_rn_value(line["text"])
+            if actual_rn is None:
+                continue
+
+            if normalize_text(actual_rn) == expected_target:
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "RN_EXACT"
+                }
+
+            consume_lines(state, [line])
+            return {
+                "status": "FAIL",
+                "pdf": line["text"],
+                "difference": (
+                    f"Expected: {expected} | "
+                    f"Found: RN# {actual_rn}"
+                ),
+                "match_type": "RN_MISMATCH"
+            }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "RN value was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # COO
+    # -----------------------------------------------------
+    if field_type == "COO":
+        expected_coo = extract_coo_value(expected)
+        expected_target = normalize_text(
+            expected_coo if expected_coo else expected
+        )
+        expected_region = get_field_region(field_name)
+
+        # Prefer the requested language. Do not let English COO satisfy French
+        # COO merely because the country happens to be the same.
+        candidates = []
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+            actual_coo = extract_coo_value(line["text"])
+            if not actual_coo:
+                continue
+            region = coo_language(line["text"])
+            candidates.append((line, actual_coo, region))
+
+        preferred = [
+            item for item in candidates
+            if expected_region and item[2] == expected_region
+        ]
+
+        # When no language suffix is supplied, any COO language may be used.
+        search_candidates = preferred if preferred else (
+            candidates if not expected_region else []
+        )
+
+        for line, actual_coo, _region in search_candidates:
+            if normalize_text(actual_coo) == expected_target:
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "COO_EXACT"
+                }
+
+        # A same-language different COO is a genuine FAIL.
+        for line, actual_coo, _region in search_candidates:
+            consume_lines(state, [line])
+            return {
+                "status": "FAIL",
+                "pdf": line["text"],
+                "difference": (
+                    f"Expected: {expected} | "
+                    f"Found: {actual_coo}"
+                ),
+                "match_type": "COO_MISMATCH"
+            }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": (
+                "Expected COO was not detected in the requested language/region."
+            ),
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # GENDER
+    # -----------------------------------------------------
+    if field_type == "GENDER":
+        expected_gender = extract_gender_value(expected)
+        expected_target = normalize_text(
+            expected_gender if expected_gender else expected
+        )
+
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+            actual_gender = extract_gender_value(line["text"])
+            if not actual_gender:
+                continue
+
+            if normalize_text(actual_gender) == expected_target:
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "GENDER_EXACT"
+                }
+
+            consume_lines(state, [line])
+            return {
+                "status": "FAIL",
+                "pdf": line["text"],
+                "difference": (
+                    f"Expected: {expected} | "
+                    f"Found: {actual_gender}"
+                ),
+                "match_type": "GENDER_MISMATCH"
+            }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Gender value was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # SIZE
+    # -----------------------------------------------------
+    if field_type == "SIZE":
+        expected_size = normalize_text(expected)
+        expected_size = re.sub(
+            r"^size\s*[:#-]?\s*",
+            "",
+            expected_size
+        ).strip()
+
+        # Prefer labeled size blocks.
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+            actual_size = extract_size_value(line["text"])
+            if actual_size is None:
+                continue
+
+            if normalize_text(actual_size) == expected_size:
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "SIZE_EXACT"
+                }
+
+            consume_lines(state, [line])
+            return {
+                "status": "FAIL",
+                "pdf": line["text"],
+                "difference": (
+                    f"Expected: {expected} | "
+                    f"Found: {actual_size}"
+                ),
+                "match_type": "SIZE_MISMATCH"
+            }
+
+        # Then exact text, useful when artwork prints only the value.
+        exact = find_exact_lines(
+            expected,
+            field_name,
+            state,
+            max_window=1
+        )
+        if exact:
+            consume_lines(state, exact)
+            return {
+                "status": "PASS",
+                "pdf": join_lines(exact),
+                "difference": "—",
+                "match_type": "EXACT"
+            }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Size value was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # COLOR
+    # -----------------------------------------------------
+    if field_type == "COLOR":
+        expected_color = normalize_text(expected)
+        expected_color = re.sub(
+            r"^(?:color|colour)\s*[:#-]?\s*",
+            "",
+            expected_color
+        ).strip()
+
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+            actual_color = extract_color_value(line["text"])
+            if actual_color is None:
+                continue
+
+            if normalize_text(actual_color) == expected_color:
+                consume_lines(state, [line])
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "COLOR_EXACT"
+                }
+
+            consume_lines(state, [line])
+            return {
+                "status": "FAIL",
+                "pdf": line["text"],
+                "difference": (
+                    f"Expected: {expected} | "
+                    f"Found: {actual_color}"
+                ),
+                "match_type": "COLOR_MISMATCH"
+            }
+
+        return _generic_exact_field(expected, field_name, state)
+
+    # -----------------------------------------------------
+    # CARE
+    # -----------------------------------------------------
+    if field_type == "CARE":
+        care_region = find_care_region(state, field_name)
+
+        if care_region:
+            actual_text = join_lines(care_region)
+            expected_norm = normalize_text(expected)
+            actual_norm = normalize_text(actual_text)
+
+            if expected_norm == actual_norm or expected_norm in actual_norm:
+                consume_lines(state, care_region)
+                return {
+                    "status": "PASS",
+                    "pdf": actual_text,
+                    "difference": "—",
+                    "match_type": "CARE_EXACT_REGION"
+                }
+
+            expected_tokens = set(tokenize(expected))
+            actual_tokens = set(tokenize(actual_text))
+            common = expected_tokens & actual_tokens
+
+            if expected_tokens and len(common) >= max(3, int(len(expected_tokens) * 0.55)):
+                consume_lines(state, care_region)
+                return {
+                    "status": "FAIL",
+                    "pdf": actual_text,
+                    "difference": describe_text_difference(expected, actual_text),
+                    "match_type": "CARE_MISMATCH"
+                }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Care instruction was not detected in the relevant artwork region.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # GENERAL/BRAND/ATTRIBUTE/IDENTIFIER/BATCH/QUANTITY
+    # -----------------------------------------------------
+    return _generic_exact_field(
         expected,
         field_name,
-        page_units,
-        consumed
+        state
+    )
+
+
+def _generic_exact_field(expected, field_name, state):
+    exact = find_exact_lines(
+        expected,
+        field_name,
+        state,
+        max_window=8
     )
 
     if exact:
-        return exact
+        consume_lines(state, exact)
+        return {
+            "status": "PASS",
+            "pdf": join_lines(exact),
+            "difference": "—",
+            "match_type": "EXACT"
+        }
 
-    # 2. Only field-safe mismatch rules may produce FAIL.
-    mismatch = search_field_mismatch(
-        expected,
-        page_units,
-        field_name,
-        consumed
-    )
-
-    if mismatch:
-        return mismatch
-
-    # 3. Otherwise we do not guess.
+    # IMPORTANT: for unknown fields we do not manufacture a FAIL. This avoids
+    # the historical problem where unrelated PDF text was interpreted as a mismatch.
     return {
         "status": "NOT FOUND",
         "pdf": "Not found",
-        "difference": (
-            "Expected value was not detected in the relevant artwork content."
-        ),
+        "difference": "Expected value was not detected.",
         "match_type": "NOT_FOUND"
     }
 
 
 # =========================================================
-# AUTO DETECT
+# FIELD MATCHING ORDER
 # =========================================================
 
-AUTO_IGNORED_FIELD_WORDS = {
-    "sr",
-    "serial",
-    "serialno",
-    "serialnumber",
-    "jobno",
-    "jobnumber",
-    "orderno",
-    "ordernumber",
-    "orderdate",
-    "ticket",
-    "ticketno",
-    "createddate",
-    "modifieddate",
-    "timestamp"
+FIELD_PRIORITY = {
+    "OSZ": 10,
+    "RN": 20,
+    "IDENTIFIER": 20,
+    "COO": 30,
+    "CONTENT": 40,
+    "CARE": 50,
+    "GENDER": 60,
+    "COLOR": 60,
+    "SIZE": 60,
+    "BATCH": 60,
+    "QUANTITY": 60,
+    "SYMBOL": 70,
+    "BRAND": 80,
+    "ATTRIBUTE": 90,
+    "GENERAL": 100,
 }
 
 
-def _auto_field_is_candidate(field_name):
-    """Exclude obvious administrative fields, but allow all populated artwork fields."""
-    normalized = normalize_text(field_name)
-    compact = normalized.replace(" ", "").replace("_", "").replace("-", "")
+def order_fields_for_matching(fields):
+    indexed = list(enumerate(fields))
 
-    if not compact:
-        return False
-
-    if compact in AUTO_IGNORED_FIELD_WORDS:
-        return False
-
-    # Recognized artwork-variable fields are always candidates.
-    if get_field_type(field_name) != "GENERAL":
-        return True
-
-    # Symbol/label-like fields are valid Auto Detect candidates too.
-    artwork_keywords = [
-        "symbol", "label", "mark", "text", "copy",
-        "name", "value", "number", "code"
-    ]
-
-    return any(keyword in compact for keyword in artwork_keywords)
-
-
-def auto_detect_fields(
-    df,
-    output_pages,
-    product_type
-):
-    """
-    Auto Detect returns fields that have positive evidence in the artwork:
-
-    * exact populated value -> PASS evidence
-    * safe field-specific conflicting value -> FAIL evidence
-
-    It does not select a field merely because its name looks familiar.
-    """
-    candidates = [
-        str(column)
-        for column in df.columns
-        if _auto_field_is_candidate(str(column))
-    ]
-
-    detected = []
-
-    for field in candidates:
-        evidence_found = False
-
-        for page_index, page in enumerate(output_pages):
-            if page_index >= len(df):
-                break
-
-            value = df.iloc[page_index][field]
-            if is_blank_value(value):
-                continue
-
-            value = str(value).strip()
-
-            # Auto Detect evidence search is independent per field so that a
-            # successful field can never hide another field.
-            units = get_page_units(page, product_type)
-            local_consumed = {
-                "unit_ids": set(),
-                "line_ids": set(),
-                "signatures": set(),
-                "value_keys": set()
-            }
-
-            exact = find_exact_value(
-                value,
-                field,
-                units,
-                local_consumed
+    return [
+        field
+        for _index, field in sorted(
+            indexed,
+            key=lambda pair: (
+                FIELD_PRIORITY.get(
+                    get_field_type(pair[1]),
+                    100
+                ),
+                pair[0]
             )
-
-            if exact:
-                evidence_found = True
-                break
-
-            mismatch = search_field_mismatch(
-                value,
-                units,
-                field,
-                local_consumed
-            )
-
-            if mismatch:
-                evidence_found = True
-                break
-
-        if evidence_found:
-            detected.append(field)
-
-    return detected
+        )
+    ]
 
 
 # =========================================================
@@ -1993,15 +1763,25 @@ def build_report(
     product_type
 ):
     """
-    Build a complete report containing PASS, FAIL, NOT FOUND and SKIP.
+    Full validation report.
 
-    Consumption is page-local and shared across fields on the same page.
-    Therefore the same artwork data is not repeatedly used for several fields.
+    Matching order is optimized for specificity, but report output is returned
+    in the original selected-field order per page.
     """
+
     results = []
     field_no = 1
 
+    # Pre-compute OSZ group sizes per row. They are used only to make sequence
+    # mapping safe when more than one OSZ field exists.
+    osz_fields = [
+        field for field in selected_fields
+        if get_field_type(field) == "OSZ"
+    ]
+    osz_group_size = len(osz_fields)
+
     for page_index, page in enumerate(pdf_pages):
+
         excel_index = page_index
 
         if excel_index >= len(df):
@@ -2020,40 +1800,47 @@ def build_report(
             continue
 
         row = df.iloc[excel_index]
-        page_units = get_page_units(
+        state = build_page_state(
             page,
             product_type
         )
 
-        # Shared consumption tracker for this PDF page.
-        consumed = {
-            "unit_ids": set(),
-            "line_ids": set(),
-            "signatures": set(),
-            "value_keys": set()
-        }
+        # Match in smart specificity order so a precise RN/OSZ/COO matcher gets
+        # the relevant artwork before a broad textual field can consume it.
+        matching_fields = order_fields_for_matching(
+            selected_fields
+        )
 
-        for field in selected_fields:
-            value = row[field]
+        page_results = {}
 
-            if is_blank_value(value):
-                value = ""
-            else:
-                value = str(value).strip()
+        for field in matching_fields:
+
+            value = "" if is_blank_value(row[field]) else str(row[field]).strip()
 
             result = check_field(
                 value,
-                page_units,
                 field,
-                consumed
+                state,
+                osz_group_size=osz_group_size
             )
+
+            page_results[field] = {
+                "field": field,
+                "value": value,
+                "result": result
+            }
+
+        # Return results in the user's original field order, not matching order.
+        for field in selected_fields:
+            item = page_results[field]
+            result = item["result"]
 
             results.append({
                 "FIELD NO": field_no,
                 "PDF PAGE": page["page"],
                 "EXCEL ROW": excel_index + 2,
                 "FIELD": field,
-                "ORDER FORM DATA": value,
+                "ORDER FORM DATA": item["value"],
                 "PDF OUTPUT": result["pdf"],
                 "STATUS": result["status"],
                 "DIFFERENCE": result["difference"]
@@ -2065,387 +1852,64 @@ def build_report(
 
 
 # =========================================================
-# PFL PANEL SUPPORT
+# AUTO DETECT
 # =========================================================
 
-def get_pfl_panel_blocks(page_text):
+def auto_detect_fields(
+    df,
+    output_pages,
+    product_type
+):
     """
-    PFL mode treats panel-numbered artwork as a continuous stream.
-    Panel labels such as 1, 2, 3 or PANEL 1 / PANEL 2 are removed
-    from the comparison content. The extracted lines are then grouped
-    into larger blocks so text split at a panel boundary can be found.
+    Auto Detect is now a REPORT-DRIVEN operation.
+
+    It considers every populated non-administrative field and runs the same
+    validation engine used by manual Select Fields.
+
+    Therefore Auto Detect can detect:
+        PASS -> expected data found
+        FAIL -> relevant field-specific wrong data found
+
+    NOT FOUND is not enough evidence to call a field an artwork field.
     """
-    if not page_text:
-        return []
 
-    raw_lines = page_text.splitlines()
-    cleaned = []
-
-    panel_pattern = re.compile(
-        r"^\s*(?:panel\s*)?(\d{1,3})\s*$",
-        re.IGNORECASE
-    )
-
-    for raw in raw_lines:
-        line = clean_pdf_line(raw)
-        if not line:
-            continue
-        if len(line) > 1500:
-            continue
-
-        # Ignore standalone panel sequence numbers.
-        if panel_pattern.match(line):
-            continue
-
-        # Ignore common textual panel labels.
-        if re.match(r"^\s*panel\s*[-#:]?\s*\d{1,3}\s*$", line, re.IGNORECASE):
-            continue
-
-        cleaned.append(line)
-
-    if not cleaned:
-        return []
-
-    blocks = list(cleaned)
-
-    # Larger windows are the important part for PFL because a value
-    # may begin near the end of one panel and continue into the next.
-    maximum = min(24, len(cleaned))
-
-    for size in range(2, maximum + 1):
-        for start in range(len(cleaned) - size + 1):
-            block = " ".join(cleaned[start:start + size])
-            if block:
-                blocks.append(block)
-
-    unique = []
-    seen = set()
-
-    for block in blocks:
-        normalized = normalize_text(block)
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        unique.append(block)
-
-    return unique
-
-
-def get_comparison_blocks(page_text, product_type):
-    if product_type == "PFL":
-        return get_pfl_panel_blocks(page_text)
-    return create_pdf_blocks(page_text)
-
-
-# =========================================================
-# AUTO DETECT MODE
-# =========================================================
-
-AUTO_IGNORED_FIELD_WORDS = {
-    "sr",
-    "serial",
-    "serialno",
-    "serialnumber",
-    "jobno",
-    "jobnumber",
-    "orderno",
-    "ordernumber",
-    "orderdate",
-    "ticket",
-    "ticketno",
-    "createddate",
-    "modifieddate"
-}
-
-
-def _auto_field_is_candidate(field_name):
-    """Keep Auto Detect focused on fields that can reasonably appear in artwork."""
-
-    compact = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
-
-    if not compact:
-        return False
-
-    if compact in AUTO_IGNORED_FIELD_WORDS:
-        return False
-
-    # Explicitly recognized variable/business fields are candidates.
-    if get_field_type(field_name) != "GENERAL":
-        return True
-
-    # Common artwork variable names that are not covered by field typing.
-    keywords = (
-        "sku", "item", "style", "batch", "lot", "qty", "quantity",
-        "number", "code", "description", "attribute", "value"
-    )
-
-    return any(word in compact for word in keywords)
-
-
-def auto_detect_fields(df, output_pages, product_type):
-    """
-    Identify Order Form columns that have evidence of corresponding artwork data.
-
-    We do not blindly select every Excel column. A field must have at least one
-    nonblank value and evidence in the output through exact matching or a strong
-    field-aware candidate. This keeps administrative Excel columns out of the QC.
-    """
+    available_fields = get_available_fields(df)
 
     candidates = [
-        str(column)
-        for column in df.columns
-        if _auto_field_is_candidate(str(column))
+        field for field in available_fields
+        if not is_admin_field(field)
     ]
+
+    if not candidates:
+        return []
+
+    probe = build_report(
+        df,
+        output_pages,
+        order_fields_for_matching(candidates),
+        product_type
+    )
+
+    if probe.empty:
+        return []
 
     detected = []
 
-    # Build page blocks once. No comparison happens before COMPARE because this
-    # function itself is called only from the Compare button handler.
-    page_blocks = [
-        get_comparison_blocks(page.get("text", ""), product_type)
-        for page in output_pages
-    ]
-
     for field in candidates:
-        found_evidence = False
+        field_rows = probe[
+            probe["FIELD"] == field
+        ]
 
-        for page_index, blocks in enumerate(page_blocks):
-            if page_index >= len(df):
-                break
+        if field_rows.empty:
+            continue
 
-            value = df.iloc[page_index][field]
-
-            if pd.isna(value) or not str(value).strip():
-                continue
-
-            value = str(value).strip()
-
-            # Exact value is the strongest evidence that this column belongs
-            # to the output artwork.
-            if search_exact_value(value, blocks):
-                found_evidence = True
-                break
-
-            # Strong field-aware mismatch evidence means the value was likely
-            # intended for artwork even if the printed value is wrong.
-            probable = search_probable_mismatch(
-                value,
-                blocks,
-                field
-            )
-
-            if probable:
-                found_evidence = True
-                break
-
-        if found_evidence:
+        if field_rows["STATUS"].isin(
+            ["PASS", "FAIL"]
+        ).any():
             detected.append(field)
 
     return detected
 
-
-# =========================================================
-# BUILD REPORT
-#
-# PAGE 1 → EXCEL ROW 2
-# PAGE 2 → EXCEL ROW 3
-# PAGE 3 → EXCEL ROW 4
-# =========================================================
-
-def build_report(
-    df,
-    pdf_pages,
-    selected_fields,
-    product_type
-):
-
-    results = []
-
-    field_no = 1
-
-
-    # -----------------------------------------------------
-    # Process PDF pages.
-    #
-    # PDF page index 0 = Excel row 2
-    # PDF page index 1 = Excel row 3
-    # etc.
-    # -----------------------------------------------------
-
-    for page_index, page in enumerate(
-        pdf_pages
-    ):
-
-        excel_index = page_index
-
-
-        # -------------------------------------------------
-        # No corresponding Excel row
-        # -------------------------------------------------
-
-        if excel_index >= len(df):
-
-            for field in selected_fields:
-
-                results.append(
-                    {
-                        "FIELD NO": field_no,
-                        "PDF PAGE": page["page"],
-                        "EXCEL ROW": "N/A",
-                        "FIELD": field,
-                        "ORDER FORM DATA": "No Excel row",
-                        "PDF OUTPUT": "No corresponding Order Form row",
-                        "STATUS": "NOT FOUND",
-                        "DIFFERENCE": "No corresponding Excel row."
-                    }
-                )
-
-                field_no += 1
-
-            continue
-
-
-        # -------------------------------------------------
-        # Get corresponding Excel row
-        # -------------------------------------------------
-
-        row = df.iloc[
-            excel_index
-        ]
-
-
-        # -------------------------------------------------
-        # Extract smart PDF blocks
-        # -------------------------------------------------
-
-        pdf_blocks = get_comparison_blocks(
-            page["text"],
-            product_type
-        )
-
-
-        # -------------------------------------------------
-        # Compare ONLY user-selected fields
-        # -------------------------------------------------
-
-        for field in selected_fields:
-
-            value = row[field]
-
-
-            if pd.isna(value):
-
-                value = ""
-
-            else:
-
-                value = str(
-                    value
-                ).strip()
-
-
-            # -------------------------------------------------
-            # Blank variable field = NOT REQUIRED
-            # -------------------------------------------------
-
-            if not value:
-
-                results.append(
-                    {
-                        "FIELD NO": field_no,
-                        "PDF PAGE": page["page"],
-                        "EXCEL ROW": excel_index + 2,
-                        "FIELD": field,
-                        "ORDER FORM DATA": "",
-                        "PDF OUTPUT": "—",
-                        "STATUS": "SKIP",
-                        "DIFFERENCE": "Blank Order Form value — PDF content ignored."
-                    }
-                )
-
-                field_no += 1
-
-                continue
-
-
-            # -------------------------------------------------
-            # Compare variable field
-            # -------------------------------------------------
-
-            result = check_field(
-                value,
-                pdf_blocks,
-                field
-            )
-
-
-            results.append(
-                {
-                    "FIELD NO": field_no,
-                    "PDF PAGE": page["page"],
-                    "EXCEL ROW": excel_index + 2,
-                    "FIELD": field,
-                    "ORDER FORM DATA": value,
-                    "PDF OUTPUT": result["pdf"],
-                    "STATUS": result["status"],
-                    "DIFFERENCE": result["difference"]
-                }
-            )
-
-            field_no += 1
-
-
-    return pd.DataFrame(
-        results
-    )
-
-
-# =========================================================
-# STATUS COLORS
-# =========================================================
-
-def style_status(value):
-
-    if value == "PASS":
-
-        return (
-            "background-color: #238636;"
-            "color: white;"
-            "font-weight: bold;"
-        )
-
-
-    if value == "FAIL":
-
-        return (
-            "background-color: #da3633;"
-            "color: white;"
-            "font-weight: bold;"
-        )
-
-
-    if value == "NOT FOUND":
-
-        return (
-            "background-color: #9e6a03;"
-            "color: white;"
-            "font-weight: bold;"
-        )
-
-
-    if value == "SKIP":
-
-        return (
-            "background-color: #555555;"
-            "color: white;"
-            "font-weight: bold;"
-        )
-
-
-    return ""
-
-
-# =========================================================
 
 def main():
     """Render Tool 1: Order Form → Output Check."""
