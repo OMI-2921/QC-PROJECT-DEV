@@ -1911,6 +1911,42 @@ def auto_detect_fields(
     return detected
 
 
+# =========================================================
+# STATUS COLORS
+# =========================================================
+
+def style_status(value):
+    if value == "PASS":
+        return (
+            "background-color: #238636;"
+            "color: white;"
+            "font-weight: bold;"
+        )
+
+    if value == "FAIL":
+        return (
+            "background-color: #da3633;"
+            "color: white;"
+            "font-weight: bold;"
+        )
+
+    if value == "NOT FOUND":
+        return (
+            "background-color: #9e6a03;"
+            "color: white;"
+            "font-weight: bold;"
+        )
+
+    if value == "SKIP":
+        return (
+            "background-color: #555555;"
+            "color: white;"
+            "font-weight: bold;"
+        )
+
+    return ""
+
+
 def main():
     """Render Tool 1: Order Form → Output Check."""
 
