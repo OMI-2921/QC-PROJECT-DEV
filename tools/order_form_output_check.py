@@ -387,6 +387,10 @@ def get_field_type(field_name):
         or "stylecode" in compact
         or compact == "style"
         or "productcode" in compact
+        or "supwsp" in compact
+        or "supplier" in compact
+        or "vendorid" in compact
+        or "vendorcode" in compact
     ):
         return "IDENTIFIER"
 
@@ -619,6 +623,7 @@ def build_page_state(page, product_type):
         "source_type": page.get("source_type", "pdf_text"),
         "lines": lines,
         "consumed": set(),
+        "consumed_spans": {},
         "osz_runs": extract_standalone_numeric_runs_from_lines(lines),
     }
 
@@ -642,12 +647,32 @@ def extract_standalone_numeric_runs_from_lines(lines):
 
 
 def line_is_available(line, state):
-    return line["line_id"] not in state["consumed"]
+    # A line remains available when only part of it has already been assigned.
+    # This is required for combined output lines containing multiple fields.
+    return line["line_id"] not in state.get("consumed", set())
 
 
 def consume_lines(state, lines):
     for line in lines:
-        state["consumed"].add(line["line_id"])
+        state.setdefault("consumed", set()).add(line["line_id"])
+
+
+def consume_match(state, match_info):
+    if not match_info:
+        return
+
+    if match_info.get("lines"):
+        consume_lines(state, match_info["lines"])
+        return
+
+    line = match_info.get("line")
+    if line is not None and match_info.get("start") is not None and match_info.get("end") is not None:
+        consume_span(
+            state,
+            line,
+            match_info["start"],
+            match_info["end"]
+        )
 
 
 def join_lines(lines):
@@ -661,20 +686,61 @@ def join_lines(lines):
 # SAFE EXACT MATCHING
 # =========================================================
 
-def normalized_contains(expected, actual):
-    expected_norm = normalize_text(expected)
-    actual_norm = normalize_text(actual)
+def _used_spans(state, line_id):
+    return state.setdefault("consumed_spans", {}).get(line_id, [])
 
+
+def _span_overlaps(a_start, a_end, used_spans):
+    return any(a_start < end and a_end > start for start, end in used_spans)
+
+
+def consume_span(state, line, start, end):
+    state.setdefault("consumed_spans", {}).setdefault(line["line_id"], []).append((start, end))
+
+
+def _normalized_match_positions(expected_norm, actual_norm, field_type):
     if not expected_norm or not actual_norm:
-        return False
+        return []
 
-    # IMPORTANT: for multi-word text, substring is acceptable because artwork
-    # may include a label around it. For a single numeric token, this function
-    # must NOT be used because 2 must never match inside RN# 55285.
-    if len(expected_norm.split()) <= 1 and normalize_numeric(expected_norm):
-        return False
+    # Structured scalar/numeric values must match as whole tokens.
+    if normalize_numeric(expected_norm) is not None:
+        return [
+            (m.start(), m.end())
+            for m in re.finditer(
+                rf"(?<![A-Za-z0-9]){re.escape(expected_norm)}(?![A-Za-z0-9])",
+                actual_norm
+            )
+        ]
 
-    return expected_norm in actual_norm
+    # Identifiers: normal whole-token match. The asymmetric prefix rule is
+    # handled separately by find_identifier_match().
+    if field_type == "IDENTIFIER":
+        return [
+            (m.start(), m.end())
+            for m in re.finditer(
+                rf"(?<![A-Za-z0-9]){re.escape(expected_norm)}(?![A-Za-z0-9])",
+                actual_norm
+            )
+        ]
+
+    # A single alphanumeric token must not match inside another word.
+    if len(expected_norm.split()) == 1 and re.fullmatch(r"[A-Za-z0-9%#]+", expected_norm):
+        return [
+            (m.start(), m.end())
+            for m in re.finditer(
+                rf"(?<![A-Za-z0-9]){re.escape(expected_norm)}(?![A-Za-z0-9])",
+                actual_norm
+            )
+        ]
+
+    # Multi-word text can occur inside a combined artwork line.
+    return [
+        (m.start(), m.end())
+        for m in re.finditer(
+            re.escape(expected_norm),
+            actual_norm
+        )
+    ]
 
 
 def safe_exact_match(expected, actual, field_name):
@@ -685,15 +751,13 @@ def safe_exact_match(expected, actual, field_name):
         act = normalize_symbol_text(actual)
         return bool(exp and exp == act)
 
-    # Numeric value: exact numeric token only.
-    numeric_expected = normalize_numeric(expected)
-    if numeric_expected is not None:
-        actual_norm = normalize_text(actual)
+    expected_numeric = normalize_numeric(expected)
+    if expected_numeric is not None:
         actual_numbers = re.findall(
             r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9])",
-            actual_norm
+            normalize_text(actual)
         )
-        return numeric_expected in {
+        return expected_numeric in {
             normalize_numeric(number)
             for number in actual_numbers
         }
@@ -704,67 +768,197 @@ def safe_exact_match(expected, actual, field_name):
     if not exp or not act:
         return False
 
-    # Full normalized text / token sequence.
     if exp == act:
         return True
 
-    if exp in act:
-        return True
+    positions = _normalized_match_positions(exp, act, field_type)
+    return bool(positions)
 
-    # Space-independent comparison is only for longer textual values.
-    compact_exp = compact_text(expected)
-    compact_act = compact_text(actual)
 
-    return bool(
-        len(exp.split()) > 1
-        and compact_exp
-        and compact_exp in compact_act
-    )
+def find_identifier_match(expected, state):
+    expected_norm = normalize_text(expected)
+    if not expected_norm:
+        return None
+
+    token_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-/]*")
+
+    # First: exact identifier token.
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            continue
+
+        actual_norm = line["norm"]
+
+        for match in token_pattern.finditer(actual_norm):
+            token = match.group(0)
+            if token.casefold() != expected_norm.casefold():
+                continue
+
+            if _span_overlaps(match.start(), match.end(), _used_spans(state, line["line_id"])):
+                continue
+
+            return {
+                "kind": "PASS",
+                "line": line,
+                "start": match.start(),
+                "end": match.end(),
+                "actual": token,
+                "difference": "—",
+                "match_type": "IDENTIFIER_EXACT"
+            }
+
+    # Second: the Order Form has the base code and the PDF has an additional
+    # suffix/static portion. Base -> longer output is intentionally PASS.
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            continue
+
+        actual_norm = line["norm"]
+
+        for match in token_pattern.finditer(actual_norm):
+            token = match.group(0)
+
+            if not token.casefold().startswith(expected_norm.casefold()):
+                continue
+
+            if len(token) <= len(expected_norm):
+                continue
+
+            if _span_overlaps(match.start(), match.end(), _used_spans(state, line["line_id"])):
+                continue
+
+            return {
+                "kind": "PASS",
+                "line": line,
+                "start": match.start(),
+                "end": match.start() + len(expected_norm),
+                "actual": token,
+                "difference": "Base identifier matched; PDF contains additional suffix/static characters.",
+                "match_type": "IDENTIFIER_BASE_PLUS_SUFFIX"
+            }
+
+    # Third: reverse condition — PDF has only a shorter base and Order Form
+    # expects the longer identifier. This must NOT pass.
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            continue
+
+        actual_norm = line["norm"]
+
+        for match in token_pattern.finditer(actual_norm):
+            token = match.group(0)
+
+            if len(token) < 2:
+                continue
+
+            if not expected_norm.casefold().startswith(token.casefold()):
+                continue
+
+            if token.casefold() == expected_norm.casefold():
+                continue
+
+            if _span_overlaps(match.start(), match.end(), _used_spans(state, line["line_id"])):
+                continue
+
+            return {
+                "kind": "FAIL",
+                "line": line,
+                "start": match.start(),
+                "end": match.end(),
+                "actual": token,
+                "difference": (
+                    f"Identifier incomplete: Order Form has '{expected}', "
+                    f"but PDF has '{token}'."
+                ),
+                "match_type": "IDENTIFIER_SHORTER_OUTPUT"
+            }
+
+    return None
 
 
 def find_exact_lines(expected, field_name, state, max_window=8):
-    """Find the smallest unused contiguous line span containing the expected value."""
+    """Find an exact value while allowing multiple independent fields on one PDF line."""
     lines = state["lines"]
     available = [line for line in lines if line_is_available(line, state)]
     if not available:
         return None
 
     field_type = get_field_type(field_name)
+
+    if field_type == "IDENTIFIER":
+        identifier = find_identifier_match(expected, state)
+        if identifier and identifier["kind"] == "PASS":
+            return [identifier["line"]], identifier
+        return None
+
     numeric_expected = normalize_numeric(expected)
-
-    # Numeric scalar values must never be matched as substrings in mixed text.
-    # This is the critical protection against 2/4/6 matching inside RN# 55285.
     if numeric_expected is not None:
-        search_window = 1
         for line in available:
-            if field_type in {"OSZ", "RN"}:
-                continue
-            if field_type not in {"QUANTITY", "BATCH"} and normalize_text(line["text"]) == numeric_expected:
-                return [line]
-
+            positions = _normalized_match_positions(
+                numeric_expected,
+                line["norm"],
+                field_type
+            )
+            for start, end in positions:
+                if not _span_overlaps(start, end, _used_spans(state, line["line_id"])):
+                    return [line], {
+                        "kind": "PASS",
+                        "line": line,
+                        "start": start,
+                        "end": end,
+                        "actual": numeric_expected,
+                        "difference": "—",
+                        "match_type": "NUMERIC_TOKEN"
+                    }
         return None
 
     preferred_single_line = field_type in {
-        "SYMBOL", "RN", "IDENTIFIER", "OSZ", "SIZE", "COLOR",
-        "GENDER", "BATCH", "QUANTITY"
+        "SYMBOL", "RN", "OSZ", "SIZE", "COLOR", "GENDER",
+        "BATCH", "QUANTITY", "BRAND", "ATTRIBUTE", "GENERAL"
     }
     search_window = 1 if preferred_single_line else max_window
 
-    for window_size in range(1, search_window + 1):
-        for start in range(0, len(available) - window_size + 1):
-            candidate = available[start:start + window_size]
-            ids = [line["line_id"] for line in candidate]
+    # First search individual lines. This is essential for combined output such
+    # as 'SF8334 67 YZP': each value can be consumed independently.
+    for line in available:
+        positions = _normalized_match_positions(
+            normalize_text(expected),
+            line["norm"],
+            field_type
+        )
+        for start, end in positions:
+            if not _span_overlaps(start, end, _used_spans(state, line["line_id"])):
+                return [line], {
+                    "kind": "PASS",
+                    "line": line,
+                    "start": start,
+                    "end": end,
+                    "actual": line["norm"][start:end],
+                    "difference": "—",
+                    "match_type": "EXACT_COMBINED_LINE"
+                }
 
+    if search_window <= 1:
+        return None
+
+    # Multi-line exact match for wrapped care/content/general text.
+    for window_size in range(2, search_window + 1):
+        for start_index in range(0, len(available) - window_size + 1):
+            candidate = available[start_index:start_index + window_size]
+            ids = [line["line_id"] for line in candidate]
             if ids != list(range(ids[0], ids[-1] + 1)):
                 continue
 
             text = join_lines(candidate)
-
             if safe_exact_match(expected, text, field_name):
-                return candidate
+                return candidate, {
+                    "kind": "PASS",
+                    "lines": candidate,
+                    "difference": "—",
+                    "match_type": "EXACT_MULTI_LINE"
+                }
 
     return None
-
 
 # =========================================================
 # STRUCTURED EXTRACTORS
@@ -884,70 +1078,70 @@ def extract_content_values(text):
     if not normalized:
         return []
 
-    # Stop material capture at another percentage sign or common section label.
+    # Support both normal PDF text ('60% cotton') and OCR/PDF extraction that
+    # collapses the percent sign ('60cotton'). Material is captured until the
+    # next percentage/material component or end of the content run.
     pattern = re.compile(
-        r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%\s*"
-        r"(?P<material>[a-z][a-z0-9\s\-]*?)(?=\s+\d{1,3}(?:\.\d+)?\s*%|$)",
+        r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%?\s*"
+        r"(?P<material>[a-z][a-z0-9-]*(?:\s+[a-z][a-z0-9-]*){0,3})"
+        r"(?=\s+\d{1,3}(?:\.\d+)?\s*%?|$)",
         re.IGNORECASE
     )
 
     values = []
     for match in pattern.finditer(normalized):
         material = match.group("material").strip()
-        material = re.sub(
+        if not material:
+            continue
+
+        # Prevent accidental capture of common section/identifier words.
+        material = re.split(
             r"\b(?:shell|liner|lining|body|rn|ca|made|size|color|colour)\b.*$",
-            "",
             material,
-        ).strip()
+            maxsplit=1
+        )[0].strip()
+
         if material:
             values.append(
                 f"{match.group('pct')}% {material}"
             )
+
     return values
 
 
 def normalize_composition(values):
-    return sorted(
+    # Preserve source order. Ordering is presentation/semantic information;
+    # sorting it hides which exact component differs.
+    return [
         normalize_text(value)
         for value in values
         if normalize_text(value)
-    )
-
-
+    ]
 
 
 def analyze_content_difference(expected, actual):
-    """
-    Produce a human-friendly Content difference.
-
-    The QC user should see the actual issue, not a reordered list of
-    percentages/materials. In particular, a material spelling error such as
-    POLYSTER vs POLYESTER is reported directly.
-    """
+    """Return the actual Content defect in QC-friendly language."""
     expected_values = extract_content_values(expected)
     actual_values = extract_content_values(actual)
 
     if not expected_values or not actual_values:
-        return (
-            f"Expected: {expected} | Found: {actual}"
-        )
+        return f"Expected: {expected} | Found: {actual}"
 
-    # Compare composition entries in their original order.
-    max_len = max(len(expected_values), len(actual_values))
     issues = []
-
     from difflib import SequenceMatcher
 
-    for i in range(max_len):
-        exp = expected_values[i] if i < len(expected_values) else None
-        act = actual_values[i] if i < len(actual_values) else None
+    max_len = max(len(expected_values), len(actual_values))
+
+    for index in range(max_len):
+        exp = expected_values[index] if index < len(expected_values) else None
+        act = actual_values[index] if index < len(actual_values) else None
 
         if exp is None:
-            issues.append(f"Extra content: {act}")
+            issues.append(f"Extra content in PDF: {act}")
             continue
 
         if act is None:
-            issues.append(f"Missing content: {exp}")
+            issues.append(f"Missing from PDF: {exp}")
             continue
 
         exp_match = re.fullmatch(
@@ -963,9 +1157,7 @@ def analyze_content_difference(expected, actual):
 
         if not exp_match or not act_match:
             if normalize_text(exp) != normalize_text(act):
-                issues.append(
-                    f"Content mismatch: {exp} → {act}"
-                )
+                issues.append(f"Content mismatch: {exp} → {act}")
             continue
 
         exp_pct = exp_match.group("pct")
@@ -973,40 +1165,33 @@ def analyze_content_difference(expected, actual):
         exp_material = exp_match.group("material").strip()
         act_material = act_match.group("material").strip()
 
-        if exp_pct != act_pct and normalize_text(exp_material) != normalize_text(act_material):
-            issues.append(
-                f"Percentage and material mismatch: {exp} → {act}"
-            )
-            continue
-
         if exp_pct != act_pct:
             issues.append(
-                f"Percentage mismatch: {exp_pct}% → {act_pct}% ({exp_material})"
+                f"Percentage mismatch: Order Form {exp_pct}% → PDF {act_pct}% ({exp_material.upper()})"
             )
             continue
 
-        if normalize_text(exp_material) != normalize_text(act_material):
-            similarity = SequenceMatcher(
-                None,
-                normalize_text(exp_material),
-                normalize_text(act_material),
-                autojunk=False
-            ).ratio()
+        if normalize_text(exp_material) == normalize_text(act_material):
+            continue
 
-            # High similarity with same percentage = likely spelling/wording error.
-            if similarity >= 0.70:
-                issues.append(
-                    f"Spelling mistake: {exp_material.upper()} → {act_material.upper()}"
-                )
-            else:
-                issues.append(
-                    f"Material mismatch: {exp_material.upper()} → {act_material.upper()}"
-                )
+        similarity = SequenceMatcher(
+            None,
+            normalize_text(exp_material),
+            normalize_text(act_material),
+            autojunk=False
+        ).ratio()
 
-    if issues:
-        return "; ".join(issues)
+        if similarity >= 0.70:
+            issues.append(
+                f'Spelling mistake: Order Form "{exp_material.upper()}" → PDF "{act_material.upper()}"'
+            )
+        else:
+            issues.append(
+                f'Material mismatch: Order Form "{exp_material.upper()}" → PDF "{act_material.upper()}"'
+            )
 
-    return "Content differs."
+    return "; ".join(issues) if issues else "Content differs."
+
 
 def composition_matches(expected, actual):
     expected_values = normalize_composition(
@@ -1465,9 +1650,9 @@ def check_field(
                     return {
                         "status": "FAIL",
                         "pdf": text,
-                        "difference": analyze_content_difference(
-                            expected,
-                            text
+                        "difference": (
+                            f"Expected: {expected} | "
+                            f"Found: {' | '.join(actual_values)}"
                         ),
                         "match_type": "CONTENT_MISMATCH"
                     }
@@ -1773,7 +1958,33 @@ def check_field(
         }
 
     # -----------------------------------------------------
-    # GENERAL/BRAND/ATTRIBUTE/IDENTIFIER/BATCH/QUANTITY
+    # IDENTIFIER
+    # -----------------------------------------------------
+    if field_type == "IDENTIFIER":
+        identifier = find_identifier_match(expected, state)
+        if identifier:
+            consume_span(
+                state,
+                identifier["line"],
+                identifier["start"],
+                identifier["end"]
+            )
+            return {
+                "status": identifier["kind"],
+                "pdf": identifier["actual"],
+                "difference": identifier["difference"],
+                "match_type": identifier["match_type"]
+            }
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Expected identifier was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # GENERAL / BRAND / ATTRIBUTE / BATCH / QUANTITY
     # -----------------------------------------------------
     return _generic_exact_field(
         expected,
@@ -1791,16 +2002,22 @@ def _generic_exact_field(expected, field_name, state):
     )
 
     if exact:
-        consume_lines(state, exact)
+        lines, match_info = exact
+        consume_match(state, match_info)
+
+        if match_info.get("actual"):
+            pdf_value = match_info["actual"]
+        else:
+            pdf_value = join_lines(lines)
+
         return {
             "status": "PASS",
-            "pdf": join_lines(exact),
+            "pdf": pdf_value,
             "difference": "—",
-            "match_type": "EXACT"
+            "match_type": match_info.get("match_type", "EXACT")
         }
 
-    # IMPORTANT: for unknown fields we do not manufacture a FAIL. This avoids
-    # the historical problem where unrelated PDF text was interpreted as a mismatch.
+    # IMPORTANT: unknown/general fields do not generate invented FAILs.
     return {
         "status": "NOT FOUND",
         "pdf": "Not found",
@@ -2188,20 +2405,6 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
                 cell.fill = PatternFill("solid", fgColor=GREY)
                 cell.font = Font(color=WHITE, bold=True)
 
-    # ---------------------------------------------------------
-    # SAFE NATIVE AUTOFILTER (NO EXCEL TABLE XML)
-    #
-    # We deliberately do not create an openpyxl Table here. Some Excel
-    # clients can attempt to repair table/AutoFilter XML generated by
-    # programmatic workbooks. A normal worksheet AutoFilter gives us the
-    # same filter behavior without creating /xl/tables/table*.xml.
-    # ---------------------------------------------------------
-    if comparison.max_row >= 2 and comparison.max_column >= 1:
-        comparison.auto_filter.ref = (
-            f"A1:{get_column_letter(comparison.max_column)}"
-            f"{comparison.max_row}"
-        )
-
     # Widths
     width_map = {
         "FIELD NO": 12,
@@ -2224,6 +2427,7 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         comparison.row_dimensions[row_idx].height = 55
 
     comparison.freeze_panes = "A2"
+    comparison.auto_filter.ref = comparison.dimensions
 
     thin = Side(style="thin", color=LIGHT_BORDER)
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
