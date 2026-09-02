@@ -476,6 +476,20 @@ def _usable_text(text):
     return len(alnum) >= 6
 
 
+def _text_quality_score(text):
+    """Score extracted artwork text so OCR can be preferred over weak PDF text layers."""
+    text = str(text or "")
+    if not text.strip():
+        return 0
+
+    alnum = len(re.findall(r"[A-Za-z0-9]", text))
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    useful_lines = sum(1 for line in lines if len(re.sub(r"[^A-Za-z0-9%#]", "", line)) >= 2)
+    numeric_runs = len(re.findall(r"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])", text))
+
+    return alnum + useful_lines * 8 + numeric_runs * 3
+
+
 def _ocr_image(image):
     try:
         import pytesseract
@@ -484,16 +498,25 @@ def _ocr_image(image):
             "OCR support is not installed. Add pytesseract to requirements.txt."
         ) from exc
 
-    try:
-        return pytesseract.image_to_string(
-            image,
-            lang="eng+fra+spa"
-        )
-    except Exception as exc:
+    # Prefer English first. Many Streamlit/Tesseract deployments do not carry
+    # the optional French/Spanish traineddata files, and forcing missing
+    # language packs can break OCR completely.
+    errors = []
+    for lang in ("eng", "eng+fra+spa"):
+        try:
+            text = pytesseract.image_to_string(image, lang=lang)
+            if _usable_text(text):
+                return text
+        except Exception as exc:
+            errors.append(f"{lang}: {exc}")
+
+    if errors:
         raise RuntimeError(
-            "OCR could not run. Make sure Tesseract OCR and its language data "
-            "are installed in the Streamlit environment."
-        ) from exc
+            "OCR could not run. Tesseract may be missing or language data may "
+            "not be installed. Details: " + " | ".join(errors)
+        )
+
+    return ""
 
 
 def _render_pdf_page(page):
@@ -515,6 +538,7 @@ def get_output_page_count(file):
         document = fitz.open(stream=data, filetype="pdf")
         count = len(document)
         document.close()
+        file.seek(0)
         return count
 
     if name.endswith((".jpg", ".jpeg", ".png")):
@@ -524,46 +548,81 @@ def get_output_page_count(file):
 
 
 def extract_output_pages(file):
+    """
+    Extract artwork page text.
+
+    For PDF artwork, OCR is attempted for every page. This is intentional:
+    a PDF can look non-editable in a viewer while still containing a weak or
+    stale text layer. The OCR result is therefore preferred when it is usable;
+    the embedded PDF text remains a fallback.
+    """
     name = str(getattr(file, "name", "")).casefold()
 
     if name.endswith(".pdf"):
         file.seek(0)
         data = file.read()
+        if not data:
+            raise ValueError("The Output Artwork PDF is empty.")
+
         document = fitz.open(stream=data, filetype="pdf")
         pages = []
 
-        for page_number, page in enumerate(document, start=1):
-            direct_text = page.get_text("text") or ""
+        try:
+            for page_number, page in enumerate(document, start=1):
+                direct_text = page.get_text("text") or ""
+                ocr_text = ""
+                ocr_error = None
 
-            if _usable_text(direct_text):
-                text = direct_text
-                source_type = "pdf_text"
-            else:
-                text = _ocr_image(_render_pdf_page(page))
-                source_type = "ocr"
+                try:
+                    ocr_text = _ocr_image(_render_pdf_page(page)) or ""
+                except Exception as exc:
+                    ocr_error = exc
 
-            pages.append({
-                "page": page_number,
-                "text": text,
-                "source_type": source_type
-            })
+                # Prefer OCR for non-editable/scanned artwork. When OCR is not
+                # available, use a usable embedded text layer rather than failing.
+                if _usable_text(ocr_text):
+                    text = ocr_text
+                    source_type = "ocr"
+                elif _usable_text(direct_text):
+                    text = direct_text
+                    source_type = "pdf_text"
+                else:
+                    detail = str(ocr_error) if ocr_error else "no usable text"
+                    raise RuntimeError(
+                        f"Page {page_number}: no readable artwork text was found. {detail}"
+                    )
 
-        document.close()
+                pages.append({
+                    "page": page_number,
+                    "text": str(text),
+                    "source_type": source_type,
+                    "direct_text": str(direct_text or ""),
+                    "ocr_text": str(ocr_text or "")
+                })
+        finally:
+            document.close()
+
+        file.seek(0)
         return pages
 
     if name.endswith((".jpg", ".jpeg", ".png")):
         file.seek(0)
         image = Image.open(file).convert("RGB")
+        text = _ocr_image(image)
+        if not _usable_text(text):
+            raise RuntimeError("No readable artwork text was detected in the image.")
+        file.seek(0)
         return [{
             "page": 1,
-            "text": _ocr_image(image),
-            "source_type": "ocr"
+            "text": str(text),
+            "source_type": "ocr",
+            "direct_text": "",
+            "ocr_text": str(text)
         }]
 
     raise ValueError(
         "Unsupported output format. Please upload PDF, JPG, JPEG, or PNG."
     )
-
 
 def clean_pdf_line(line):
     if not line:
@@ -614,10 +673,31 @@ def build_page_lines(page_text, product_type):
 
 
 def build_page_state(page, product_type):
+    if not isinstance(page, dict):
+        raise TypeError(
+            f"Output page data is malformed. Expected a page dictionary, got {type(page).__name__}."
+        )
+
     lines = build_page_lines(
         page.get("text", ""),
         product_type
     )
+
+    # Defensive validation: every line must be a dictionary with the fields
+    # consumed by the matching engine. This prevents the vague
+    # "list indices must be integers or slices, not str" failure.
+    invalid_lines = [
+        index for index, line in enumerate(lines)
+        if not isinstance(line, dict)
+        or "line_id" not in line
+        or "text" not in line
+        or "norm" not in line
+    ]
+    if invalid_lines:
+        raise TypeError(
+            f"Output page {page.get('page', '?')} contains malformed OCR/text lines: {invalid_lines[:5]}"
+        )
+
     return {
         "page": page.get("page"),
         "source_type": page.get("source_type", "pdf_text"),
@@ -658,21 +738,27 @@ def consume_lines(state, lines):
 
 
 def consume_match(state, match_info):
-    if not match_info:
+    """Safely consume either a multi-line match or one matched span."""
+    if not isinstance(match_info, dict):
         return
 
-    if match_info.get("lines"):
-        consume_lines(state, match_info["lines"])
-        return
+    matched_lines = match_info.get("lines")
+    if matched_lines:
+        if isinstance(matched_lines, dict):
+            matched_lines = [matched_lines]
+        valid_lines = [
+            line for line in matched_lines
+            if isinstance(line, dict) and "line_id" in line
+        ]
+        if valid_lines:
+            consume_lines(state, valid_lines)
+            return
 
     line = match_info.get("line")
-    if line is not None and match_info.get("start") is not None and match_info.get("end") is not None:
-        consume_span(
-            state,
-            line,
-            match_info["start"],
-            match_info["end"]
-        )
+    start = match_info.get("start")
+    end = match_info.get("end")
+    if isinstance(line, dict) and start is not None and end is not None:
+        consume_span(state, line, int(start), int(end))
 
 
 def join_lines(lines):
@@ -837,7 +923,44 @@ def find_identifier_match(expected, state):
                 "match_type": "IDENTIFIER_BASE_PLUS_SUFFIX"
             }
 
-    # Third: reverse condition — PDF has only a shorter base and Order Form
+    # Third: when both sides are extended identifiers that share a meaningful
+    # code prefix but differ, report a genuine FAIL. Example:
+    # Order Form USX690 vs PDF USX609.
+    for line in state["lines"]:
+        if not line_is_available(line, state):
+            continue
+
+        actual_norm = line["norm"]
+        for match in token_pattern.finditer(actual_norm):
+            token = match.group(0)
+            if token.casefold() == expected_norm.casefold():
+                continue
+            common = 0
+            for left, right in zip(expected_norm.casefold(), token.casefold()):
+                if left != right:
+                    break
+                common += 1
+            if common < 3:
+                continue
+            if len(token) < 2:
+                continue
+            if _span_overlaps(match.start(), match.end(), _used_spans(state, line["line_id"])):
+                continue
+
+            return {
+                "kind": "FAIL",
+                "line": line,
+                "start": match.start(),
+                "end": match.end(),
+                "actual": token,
+                "difference": (
+                    f"Identifier mismatch: Order Form has '{expected}', "
+                    f"but PDF has '{token}'."
+                ),
+                "match_type": "IDENTIFIER_PREFIX_MISMATCH"
+            }
+
+    # Fourth: reverse condition — PDF has only a shorter base and Order Form
     # expects the longer identifier. This must NOT pass.
     for line in state["lines"]:
         if not line_is_available(line, state):
@@ -1862,12 +1985,14 @@ def check_field(
             max_window=1
         )
         if exact:
-            consume_lines(state, exact)
+            lines, match_info = exact
+            consume_match(state, match_info)
+            pdf_value = match_info.get("actual") or join_lines(lines)
             return {
                 "status": "PASS",
-                "pdf": join_lines(exact),
+                "pdf": pdf_value,
                 "difference": "—",
-                "match_type": "EXACT"
+                "match_type": match_info.get("match_type", "EXACT")
             }
 
         return {
@@ -2770,9 +2895,14 @@ def main():
                     )
 
             except Exception as error:
+                import traceback
                 st.error(
-                    f"Unable to process the Output Artwork: {error}"
+                    f"Unable to process the Output Artwork: {type(error).__name__}: {error}"
                 )
+                # Keep the exact failing line visible during debugging. This
+                # can be removed later once the deployment is stable.
+                with st.expander("Technical error details", expanded=False):
+                    st.code(traceback.format_exc())
 
     # =========================================================
     # SAVED REPORT
