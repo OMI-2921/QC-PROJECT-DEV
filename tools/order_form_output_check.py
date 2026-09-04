@@ -3082,7 +3082,8 @@ def build_report(
     df,
     pdf_pages,
     selected_fields,
-    product_type
+    product_type,
+    page_row_mapping=None
 ):
     """
     Full validation report.
@@ -3104,7 +3105,17 @@ def build_report(
 
     for page_index, page in enumerate(pdf_pages):
 
-        excel_index = page_index
+        # Preserve the original PDF page number when only specific pages
+        # were selected. Page 5 must still map to Data Row 5.
+        try:
+            original_page_index = int(page.get("page", page_index + 1)) - 1
+        except Exception:
+            original_page_index = page_index
+
+        if page_row_mapping is not None:
+            excel_index = page_row_mapping.get(original_page_index)
+        else:
+            excel_index = original_page_index
 
         if excel_index >= len(df):
             for field in selected_fields:
@@ -3180,7 +3191,8 @@ def build_report(
 def auto_detect_fields(
     df,
     output_pages,
-    product_type
+    product_type,
+    page_row_mapping=None
 ):
     """
     Auto Detect is now a REPORT-DRIVEN operation.
@@ -3209,7 +3221,8 @@ def auto_detect_fields(
         df,
         output_pages,
         order_fields_for_matching(candidates),
-        product_type
+        product_type,
+        page_row_mapping=page_row_mapping
     )
 
     if probe.empty:
@@ -3582,6 +3595,165 @@ def main():
             return
 
     # =========================================================
+    # OUTPUT PAGE SELECTION + PAGE → ORDER FORM ROW MAPPING
+    # =========================================================
+    output_page_count = 0
+    mapping_complete = True
+    page_row_mapping = {}
+    selected_page_numbers = []
+    selected_page_indices = []
+
+    if excel_file and output_file:
+        try:
+            output_page_count = get_output_page_count(output_file)
+        except Exception as error:
+            st.warning(f"Unable to determine output page count: {error}")
+
+        if output_page_count > 1:
+            st.markdown(
+                '<div class="section-title">📄 Artwork Page Selection</div>',
+                unsafe_allow_html=True
+            )
+            st.caption(
+                "Choose all artwork pages or select specific page number(s). "
+                "Specific page selection is useful when checking one page from a large multi-page PDF."
+            )
+
+            page_mode = st.radio(
+                "Artwork Pages to Compare",
+                options=["All Pages", "Specific Page(s)"],
+                horizontal=True,
+                key=f"of_page_mode_{st.session_state['of_reset_id']}"
+            )
+
+            if page_mode == "Specific Page(s)":
+                page_options = list(range(1, output_page_count + 1))
+                previous_pages = st.session_state.get("of_selected_page_numbers", [])
+                if not previous_pages:
+                    previous_pages = [1]
+                selected_page_numbers = st.multiselect(
+                    "Select Artwork Page Number(s)",
+                    options=page_options,
+                    default=[p for p in previous_pages if p in page_options],
+                    placeholder="Select page number(s)...",
+                    key=f"of_selected_pages_{st.session_state['of_reset_id']}"
+                )
+                st.session_state["of_selected_page_numbers"] = selected_page_numbers
+            else:
+                selected_page_numbers = list(range(1, output_page_count + 1))
+                st.session_state["of_selected_page_numbers"] = selected_page_numbers
+        elif output_page_count == 1:
+            selected_page_numbers = [1]
+            st.session_state["of_selected_page_numbers"] = [1]
+
+        selected_page_indices = [p - 1 for p in selected_page_numbers]
+
+        # Mapping rules:
+        # 1 data row  -> every selected page uses Data Row 1 / Excel Row 2.
+        # Multiple rows -> Page N automatically maps to Data Row N whenever
+        # that row exists. Only pages beyond the available rows need manual
+        # row selection.
+        if selected_page_indices:
+            if len(df) == 1:
+                for page_index in selected_page_indices:
+                    page_row_mapping[page_index] = 0
+            else:
+                unmatched_pages = []
+                for page_index in selected_page_indices:
+                    if page_index < len(df):
+                        page_row_mapping[page_index] = page_index
+                    else:
+                        unmatched_pages.append(page_index)
+
+                if unmatched_pages:
+                    st.markdown(
+                        '<div class="section-title">🔗 Additional Page → Order Form Row Mapping</div>',
+                        unsafe_allow_html=True
+                    )
+                    st.caption(
+                        "These selected artwork pages do not have an automatic matching Order Form row. "
+                        "Choose the correct data row below."
+                    )
+
+                    row_choices = []
+                    for data_index in range(len(df)):
+                        row = df.iloc[data_index]
+                        preview_parts = []
+                        preferred = []
+                        for col in df.columns:
+                            compact = normalize_text(col).replace(" ", "").replace("_", "").replace("-", "")
+                            if any(token in compact for token in (
+                                "itemcode", "itemnumber", "stylecode", "cdstyle",
+                                "size", "color", "colour", "gender", "productgender",
+                                "cdimport", "rn"
+                            )):
+                                preferred.append(col)
+                        ordered_cols = preferred + [col for col in df.columns if col not in preferred]
+                        seen_preview = set()
+                        for col in ordered_cols:
+                            value = row[col]
+                            if is_blank_value(value):
+                                continue
+                            value_text = str(value).strip()
+                            if not value_text:
+                                continue
+                            compact_col = normalize_text(col).replace(" ", "")
+                            if compact_col in seen_preview:
+                                continue
+                            seen_preview.add(compact_col)
+                            preview_parts.append(f"{col}: {value_text}")
+                            if len(preview_parts) >= 3:
+                                break
+                        preview = " | ".join(preview_parts)
+                        label = f"Data Row {data_index + 1} (Excel Row {data_index + 2})"
+                        if preview:
+                            label += f" — {preview}"
+                        row_choices.append((data_index, label))
+
+                    option_labels = ["— SELECT ORDER FORM ROW —"] + [label for _idx, label in row_choices]
+                    label_to_index = {label: idx for idx, label in row_choices}
+
+                    for page_index in unmatched_pages:
+                        existing = st.session_state["of_page_row_mapping"].get(page_index)
+                        default_pos = 0
+                        if existing is not None:
+                            for pos, (data_index, _label) in enumerate(row_choices, start=1):
+                                if data_index == existing:
+                                    default_pos = pos
+                                    break
+                        selected_label = st.selectbox(
+                            f"Artwork Page {page_index + 1}",
+                            options=option_labels,
+                            index=default_pos,
+                            key=f"of_page_row_select_{st.session_state['of_reset_id']}_{page_index}",
+                            help="Data Row 1 corresponds to Excel Row 2; Data Row 2 corresponds to Excel Row 3; and so on."
+                        )
+                        if selected_label == "— SELECT ORDER FORM ROW —":
+                            mapping_complete = False
+                        else:
+                            page_row_mapping[page_index] = label_to_index[selected_label]
+
+            st.session_state["of_page_row_mapping"] = page_row_mapping
+
+            if len(df) == 1 and selected_page_numbers:
+                st.success(
+                    "✅ Single-data-row Order Form detected. Every selected artwork page will be compared against Data Row 1 (Excel Row 2)."
+                )
+            elif mapping_complete and selected_page_numbers:
+                mapping_preview = [
+                    f"Page {page_index + 1} → Data Row {page_row_mapping[page_index] + 1} (Excel Row {page_row_mapping[page_index] + 2})"
+                    for page_index in selected_page_indices
+                    if page_index in page_row_mapping
+                ]
+                st.success("✅ Page-to-row mapping ready. " + " • ".join(mapping_preview))
+            elif selected_page_numbers:
+                st.warning("Please complete the row selection for every artwork page shown above.")
+        else:
+            mapping_complete = False
+            if output_page_count > 1:
+                st.info("Select at least one artwork page to compare.")
+
+    # =========================================================
     # COMPARISON METHOD
     # =========================================================
     comparison_method = None
@@ -3620,16 +3792,23 @@ def main():
                 str(getattr(output_file, "name", "")),
                 int(getattr(output_file, "size", 0)),
                 product_type,
+                tuple(selected_page_numbers),
+                tuple(sorted(page_row_mapping.items())),
             )
 
             if st.session_state.get("of_auto_detect_key") != auto_key:
                 try:
                     with st.spinner("Auto Detect is reading the artwork with OCR..."):
-                        auto_pages = extract_output_pages(output_file)
+                        auto_all_pages = extract_output_pages(output_file)
+                        auto_pages = [
+                            page for page in auto_all_pages
+                            if int(page.get("page", 0)) in set(selected_page_numbers)
+                        ]
                         detected_fields = auto_detect_fields(
                             df,
                             auto_pages,
-                            product_type
+                            product_type,
+                            page_row_mapping=page_row_mapping
                         )
                     st.session_state["of_auto_detected_fields"] = detected_fields
                     st.session_state["of_auto_output_pages"] = auto_pages
@@ -3658,6 +3837,7 @@ def main():
                 "Review detected fields",
                 options=available_fields,
                 default=default_auto,
+                placeholder="Type to search fields...",
                 label_visibility="collapsed",
                 key=f"auto_selected_fields_{st.session_state['of_reset_id']}"
             )
@@ -3673,40 +3853,23 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Only populated Order Form fields are shown. Search by Excel column name or field terminology."
+                "Only populated Order Form fields are shown. Open the dropdown and type to search by Excel column name or field terminology."
             )
 
-            search_text = st.text_input(
-                "Search Fields",
-                placeholder="Type field name or alias...",
-                key=f"field_search_{st.session_state['of_reset_id']}"
-            )
-
-            if search_text.strip():
-                needle = normalize_text(search_text)
-                filtered_fields = [
-                    field for field in available_fields
-                    if needle in normalize_text(field)
-                    or any(token in normalize_text(field) for token in needle.split())
-                ]
-            else:
-                filtered_fields = available_fields
-
+            # Streamlit's multiselect has built-in live search.
+            # The user can click the dropdown and start typing immediately;
+            # matching fields are filtered as the text is entered, without
+            # requiring a separate search box or pressing Enter.
             previous = st.session_state.get(
                 f"selected_fields_{st.session_state['of_reset_id']}", []
             )
             previous = [field for field in previous if field in available_fields]
-            # Keep previously selected fields available while the user searches,
-            # so a search never silently unselects an existing choice.
-            display_options = list(filtered_fields)
-            for field in previous:
-                if field not in display_options:
-                    display_options.append(field)
 
             selected_fields = st.multiselect(
                 "Select the fields from your Order Form",
-                options=display_options,
+                options=available_fields,
                 default=previous,
+                placeholder="Type to search fields...",
                 label_visibility="collapsed",
                 key=f"selected_fields_{st.session_state['of_reset_id']}"
             )
@@ -3765,10 +3928,11 @@ def main():
             st.metric("Output Type", extension)
 
         if output_page_count and len(df) != output_page_count:
-            st.warning(
-                "⚠️ Excel row count and output page count do not have the same "
-                "count. The existing mapping will still use Output Page 1 → "
-                "Excel Row 2, Output Page 2 → Excel Row 3, and so on."
+            st.info(
+                f"ℹ️ The Order Form contains {len(df)} data row(s) while the "
+                f"artwork contains {output_page_count} page(s). This is allowed. "
+                "The current comparison maps Output Page 1 → Excel Row 2, "
+                "Output Page 2 → Excel Row 3, and so on."
             )
         elif output_page_count:
             st.success("✅ Excel rows and output pages match.")
@@ -3787,6 +3951,8 @@ def main():
                 or bool(selected_fields)
             )
             and product_type != "----- SELECT -----"
+            and bool(selected_page_numbers)
+            and mapping_complete
         )
 
         if st.button(
@@ -3806,7 +3972,11 @@ def main():
                     ):
                         output_pages = st.session_state["of_auto_output_pages"]
                     else:
-                        output_pages = extract_output_pages(output_file)
+                        all_output_pages = extract_output_pages(output_file)
+                    output_pages = [
+                        page for page in all_output_pages
+                        if int(page.get("page", 0)) in set(selected_page_numbers)
+                    ]
 
                     if not output_pages:
                         raise ValueError(
@@ -3822,12 +3992,15 @@ def main():
                         df,
                         output_pages,
                         selected_fields,
-                        product_type
+                        product_type,
+                        page_row_mapping=page_row_mapping
                     )
                     st.session_state["of_report_selected_fields"] = selected_fields
                     st.session_state["of_report_product_type"] = product_type
                     st.session_state["of_report_comparison_method"] = comparison_method
                     st.session_state["of_visual_pages"] = output_pages
+                    st.session_state["of_report_page_row_mapping"] = dict(page_row_mapping)
+                    st.session_state["of_report_selected_pages"] = list(selected_page_numbers)
 
             except Exception as error:
                 import traceback
@@ -3869,6 +4042,10 @@ def main():
             f"Comparison method: {report_method} • "
             f"Product type: {report_product_type}"
         )
+
+        report_selected_pages = st.session_state.get("of_report_selected_pages", [])
+        if report_selected_pages:
+            st.caption("Artwork pages compared: " + ", ".join(str(p) for p in report_selected_pages))
 
         if report_method == "Auto Detect" and report_fields:
             st.caption(
