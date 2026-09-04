@@ -1,8 +1,4 @@
 import streamlit as st
-
-# Build marker used in Auto Detect cache keys so code updates cannot reuse
-# stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-04-AUTODETECT-ROWMAP-FIX-03"
 import pandas as pd
 import fitz
 import re
@@ -10,7 +6,7 @@ import unicodedata
 import io
 from io import BytesIO
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
@@ -426,8 +422,6 @@ def get_field_type(field_name):
         or "fabric" in compact
         or "content" in compact
         or "composition" in compact
-        or "compodsc" in compact
-        or "lhcompodsc" in compact
         or "fabrication" in compact
         or "material" in compact
     ):
@@ -500,17 +494,12 @@ def _text_quality_score(text):
 
 def _ocr_image_with_data(image):
     """
-    Multi-pass OCR for small artwork text.
+    Fast multi-pass OCR for small artwork text.
 
-    Returns:
-        primary_text, primary_word_boxes, language, supplemental_text
-
-    primary_text is reconstructed from the strongest OCR pass using physical
-    word coordinates so the visual reading order is preserved. supplemental_text
-    contains additional unique lines from weaker passes and is used only as
-    secondary evidence for Auto Detect.
+    PSM 11 is the primary pass for separated artwork text and PSM 6 is kept as
+    a compact-layout fallback. Text from both passes is merged, while the
+    strongest pass supplies the word boxes used for visual highlighting.
     """
-
     try:
         import pytesseract
         from pytesseract import Output
@@ -542,7 +531,7 @@ def _ocr_image_with_data(image):
             gray = gray.filter(ImageFilter.SHARPEN)
         variants.append(("gray", gray))
 
-    # Keep the OCR workload controlled: 3 primary passes.
+    # Keep the OCR workload controlled: 4 primary passes max.
     requested_passes = [
         ("color", 11, "eng"),
         ("gray", 11, "eng"),
@@ -608,22 +597,7 @@ def _ocr_image_with_data(image):
                 continue
 
             avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
-
-            # Prefer a clean reading order over a noisy OCR pass that happens
-            # to contain more total characters. Artwork often contains logos,
-            # barcode fragments and isolated symbols that inflate raw length.
-            non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
-            junk_lines = sum(
-                1
-                for line in non_empty_lines
-                if len(re.sub(r"[^A-Za-z0-9%#]", "", line)) <= 1
-            )
-            quality = (
-                _text_quality_score(text)
-                + (avg_conf * 0.20)
-                - (junk_lines * 18)
-            )
-
+            quality = _text_quality_score(text) + (avg_conf * 0.20)
             results.append({
                 "text": text,
                 "words": words,
@@ -639,106 +613,27 @@ def _ocr_image_with_data(image):
                 "OCR could not run. Tesseract may be missing. Details: "
                 + " | ".join(errors[:4])
             )
-        return "", [], "", ""
+        return "", [], ""
 
     best = max(results, key=lambda item: item["quality"])
 
-    # Rebuild the strongest OCR pass from physical coordinates. Tesseract's
-    # block/line numbering can occasionally reverse adjacent words on artwork;
-    # geometry is a safer source of visual reading order.
-    ordered_words = [
-        word for word in best["words"]
-        if str(word.get("text", "")).strip()
-    ]
-
-    primary_lines = []
-    if ordered_words:
-        heights = [max(1, int(word.get("height", 1))) for word in ordered_words]
-        median_height = float(sorted(heights)[len(heights) // 2]) if heights else 20.0
-        line_tolerance = max(10.0, median_height * 0.65)
-
-        line_groups = []
-        for word in sorted(
-            ordered_words,
-            key=lambda item: (
-                float(item.get("top", 0)) + float(item.get("height", 0)) / 2.0,
-                float(item.get("left", 0)),
-            )
-        ):
-            center_y = (
-                float(word.get("top", 0))
-                + float(word.get("height", 0)) / 2.0
-            )
-
-            best_group = None
-            best_distance = None
-            for group in line_groups:
-                distance = abs(center_y - group["center_y"])
-                if distance <= line_tolerance and (
-                    best_distance is None or distance < best_distance
-                ):
-                    best_group = group
-                    best_distance = distance
-
-            if best_group is None:
-                line_groups.append({
-                    "center_y": center_y,
-                    "words": [word],
-                })
-            else:
-                best_group["words"].append(word)
-                best_group["center_y"] = sum(
-                    float(w.get("top", 0)) + float(w.get("height", 0)) / 2.0
-                    for w in best_group["words"]
-                ) / len(best_group["words"])
-
-        line_groups.sort(key=lambda group: group["center_y"])
-
-        for group in line_groups:
-            group["words"].sort(key=lambda item: float(item.get("left", 0)))
-            line = " ".join(
-                str(word.get("text", "")).strip()
-                for word in group["words"]
-                if str(word.get("text", "")).strip()
-            )
-            line = re.sub(r"\s+", " ", line).strip()
-            if line:
-                primary_lines.append(line)
-
-    if not primary_lines:
-        primary_lines = [
-            re.sub(r"\s+", " ", line).strip()
-            for line in best["text"].splitlines()
-            if line.strip()
-        ]
-
-    seen = {normalize_text(line) for line in primary_lines if normalize_text(line)}
-
-    # We do not append weaker OCR lines to the primary comparison text because
-    # that can introduce incorrect duplicate/alternate readings. Instead,
-    # return them separately for Auto Detect's secondary evidence.
-    supplemental_lines = []
+    merged_lines = []
+    seen = set()
     for result in sorted(results, key=lambda item: item["quality"], reverse=True):
-        if result is best:
-            continue
         for line in result["text"].splitlines():
             clean = re.sub(r"\s+", " ", line).strip()
+            if not clean:
+                continue
             key = normalize_text(clean)
-            if key and key not in seen and key not in {
-                normalize_text(existing) for existing in supplemental_lines
-            }:
-                supplemental_lines.append(clean)
+            if key and key not in seen:
+                seen.add(key)
+                merged_lines.append(clean)
 
-    return (
-        "\n".join(primary_lines),
-        best["words"],
-        best["lang"],
-        "\n".join(supplemental_lines),
-    )
+    return "\n".join(merged_lines), best["words"], best["lang"]
 
 
 def _ocr_image(image):
-    text, _words, _lang, _supplemental = _ocr_image_with_data(image)
+    text, _words, _lang = _ocr_image_with_data(image)
     return text
 
 
@@ -804,12 +699,7 @@ def extract_output_pages(file):
                 ocr_lang = ""
 
                 try:
-                    (
-                        ocr_text,
-                        ocr_words,
-                        ocr_lang,
-                        ocr_alt_text,
-                    ) = _ocr_image_with_data(image)
+                    ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
                 except Exception as exc:
                     ocr_error = exc
 
@@ -831,7 +721,6 @@ def extract_output_pages(file):
                     "source_type": source_type,
                     "direct_text": str(direct_text or ""),
                     "ocr_text": str(ocr_text or ""),
-                    "ocr_alt_text": str(ocr_alt_text or ""),
                     "ocr_words": ocr_words,
                     "ocr_lang": ocr_lang,
                     "image_bytes": _image_to_png_bytes(image),
@@ -847,12 +736,7 @@ def extract_output_pages(file):
     if name.endswith((".jpg", ".jpeg", ".png")):
         file.seek(0)
         image = Image.open(file).convert("RGB")
-        (
-            ocr_text,
-            ocr_words,
-            ocr_lang,
-            ocr_alt_text,
-        ) = _ocr_image_with_data(image)
+        ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
         if not _usable_text(ocr_text):
             raise RuntimeError("No readable artwork text was detected in the image.")
         file.seek(0)
@@ -862,7 +746,6 @@ def extract_output_pages(file):
             "source_type": "ocr",
             "direct_text": "",
             "ocr_text": str(ocr_text),
-            "ocr_alt_text": str(ocr_alt_text),
             "ocr_words": ocr_words,
             "ocr_lang": ocr_lang,
             "image_bytes": _image_to_png_bytes(image),
@@ -879,6 +762,35 @@ def extract_output_pages(file):
 # VISUAL ARTWORK HIGHLIGHTING
 # =========================================================
 
+# =========================================================
+# VISUAL ARTWORK HIGHLIGHTING
+# =========================================================
+
+# The same palette is used in BOTH the artwork annotation and the report
+# swatch column.  Colors are intentionally visually distinct so a reviewer can
+# follow one field from the table directly to the artwork.
+FIELD_VISUAL_COLORS = [
+    "#2563EB",  # blue
+    "#16A34A",  # green
+    "#DC2626",  # red
+    "#9333EA",  # purple
+    "#EA580C",  # orange
+    "#0891B2",  # cyan
+    "#CA8A04",  # gold
+    "#DB2777",  # pink
+    "#4F46E5",  # indigo
+    "#0F766E",  # teal
+    "#65A30D",  # lime
+    "#C026D3",  # fuchsia
+    "#7C3AED",  # violet
+    "#0284C7",  # sky
+    "#B45309",  # amber-dark
+    "#BE123C",  # rose
+    "#15803D",  # dark green
+    "#4338CA",  # dark indigo
+]
+
+
 def _visual_norm(text):
     if text is None:
         return ""
@@ -888,101 +800,332 @@ def _visual_norm(text):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _word_text_norm(text):
-    value = _visual_norm(text)
-    return value.replace(" ", "")
+def _visual_compact(text):
+    return re.sub(r"[^a-z0-9]", "", _visual_norm(text))
+
+
+def _hex_to_rgb(hex_color):
+    value = str(hex_color).lstrip("#")
+    if len(value) != 6:
+        return (37, 99, 235)
+    try:
+        return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+    except Exception:
+        return (37, 99, 235)
+
+
+def _field_color_map(fields):
+    """Assign stable colors in the selected/report field order."""
+    color_map = {}
+    for index, field in enumerate(fields or []):
+        field = str(field)
+        if field not in color_map:
+            color_map[field] = FIELD_VISUAL_COLORS[
+                index % len(FIELD_VISUAL_COLORS)
+            ]
+    return color_map
+
+
+def _report_with_visual_column(report):
+    """Return a display-only copy of the report with a visual swatch column."""
+    if report is None:
+        return report
+
+    display = report.copy()
+    if "VISUAL" in display.columns:
+        display = display.drop(columns=["VISUAL"])
+
+    insert_at = (
+        list(display.columns).index("FIELD") + 1
+        if "FIELD" in display.columns
+        else len(display.columns)
+    )
+    display.insert(insert_at, "VISUAL", "■")
+    return display
 
 
 def _find_word_boxes_for_target(page, target):
-    """Find OCR word rectangles corresponding to a report's PDF OUTPUT value."""
+    """
+    Find the most defensible OCR rectangles for one displayed PDF value.
+
+    Visual matching is deliberately stricter than the comparison engine:
+    1. exact token/line match;
+    2. exact compact match (handles OCR spacing/hyphenation);
+    3. fuzzy multi-word fallback only for sufficiently long/lettered values.
+
+    We do NOT use a broad substring rule for short values. That was a major
+    source of incorrect visual boxes in earlier builds.
+    """
     target_norm = _visual_norm(target)
-    if not target_norm or target_norm in {"not found", "—", "-"}:
+    compact_target = _visual_compact(target)
+    if not compact_target or compact_target in {"notfound", "no"}:
         return []
 
-    words = [w for w in page.get("ocr_words", []) if str(w.get("text", "")).strip()]
+    words = [
+        word for word in page.get("ocr_words", [])
+        if str(word.get("text", "")).strip()
+    ]
     if not words:
         return []
 
-    # Group OCR words by OCR line, preserving page order.
     grouped = {}
     for word in words:
         key = (
-            word.get("block_num", 0),
-            word.get("par_num", 0),
-            word.get("line_num", 0),
+            int(word.get("block_num", 0) or 0),
+            int(word.get("par_num", 0) or 0),
+            int(word.get("line_num", 0) or 0),
         )
         grouped.setdefault(key, []).append(word)
 
-    target_tokens = target_norm.split()
-    matches = []
+    exact_matches = []
+    from rapidfuzz import fuzz
 
     for line_words in grouped.values():
-        line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
-        normalized_words = [_visual_norm(item["text"]) for item in line_words]
+        line_words.sort(
+            key=lambda item: (
+                float(item.get("left", 0) or 0),
+                float(item.get("top", 0) or 0),
+            )
+        )
 
-        # Exact contiguous token-window search.
+        normalized_words = [
+            _visual_norm(word.get("text", ""))
+            for word in line_words
+        ]
+        compact_words = [
+            _visual_compact(word.get("text", ""))
+            for word in line_words
+        ]
+
+        # Exact contiguous word-window matching.
         for start in range(len(line_words)):
             joined = ""
-            for end in range(start, len(line_words)):
+            compact_joined = ""
+            for end in range(start, min(len(line_words), start + 12)):
                 token = normalized_words[end]
-                if not token:
+                compact_token = compact_words[end]
+                if not token or not compact_token:
                     continue
+
                 joined = (joined + " " + token).strip()
-                if joined == target_norm or joined.replace(" ", "") == target_norm.replace(" ", ""):
-                    matches.append(line_words[start:end + 1])
-                    break
-                if len(joined.replace(" ", "")) > len(target_norm.replace(" ", "")) + 4:
+                compact_joined += compact_token
+
+                if joined == target_norm or compact_joined == compact_target:
+                    exact_matches.append(line_words[start:end + 1])
                     break
 
-        # Single-token fallback.
-        compact_target = target_norm.replace(" ", "")
+                if len(compact_joined) > len(compact_target) + 12:
+                    break
+
+        # Exact single-token compact match. This handles values such as
+        # USX609 and blue/chine-like OCR tokenization.
+        for word, compact_word in zip(line_words, compact_words):
+            if compact_word == compact_target:
+                exact_matches.append([word])
+
+        # A single OCR word may contain multiple printable values, for example
+        # "44-12".  When the expected field is only "44" or only "12", match
+        # the exact sub-token and return a proportionally sliced rectangle.
+        # This keeps two different fields visually separate instead of painting
+        # the complete "44-12" word twice.
         for word in line_words:
-            compact_word = _word_text_norm(word["text"])
-            if compact_word == compact_target or compact_target in compact_word:
-                matches.append([word])
+            raw_word = str(word.get("text", "") or "")
+            parts = list(re.finditer(r"[A-Za-z0-9]+", raw_word))
+            if len(parts) < 2:
+                continue
+            raw_left = int(word.get("left", 0) or 0)
+            raw_top = int(word.get("top", 0) or 0)
+            raw_width = int(word.get("width", 0) or 0)
+            raw_height = int(word.get("height", 0) or 0)
+            for part_match in parts:
+                part = _visual_compact(part_match.group(0))
+                if part != compact_target:
+                    continue
+                char_count = max(1, len(raw_word))
+                start_ratio = part_match.start() / char_count
+                end_ratio = part_match.end() / char_count
+                sub_left = raw_left + int(raw_width * start_ratio)
+                sub_right = raw_left + int(raw_width * end_ratio)
+                pseudo_word = dict(word)
+                pseudo_word["left"] = sub_left
+                pseudo_word["width"] = max(1, sub_right - sub_left)
+                pseudo_word["top"] = raw_top
+                pseudo_word["height"] = raw_height
+                exact_matches.append([pseudo_word])
 
-    if not matches:
-        # Search across neighbouring OCR lines for multi-line output values.
-        ordered = []
-        for key, line_words in sorted(grouped.items(), key=lambda item: item[0]):
-            line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
-            ordered.extend(line_words)
-        compact_target = target_norm.replace(" ", "")
-        for start in range(len(ordered)):
-            current = ""
-            selected = []
-            for end in range(start, min(len(ordered), start + 15)):
-                token = _word_text_norm(ordered[end]["text"])
+    def groups_to_boxes(matches):
+        boxes = []
+        seen = set()
+        for group in matches:
+            if not group:
+                continue
+            left = min(int(word.get("left", 0) or 0) for word in group)
+            top = min(int(word.get("top", 0) or 0) for word in group)
+            right = max(
+                int(word.get("left", 0) or 0)
+                + int(word.get("width", 0) or 0)
+                for word in group
+            )
+            bottom = max(
+                int(word.get("top", 0) or 0)
+                + int(word.get("height", 0) or 0)
+                for word in group
+            )
+            key = (left, top, right, bottom)
+            if right <= left or bottom <= top or key in seen:
+                continue
+            seen.add(key)
+            boxes.append(key)
+        return boxes
+
+    boxes = groups_to_boxes(exact_matches)
+    if boxes:
+        return boxes
+
+    # Fuzzy fallback: only use this for reasonably distinctive values.
+    if len(compact_target) < 5 and not re.search(r"[a-z]", compact_target):
+        return []
+
+    candidates = []
+    for line_words in grouped.values():
+        line_words.sort(
+            key=lambda item: float(item.get("left", 0) or 0)
+        )
+        for start in range(len(line_words)):
+            compact_joined = ""
+            for end in range(start, min(len(line_words), start + 8)):
+                token = _visual_compact(line_words[end].get("text", ""))
                 if not token:
                     continue
-                current += token
-                selected.append(ordered[end])
-                if current == compact_target:
-                    matches.append(selected)
-                    break
-                if len(current) > len(compact_target) + 4:
+                compact_joined += token
+                score = fuzz.ratio(compact_target, compact_joined)
+                candidates.append((score, line_words[start:end + 1]))
+                if len(compact_joined) > len(compact_target) + 12:
                     break
 
-    # Convert groups to rectangles and deduplicate.
-    boxes = []
-    seen = set()
-    for group in matches:
-        if not group:
+    if not candidates:
+        return []
+
+    best_score, best_group = max(candidates, key=lambda item: item[0])
+    threshold = 88 if len(compact_target) >= 8 else 92
+    if best_score < threshold:
+        return []
+
+    return groups_to_boxes([best_group])
+
+
+def _load_visual_font(size, bold=False):
+    """Load a common system font; fall back safely when unavailable."""
+    candidates = []
+    if bold:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ])
+    else:
+        candidates.extend([
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ])
+
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, max(12, int(size)))
+        except Exception:
             continue
-        left = min(int(w.get("left", 0)) for w in group)
-        top = min(int(w.get("top", 0)) for w in group)
-        right = max(int(w.get("left", 0)) + int(w.get("width", 0)) for w in group)
-        bottom = max(int(w.get("top", 0)) + int(w.get("height", 0)) for w in group)
-        key = (left, top, right, bottom)
-        if right <= left or bottom <= top or key in seen:
-            continue
-        seen.add(key)
-        boxes.append(key)
-    return boxes
+
+    return ImageFont.load_default()
+
+
+def _draw_visual_label(draw, base, text, anchor_x, anchor_y, field_color,
+                       status, occupied):
+    """Draw one non-overlapping field label near its matched OCR box."""
+    font_size = max(18, int(min(base.size) * 0.011))
+    font = _load_visual_font(font_size, bold=True)
+    status_font = _load_visual_font(max(15, int(font_size * 0.82)), bold=True)
+
+    status_text = str(status or "").upper()
+    label = f"{text}"
+    bbox = draw.textbbox((0, 0), label, font=font)
+    label_w = bbox[2] - bbox[0]
+    label_h = bbox[3] - bbox[1]
+    status_bbox = draw.textbbox((0, 0), status_text, font=status_font)
+    status_w = status_bbox[2] - status_bbox[0]
+
+    pad_x = max(8, int(font_size * 0.45))
+    pad_y = max(5, int(font_size * 0.24))
+    gap = max(5, int(font_size * 0.25))
+    total_w = label_w + status_w + gap + pad_x * 2
+    total_h = max(label_h, status_bbox[3] - status_bbox[1]) + pad_y * 2
+
+    x = max(4, min(base.width - total_w - 4, int(anchor_x)))
+    preferred_y = int(anchor_y - total_h - 10)
+    if preferred_y < 4:
+        preferred_y = int(anchor_y + 10)
+    y = max(4, min(base.height - total_h - 4, preferred_y))
+
+    # Move the label down until it no longer overlaps an earlier label.
+    for _ in range(25):
+        rect = (x, y, x + total_w, y + total_h)
+        overlaps = any(
+            not (
+                rect[2] <= other[0]
+                or rect[0] >= other[2]
+                or rect[3] <= other[1]
+                or rect[1] >= other[3]
+            )
+            for other in occupied
+        )
+        if not overlaps:
+            break
+        y += total_h + 6
+        if y + total_h > base.height - 4:
+            y = max(4, preferred_y - total_h - 8)
+            x = max(4, x - min(80, total_w // 3))
+            break
+
+    rgb = _hex_to_rgb(field_color)
+    draw.rounded_rectangle(
+        (x, y, x + total_w, y + total_h),
+        radius=max(5, int(font_size * 0.2)),
+        fill=(*rgb, 238),
+        outline=(255, 255, 255, 245),
+        width=max(2, int(font_size * 0.10)),
+    )
+
+    text_y = y + pad_y - bbox[1]
+    draw.text(
+        (x + pad_x, text_y),
+        label,
+        fill=(255, 255, 255, 255),
+        font=font,
+    )
+
+    status_x = x + pad_x + label_w + gap
+    status_y = y + pad_y - status_bbox[1]
+    status_rgb = (
+        (22, 163, 74) if status_text == "PASS"
+        else (220, 38, 38) if status_text == "FAIL"
+        else (107, 114, 128)
+    )
+    draw.text(
+        (status_x, status_y),
+        status_text,
+        fill=(*status_rgb, 255),
+        font=status_font,
+    )
+
+    occupied.append((x, y, x + total_w, y + total_h))
 
 
 def build_highlighted_page_image(page, page_report):
-    """Return the complete artwork page with PASS/FAIL highlight overlays."""
+    """
+    Return the complete original artwork page with field-specific colored
+    highlights and mapped-field annotations.
+
+    The image is NOT cropped or reconstructed. Coordinates come directly from
+    the OCR boxes belonging to the exact rendered artwork image.
+    """
     image_bytes = page.get("image_bytes")
     if not image_bytes:
         return None
@@ -991,28 +1134,67 @@ def build_highlighted_page_image(page, page_report):
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    if page_report is not None and not page_report.empty:
-        for _, row in page_report.iterrows():
-            status = str(row.get("STATUS", ""))
-            if status not in {"PASS", "FAIL"}:
-                continue
-            target = row.get("PDF OUTPUT", "")
-            boxes = _find_word_boxes_for_target(page, target)
-            fill = (35, 134, 54, 75) if status == "PASS" else (218, 54, 51, 95)
-            outline = (35, 134, 54, 220) if status == "PASS" else (218, 54, 51, 240)
-            for left, top, right, bottom in boxes:
-                pad = max(3, int(min(base.size) * 0.004))
-                left = max(0, left - pad)
-                top = max(0, top - pad)
-                right = min(base.width - 1, right + pad)
-                bottom = min(base.height - 1, bottom + pad)
-                draw.rounded_rectangle(
-                    (left, top, right, bottom),
-                    radius=max(3, pad),
-                    fill=fill,
-                    outline=outline,
-                    width=max(2, pad // 2),
-                )
+    if page_report is None or page_report.empty:
+        return base.convert("RGB")
+
+    ordered_fields = []
+    for field in page_report.get("FIELD", []).tolist():
+        field = str(field)
+        if field not in ordered_fields:
+            ordered_fields.append(field)
+    color_map = _field_color_map(ordered_fields)
+    occupied_labels = []
+
+    # Draw broad highlights first, then labels on top.
+    visual_items = []
+    for _, row in page_report.iterrows():
+        status = str(row.get("STATUS", ""))
+        if status not in {"PASS", "FAIL"}:
+            continue
+
+        field = str(row.get("FIELD", ""))
+        target = str(row.get("PDF OUTPUT", "") or "").strip()
+        boxes = _find_word_boxes_for_target(page, target)
+        if not boxes:
+            continue
+
+        visual_items.append((field, status, boxes))
+
+    # Highlight field boxes with a translucent version of that field's color.
+    for field, status, boxes in visual_items:
+        rgb = _hex_to_rgb(color_map.get(field, FIELD_VISUAL_COLORS[0]))
+        fill_alpha = 62 if status == "PASS" else 78
+        outline_alpha = 245
+        outline_width = max(4, int(min(base.size) * 0.003))
+        pad = max(5, int(min(base.size) * 0.005))
+
+        for left, top, right, bottom in boxes:
+            left = max(0, left - pad)
+            top = max(0, top - pad)
+            right = min(base.width - 1, right + pad)
+            bottom = min(base.height - 1, bottom + pad)
+            draw.rounded_rectangle(
+                (left, top, right, bottom),
+                radius=max(6, pad),
+                fill=(*rgb, fill_alpha),
+                outline=(*rgb, outline_alpha),
+                width=outline_width,
+            )
+
+        # Label only the first matched location for this field. When a field
+        # occurs multiple times, every occurrence is highlighted with the same
+        # color, while one label keeps the artwork readable.
+        first_box = boxes[0]
+        _draw_visual_label(
+            draw,
+            base,
+            field,
+            first_box[0],
+            first_box[1],
+            color_map.get(field, FIELD_VISUAL_COLORS[0]),
+            status,
+            occupied_labels,
+        )
 
     return Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -1021,6 +1203,7 @@ def _visual_image_bytes(image):
     if image is None:
         return None
     return _image_to_png_bytes(image)
+
 
 def clean_pdf_line(line):
     if not line:
@@ -2708,170 +2891,111 @@ def _auto_detect_page_text(page):
         return ""
 
     values = []
-    # Prefer OCR because the artwork may be a scanned/non-editable PDF.
-    for key in ("ocr_text", "ocr_alt_text", "text", "direct_text"):
+    for key in ("ocr_text", "text", "direct_text"):
         value = page.get(key, "")
         if value and str(value).strip():
             values.append(str(value))
 
-    return "\n".join(values)
+    return normalize_text("\n".join(values))
 
 
 def _auto_detect_lines(page):
     text = _auto_detect_page_text(page)
-    return [line for line in (normalize_text(x) for x in str(text).splitlines()) if line]
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def _auto_number_evidence(expected, text):
-    """Exact numeric evidence with boundaries; never accepts a substring."""
+    """Exact numeric evidence with boundaries; never accepts a substring of a larger number."""
     numeric = normalize_numeric(expected)
     if numeric is None:
         return False
     return bool(
         re.search(
             rf"(?<![A-Za-z0-9]){re.escape(numeric)}(?![A-Za-z0-9])",
-            normalize_text(text)
+            text
         )
     )
 
 
-def _auto_identifier_evidence(expected, field_name, text):
-    """Asymmetric identifier evidence used for item/style/supplier codes."""
+def _auto_identifier_evidence(expected, text):
+    """High-confidence asymmetric identifier evidence."""
     expected_compact = re.sub(r"[^a-z0-9]", "", normalize_text(expected))
-    field_compact = (
-        normalize_text(field_name)
-        .replace(" ", "")
-        .replace("_", "")
-        .replace("-", "")
-    )
-
-    # Supplier/vendor IDs such as USX are intentionally allowed at 3 chars
-    # because the artwork may contain an appended static suffix (USX609).
-    minimum_length = 3 if any(
-        key in field_compact
-        for key in ("supwsp", "supplier", "vendorid", "vendorcode")
-    ) else 4
-
-    if not expected_compact or len(expected_compact) < minimum_length:
+    if not expected_compact or len(expected_compact) < 4:
         return False
 
     tokens = re.findall(r"[a-z0-9]+", normalize_text(text))
     for token in tokens:
         if token == expected_compact:
             return True
-        if len(expected_compact) >= 5 and token.startswith(expected_compact):
+        # Expected code may have an OCR-added suffix/prefix, but only when the
+        # expected identifier is reasonably distinctive.
+        if expected_compact in token and len(expected_compact) >= 5:
             return True
-        if len(expected_compact) == 3 and token.startswith(expected_compact):
-            return True
-
     return False
 
 
 def _auto_material_evidence(expected, text):
-    """Strong evidence for canonical visible composition-description fields."""
+    """Detect composition values without turning common words/numbers into matches."""
     expected_parts = extract_content_values(expected)
     if not expected_parts:
         return False
 
-    norm_text = normalize_text(text)
-    compact_text_value = re.sub(r"[^a-z0-9%]", "", norm_text)
-
+    compact_text_value = re.sub(r"[^a-z0-9%]", "", normalize_text(text))
     matches = 0
+
     for part in expected_parts:
         part_norm = normalize_text(part)
         material = re.sub(r"[^a-z]", "", part_norm.casefold())
-        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%?", part_norm)
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", part_norm)
 
-        if not material or len(material) < 3:
-            continue
-
-        if material in compact_text_value:
+        if material and len(material) >= 3:
+            # Accept exact material and the common OCR collapse with its percentage.
+            if material in compact_text_value:
+                matches += 1
+                continue
             if pct_match and re.search(
                 rf"{re.escape(pct_match.group(1))}\s*%?\s*{re.escape(material)}",
-                norm_text,
+                normalize_text(text),
             ):
                 matches += 1
-            elif re.search(rf"\b{re.escape(material)}\b", norm_text):
-                matches += 1
+                continue
 
-    required = 2 if len(expected_parts) >= 2 else 1
-    has_composition_shape = bool(
-        re.search(r"\d+(?:\.\d+)?\s*%?", norm_text)
-        and re.search(r"[a-z]{3,}", norm_text)
-    )
-    return matches >= required and has_composition_shape
+    # A real composition field should have at least one material + strong
+    # composition signal (% or another material). This prevents random words
+    # from selecting thousands of translated columns.
+    has_percent = bool(re.search(r"\d+(?:\.\d+)?\s*%|\d+\s*[a-z]{3,}", normalize_text(text)))
+    return matches >= max(1, min(2, len(expected_parts))) and has_percent
 
 
 def _auto_coo_evidence(expected, field_name, text):
-    """High-confidence COO evidence; codes like MADE_IN=F are not artwork text."""
+    """High-confidence COO evidence for Auto Detect."""
     from rapidfuzz import fuzz
 
     expected_coo = extract_coo_value(expected)
     target = normalize_text(expected_coo if expected_coo else expected)
+    norm = normalize_text(text)
 
-    # One/two-letter language/origin codes are internal codes, not visible COO.
-    if re.fullmatch(r"[a-z]{1,2}", target):
-        return False
-
+    # First try a compact exact comparison so OCR spacing such as
+    # "Made Inindia" still matches "MADE IN INDIA".
     target_compact = re.sub(r"[^a-z0-9]", "", target)
-    if len(target_compact) < 4:
-        return False
+    text_compact = re.sub(r"[^a-z0-9]", "", norm)
+    if target_compact and target_compact in text_compact:
+        return True
 
-    for line in _auto_detect_lines({"ocr_text": text}):
+    # Otherwise compare the complete expected COO against individual OCR lines.
+    # Do not match merely on the country name: that caused translated COO
+    # columns such as German/Turkish to be falsely auto-selected.
+    lines = _auto_detect_lines({"ocr_text": text})
+    for line in lines:
         line_compact = re.sub(r"[^a-z0-9]", "", line)
-        if target_compact == line_compact:
-            return True
-        if target_compact and target_compact in line_compact:
-            return True
-        if fuzz.ratio(target_compact, line_compact) >= 92:
+        if target_compact and fuzz.ratio(target_compact, line_compact) >= 92:
             return True
 
     return False
 
 
-def _auto_generic_field_allowed(field_name):
-    """
-    Allow only known artwork-variable semantics among GENERAL technical fields.
-    This prevents operational/database columns from being auto-selected just
-    because they are populated.
-    """
-    compact = (
-        normalize_text(field_name)
-        .replace(" ", "")
-        .replace("_", "")
-        .replace("-", "")
-    )
-
-    patterns = (
-        "stylewofinish",
-        "cdstyle",
-        "cdfinishing",
-        "finishing",
-        "cdimport",
-        "import",
-        "designstyle",
-        "lblstyle",
-        "antfamily",
-        "family",
-        "compodsc",
-        "lhcompodsc",
-    )
-    return any(token in compact for token in patterns)
-
-
-def _auto_content_field_allowed(field_name):
-    """Only canonical composition-description fields are auto-detected."""
-    compact = (
-        normalize_text(field_name)
-        .replace(" ", "")
-        .replace("_", "")
-        .replace("-", "")
-    )
-    return compact.startswith("compodsc") or compact.startswith("lhcompodsc")
-
-
 def _auto_text_evidence(expected, field_name, text):
-    """Conservative Auto Detect evidence check."""
+    """Conservative text matching for Auto Detect only."""
     from rapidfuzz import fuzz
 
     expected_norm = normalize_text(expected)
@@ -2883,12 +3007,14 @@ def _auto_text_evidence(expected, field_name, text):
     norm_text = normalize_text(text)
 
     if field_type == "IDENTIFIER":
-        return _auto_identifier_evidence(expected, field_name, norm_text)
+        return _auto_identifier_evidence(expected, norm_text)
 
     if field_type == "RN":
         digits = re.sub(r"\D", "", expected_norm)
         if not digits or len(digits) < 4:
             return False
+        # Require RN/CA context, or an exact standalone digit sequence on a
+        # short line. This prevents a number like 2 from selecting RN fields.
         if re.search(r"\b(?:rn|ca)\s*[#:\-./ ]*\d+", norm_text):
             return digits in re.sub(r"\D", "", norm_text)
         return bool(re.search(rf"(?<!\d){re.escape(digits)}(?!\d)", norm_text))
@@ -2897,9 +3023,10 @@ def _auto_text_evidence(expected, field_name, text):
         return _auto_coo_evidence(expected, field_name, norm_text)
 
     if field_type == "CONTENT":
-        return _auto_content_field_allowed(field_name) and _auto_material_evidence(expected, norm_text)
+        return _auto_material_evidence(expected, norm_text)
 
     if field_type == "CARE":
+        # Care must match several distinctive words, not one common token.
         tokens = [t for t in re.findall(r"[a-z]+", expected_norm) if len(t) >= 4]
         if len(tokens) < 3:
             return False
@@ -2908,21 +3035,24 @@ def _auto_text_evidence(expected, field_name, text):
         return hits >= max(3, int(len(unique) * 0.35))
 
     if field_type == "SIZE":
+        # Sizes are high-confidence only when the complete size/range appears.
         compact_text = re.sub(r"[^a-z0-9./-]", "", norm_text)
-        if compact_expected and compact_expected in compact_text:
-            return True
-        return _auto_number_evidence(expected_norm, norm_text) and any(
-            key in normalize_text(field_name).replace(" ", "")
-            for key in ("size", "waist", "inseam", "alpha", "fit")
-        )
+        return bool(
+            compact_expected
+            and compact_expected in compact_text
+        ) or _auto_number_evidence(expected_norm, norm_text)
 
     if field_type == "COLOR":
+        # Full color phrase or strong fuzzy similarity to one OCR line.
         if expected_norm in norm_text:
             return True
         lines = _auto_detect_lines({"ocr_text": text})
-        if not lines or len(expected_norm) < 4:
+        if not lines:
             return False
-        return max(fuzz.ratio(expected_norm, line) for line in lines) >= 86
+        return max(
+            fuzz.ratio(expected_norm, line)
+            for line in lines
+        ) >= 86
 
     if field_type == "GENDER":
         aliases = {
@@ -2931,18 +3061,19 @@ def _auto_text_evidence(expected, field_name, text):
             "boys": ("boys", "boy", "boy's", "boys'"),
             "girls": ("girls", "girl", "girl's", "girls'"),
         }
-        key = expected_norm.replace("'", "")
+        key = expected_norm.replace("'", "").replace("s", "")
         for base, variants in aliases.items():
-            if key == base or key.rstrip("s") == base.rstrip("s"):
-                return any(normalize_text(v) in norm_text for v in variants)
+            if base.startswith(key) or key.startswith(base.replace("s", "")):
+                return any(v in norm_text for v in variants)
         return expected_norm in norm_text
 
     if field_type == "BRAND":
         if compact_expected and compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
             return True
         lines = _auto_detect_lines({"ocr_text": text})
-        return bool(lines) and len(expected_norm) >= 4 and max(
-            fuzz.ratio(expected_norm, line) for line in lines
+        return bool(lines) and max(
+            fuzz.ratio(expected_norm, line)
+            for line in lines
         ) >= 88
 
     if field_type == "ATTRIBUTE":
@@ -2956,79 +3087,29 @@ def _auto_text_evidence(expected, field_name, text):
             best = max(best, overlap)
         return best >= 0.60
 
-    if field_type in {"QUANTITY", "BATCH"}:
-        # Quantities/lots are deliberately manual because artwork contains
-        # many unrelated numbers and barcode data.
+    if field_type == "QUANTITY":
+        # Quantity is intentionally not auto-selected. Artwork often contains
+        # many unrelated numbers (sizes, dimensions, panel counts, etc.). The
+        # designer can explicitly select Qty in the editable dropdown.
+        return False
+
+    if field_type == "BATCH":
         return False
 
     if field_type == "OSZ":
+        # OSZ is sequence-based in the final engine. Auto Detect only proposes
+        # it when the exact value is a standalone number.
         return _auto_number_evidence(expected, norm_text)
 
-    # GENERAL: only selected semantic technical fields are eligible.
-    if not _auto_generic_field_allowed(field_name):
+    # GENERAL: deliberately conservative. Auto Detect should not turn every
+    # populated technical/configuration column into a selected field.
+    if len(compact_expected) < 5:
         return False
-
-    # Never auto-detect a one-letter technical code such as MADE_IN=F.
-    if re.fullmatch(r"[a-z]{1,2}", expected_norm):
-        return False
-
     if normalize_numeric(expected) is not None:
-        return _auto_number_evidence(expected_norm, norm_text)
-
-    lines = _auto_detect_lines({"ocr_text": text})
-    if not lines:
         return False
-
-    if compact_expected and compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
+    if compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
         return True
-
-    if len(expected_norm) >= 6:
-        return max(fuzz.ratio(expected_norm, line) for line in lines) >= 90
-
     return False
-
-
-def _auto_candidate_priority(field_name):
-    """Lower number = preferred canonical source column when duplicate values exist."""
-    compact = (
-        normalize_text(field_name)
-        .replace(" ", "")
-        .replace("_", "")
-        .replace("-", "")
-    )
-
-    if compact.startswith("compodsc"):
-        return 0
-    if compact.startswith("lhcompodsc"):
-        return 10
-    return 20
-
-
-def _auto_field_signature(field_name, value):
-    """Semantic duplicate signature so equivalent columns do not flood Auto Detect."""
-    field_type = get_field_type(field_name)
-
-    if field_type == "CONTENT":
-        parts = extract_content_values(value)
-        if parts:
-            parsed = []
-            for part in parts:
-                match = re.match(
-                    r"(\d+(?:\.\d+)?)%?\s*(.+)",
-                    normalize_text(part)
-                )
-                if match:
-                    parsed.append(
-                        (
-                            match.group(1),
-                            normalize_text(match.group(2))
-                        )
-                    )
-                else:
-                    parsed.append(("", normalize_text(part)))
-            return (field_type, tuple(parsed))
-
-    return (field_type, normalize_text(value))
 
 
 def auto_detect_fields(
@@ -3038,17 +3119,14 @@ def auto_detect_fields(
     page_row_mapping=None
 ):
     """
-    Controlled Auto Detect.
+    Conservative Auto Detect.
 
-    A field is selected only when:
-      1. it is populated in the mapped Order Form row,
-      2. its column belongs to an allowed artwork-variable family, and
-      3. its actual value has strong evidence in the mapped artwork.
-
-    Population alone is never enough.
+    It proposes only fields for which the selected Order Form row has
+    high-confidence evidence in its mapped artwork page. Populated Excel cells
+    alone are never enough to select a field.
     """
     available_fields = get_available_fields(df)
-    allowed_types = {
+    allowed_auto_types = {
         "IDENTIFIER",
         "BRAND",
         "GENDER",
@@ -3060,111 +3138,68 @@ def auto_detect_fields(
         "ATTRIBUTE",
         "RN",
         "OSZ",
-        "GENERAL",
     }
 
-    candidates = []
-    for field in available_fields:
-        if is_admin_field(field):
-            continue
-
-        field_type = get_field_type(field)
-
-        if field_type == "GENERAL" and not _auto_generic_field_allowed(field):
-            continue
-
-        if field_type == "CONTENT" and not _auto_content_field_allowed(field):
-            continue
-
-        if field_type not in allowed_types:
-            continue
-
-        compact = (
-            normalize_text(field)
-            .replace(" ", "")
-            .replace("_", "")
-            .replace("-", "")
-        )
-
-        # Never auto-select translated/internal material columns.
-        if any(token in compact for token in (
-            "p1mat",
-            "multi",
-            "translation",
-            "greek",
-            "arabic",
-            "turkish",
-            "indonesia",
-            "matfull",
-        )):
-            if not compact.startswith("compodsc"):
-                continue
-
-        candidates.append(field)
+    candidates = [
+        field for field in available_fields
+        if not is_admin_field(field)
+        and get_field_type(field) in allowed_auto_types
+    ]
 
     if not candidates or not output_pages:
         return []
 
+    # Build explicit Page -> Data Row mappings.
     rows_to_check = []
-    for page in output_pages:
-        page_number = int(page.get("page", 1))
-
-        if page_row_mapping is not None:
+    if page_row_mapping:
+        for page in output_pages:
+            page_number = int(page.get("page", 1))
             if page_number not in page_row_mapping:
                 continue
             row_index = int(page_row_mapping[page_number])
-        elif len(df) == 1:
-            row_index = 0
-        else:
-            row_index = page_number - 1
-
-        if 0 <= row_index < len(df):
-            rows_to_check.append((page, df.iloc[row_index]))
+            if 0 <= row_index < len(df):
+                rows_to_check.append((page, df.iloc[row_index]))
+    elif len(df) == 1:
+        rows_to_check = [(page, df.iloc[0]) for page in output_pages]
+    else:
+        for page_index, page in enumerate(output_pages):
+            if page_index < len(df):
+                rows_to_check.append((page, df.iloc[page_index]))
 
     if not rows_to_check:
         return []
 
-    # Prefer canonical composition descriptions before equivalent helper columns.
-    candidates = sorted(
-        enumerate(candidates),
-        key=lambda item: (_auto_candidate_priority(item[1]), item[0])
-    )
-    candidates = [field for _idx, field in candidates]
-
     detected = []
     detected_signatures = set()
 
+    # Process in field order so duplicate columns sharing exactly the same
+    # value do not flood Auto Detect. The first high-confidence field is kept;
+    # the user can still add the other populated columns from the editable
+    # dropdown. This is especially useful for duplicated language/size columns.
     for field in candidates:
-        found = False
+        evidence_count = 0
         representative_value = None
-
         for page, row in rows_to_check:
             value = row.get(field, "")
             if is_blank_value(value):
                 continue
-
             representative_value = str(value).strip()
-            if _auto_text_evidence(
-                value,
-                field,
-                _auto_detect_page_text(page)
-            ):
-                found = True
-                break
+            if _auto_text_evidence(value, field, _auto_detect_page_text(page)):
+                evidence_count += 1
 
-        if not found or representative_value is None:
+        if evidence_count < 1 or representative_value is None:
             continue
 
-        signature = _auto_field_signature(field, representative_value)
+        signature = (
+            get_field_type(field),
+            normalize_text(representative_value),
+        )
         if signature in detected_signatures:
             continue
 
         detected_signatures.add(signature)
         detected.append(field)
 
-    # Return fields in their original Excel order.
-    original_order = {str(column): idx for idx, column in enumerate(df.columns)}
-    detected.sort(key=lambda field: original_order.get(field, 10**9))
     return detected
 
 
@@ -3278,7 +3313,8 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         ws.cell(idx, 1).alignment = Alignment(wrap_text=True, vertical="top")
 
     comparison = wb.create_sheet("Field Comparison")
-    headers = list(report.columns)
+    report_display = _report_with_visual_column(report)
+    headers = list(report_display.columns)
     header_fill = PatternFill("solid", fgColor=NAVY)
     for col_idx, header in enumerate(headers, start=1):
         cell = comparison.cell(1, col_idx, header)
@@ -3286,7 +3322,7 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    for row_idx, row in enumerate(report.itertuples(index=False), start=2):
+    for row_idx, row in enumerate(report_display.itertuples(index=False), start=2):
         for col_idx, value in enumerate(row, start=1):
             cell = comparison.cell(row_idx, col_idx, value)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
@@ -3313,6 +3349,19 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
                 cell.fill = PatternFill("solid", fgColor=GREY)
                 cell.font = Font(color=WHITE, bold=True)
 
+    # Field-color swatches use the exact same mapping as the artwork annotations.
+    field_colors = _field_color_map(report_display["FIELD"].astype(str).tolist()) if "FIELD" in report_display.columns else {}
+    visual_col = headers.index("VISUAL") + 1 if "VISUAL" in headers else None
+    if visual_col:
+        for row_idx in range(2, comparison.max_row + 1):
+            field_value = str(comparison.cell(row_idx, headers.index("FIELD") + 1).value or "")
+            hex_color = field_colors.get(field_value, FIELD_VISUAL_COLORS[0]).lstrip("#")
+            swatch = comparison.cell(row_idx, visual_col)
+            swatch.value = "■"
+            swatch.fill = PatternFill("solid", fgColor=hex_color.upper())
+            swatch.font = Font(color="FFFFFF", bold=True, size=15)
+            swatch.alignment = Alignment(horizontal="center", vertical="center")
+
     width_map = {
         "FIELD NO": 12,
         "PDF PAGE": 12,
@@ -3323,6 +3372,7 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         "STATUS": 16,
         "DIFFERENCE": 58,
         "MATCH TYPE": 22,
+        "VISUAL": 11,
     }
     for col_idx, header in enumerate(headers, start=1):
         comparison.column_dimensions[get_column_letter(col_idx)].width = width_map.get(header, 20)
@@ -3364,7 +3414,7 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
             image_data = _visual_image_bytes(highlighted)
             if image_data:
                 img = XLImage(BytesIO(image_data))
-                img.width = min(900, highlighted.width)
+                img.width = min(680, highlighted.width)
                 img.height = int(highlighted.height * (img.width / highlighted.width))
                 anchor = f"A{row_cursor}"
                 visual.add_image(img, anchor)
@@ -3657,7 +3707,6 @@ def main():
 
         if comparison_method == "Auto Detect":
             auto_key = (
-                AUTO_DETECT_ENGINE_VERSION,
                 str(getattr(excel_file, "name", "")),
                 int(getattr(excel_file, "size", 0)),
                 str(getattr(output_file, "name", "")),
@@ -3720,11 +3769,6 @@ def main():
                 placeholder="Type to search or add a populated field...",
                 label_visibility="collapsed",
                 key=auto_widget_key
-            )
-
-            st.caption(
-                f"Auto Detect engine: {AUTO_DETECT_ENGINE_VERSION} • "
-                f"{len(selected_fields)} field(s) currently selected"
             )
 
             if selected_fields:
@@ -3908,13 +3952,30 @@ def main():
         with col4:
             st.metric("IGNORED", skip_count)
 
+        report_display = _report_with_visual_column(report)
+        field_colors = _field_color_map(report_display["FIELD"].astype(str).tolist()) if "FIELD" in report_display.columns else {}
+
+        def _style_visual_row(row):
+            styles = [""] * len(row)
+            if "VISUAL" in report_display.columns:
+                visual_index = report_display.columns.get_loc("VISUAL")
+                field_name = str(row.get("FIELD", ""))
+                hex_color = field_colors.get(field_name, FIELD_VISUAL_COLORS[0])
+                styles[visual_index] = (
+                    f"background-color: {hex_color}; "
+                    "color: white; font-weight: bold; "
+                    "text-align: center; font-size: 18px;"
+                )
+            return styles
+
         styled_report = (
-            report
+            report_display
             .style
             .map(
                 style_status,
                 subset=["STATUS"]
             )
+            .apply(_style_visual_row, axis=1)
         )
 
         st.dataframe(
@@ -3935,15 +3996,42 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
+                "Each compared field is mapped to the actual artwork location using a unique color. The same color appears in the comparison table and in the Excel report."
             )
+
+            legend_fields = []
+            for field in report.get("FIELD", []).tolist() if "FIELD" in report.columns else []:
+                field = str(field)
+                if field not in legend_fields:
+                    legend_fields.append(field)
+            live_color_map = _field_color_map(legend_fields)
+
+            # Compact legend. Four columns keeps the page readable for large selections.
+            legend_count = min(4, max(1, len(legend_fields)))
+            legend_cols = st.columns(legend_count)
+            for idx, field in enumerate(legend_fields):
+                with legend_cols[idx % legend_count]:
+                    color = live_color_map.get(field, FIELD_VISUAL_COLORS[0])
+                    st.markdown(
+                        f'<div style="display:flex;align-items:center;gap:7px;margin:3px 0;">'
+                        f'<span style="width:14px;height:14px;border-radius:3px;background:{color};display:inline-block;border:1px solid #ffffff;flex:none;"></span>'
+                        f'<span style="font-size:12px;color:#d1d5db;">{field}</span>'
+                        '</div>',
+                        unsafe_allow_html=True
+                    )
+
             for page in visual_pages:
                 page_num = page.get("page")
-                page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
+                page_report = (
+                    report[report["PDF PAGE"] == page_num]
+                    if "PDF PAGE" in report.columns
+                    else report.iloc[0:0]
+                )
                 highlighted = build_highlighted_page_image(page, page_report)
                 if highlighted is not None:
-                    st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width=750)
+                    st.markdown(f"**Artwork Page {page_num} — Annotated Mapping**")
+                    # Slightly smaller than the prior 680px version.
+                    st.image(highlighted, width=650)
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
