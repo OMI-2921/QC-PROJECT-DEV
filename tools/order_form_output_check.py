@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-FAIL-OSZ-DIRECT-FALLBACK-05"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-ANNOTATION-07"
 import pandas as pd
 import fitz
 import re
@@ -1309,25 +1309,293 @@ def _truncate_visual_value(value, limit=42):
     return value[: max(1, limit - 1)] + "…"
 
 
-def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, difference):
-    """Find the *incorrect* PDF text for a FAIL without changing comparison logic.
+def _visual_field_uses_block_mapping(field_name, expected_value="", actual_value=""):
+    """Return True when the visual should show the whole compared text block.
 
-    The normal visual lookup first searches the complete PDF OUTPUT value. For
-    long care/composition mismatches that can fail because the PDF OUTPUT may
-    contain extra OCR tokens. This fallback searches the actual replacement/
-    inserted tokens from the already-produced comparison difference.
+    This is presentation-only. It never changes the comparison decision.
+    Long structured text fields are intentionally shown as complete regions so
+    the reviewer can see the exact block that was evaluated, rather than only
+    one differing word.
     """
+    field_type = get_field_type(field_name)
+    if field_type in {"CARE", "CONTENT"}:
+        return True
+
+    if field_type in {"ATTRIBUTE", "GENERAL", "BRAND"}:
+        sample = str(actual_value or expected_value or "").strip()
+        tokens = tokenize(sample)
+        return len(tokens) >= 5 or len(sample) >= 45
+
+    return False
+
+
+def _visual_group_text(group):
+    return re.sub(
+        r"\s+",
+        " ",
+        " ".join(str(word.get("text", "")).strip() for word in group if str(word.get("text", "")).strip())
+    ).strip()
+
+
+def _visual_match_line_score(target_line, actual_line):
+    """Similarity score for locating one already-compared OCR line."""
+    target_norm = _visual_norm(target_line)
+    actual_norm = _visual_norm(actual_line)
+    if not target_norm or not actual_norm:
+        return 0.0
+
+    if target_norm == actual_norm or _visual_compact(target_norm) == _visual_compact(actual_norm):
+        return 1.0
+
+    from difflib import SequenceMatcher
+
+    target_tokens = target_norm.split()
+    actual_tokens = actual_norm.split()
+    token_ratio = SequenceMatcher(
+        None, target_tokens, actual_tokens, autojunk=False
+    ).ratio()
+    compact_ratio = SequenceMatcher(
+        None, _visual_compact(target_norm), _visual_compact(actual_norm), autojunk=False
+    ).ratio()
+
+    # Token similarity is more meaningful for long care/composition lines.
+    return max(token_ratio, compact_ratio * 0.98)
+
+
+def _visual_region_markers(field_name):
+    """Return start/stop markers for locating a complete visual text region."""
+    field_type = get_field_type(field_name)
+    region = get_field_region(field_name)
+
+    if field_type == "CARE":
+        starts = {
+            "EN": ["machine wash", "wash", "bleach", "dry clean", "tumble dry", "cool iron"],
+            "FR": ["laver", "blanchiment", "nettoyage", "sécher", "repasser"],
+            "SP": ["lavar", "cloro", "secadora", "plancha", "limpieza en seco"],
+            "": ["machine wash", "wash", "bleach", "dry clean", "laver", "lavar"],
+        }
+        return starts.get(region, starts[""]), [
+            "rn", "rn#", "made in", "fabrique en", "hecho en"
+        ]
+
+    if field_type == "CONTENT":
+        return ["%", "cotton", "polyester", "spandex", "elastane", "nylon", "shell", "lining"], [
+            "rn", "rn#", "made in", "fabrique en", "hecho en",
+            "machine wash", "wash", "laver", "lavar", "bleach", "cloro"
+        ]
+
+    return [], ["rn", "rn#", "made in", "fabrique en", "hecho en"]
+
+
+def _visual_is_numeric_only_group(group):
+    text = _visual_group_text(group)
+    compact = re.sub(r"[^0-9]", "", text)
+    alpha = re.sub(r"[^a-z]", "", text.casefold())
+    return bool(compact) and not alpha and len(compact) <= 6
+
+
+def _visual_is_short_code_group(group):
+    """Detect small standalone technical codes after a long text block."""
+    text = _visual_group_text(group).strip()
+    compact_alpha = re.sub(r"[^A-Za-z]", "", text)
+    if not compact_alpha:
+        return False
+    if len(compact_alpha) > 5:
+        return False
+    # Preserve normal short words that legitimately continue care text.
+    common_short_words = {
+        "if", "no", "use", "with", "cold", "like", "only", "when",
+        "dry", "low", "iron", "cool", "wash", "bleach", "needed",
+        "laver", "avec", "sans", "si", "lavar"
+    }
+    normalized = _visual_norm(text)
+    if normalized in common_short_words:
+        return False
+    return text.upper() == text and len(compact_alpha) <= 5
+
+
+def _find_visual_semantic_block_boxes(page, field_name):
+    """Locate the complete physical artwork block for a long text field.
+
+    This is presentation-only. It never changes PASS/FAIL logic. For CARE the
+    physical block can be interrupted by standalone OSZ numbers, so numeric-only
+    lines are skipped while the care text continues. For CONTENT, the block ends
+    when the next care/COO/RN region starts.
+    """
+    groups = _visual_group_words(page)
+    if not groups:
+        return []
+
+    starts, stops = _visual_region_markers(field_name)
+    starts = [_visual_norm(x) for x in starts if _visual_norm(x)]
+    stops = [_visual_norm(x) for x in stops if _visual_norm(x)]
+    if not starts:
+        return []
+
+    field_type = get_field_type(field_name)
+    start_idx = None
+    for idx, group in enumerate(groups):
+        line_text = _visual_norm(_visual_group_text(group))
+        if line_text and any(marker in line_text for marker in starts):
+            start_idx = idx
+            break
+
+    if start_idx is None:
+        return []
+
+    selected_groups = []
+    meaningful_text_groups = 0
+
+    for idx in range(start_idx, len(groups)):
+        group = groups[idx]
+        line_text = _visual_norm(_visual_group_text(group))
+
+        if idx > start_idx and any(marker in line_text for marker in stops):
+            break
+
+        # A numeric OSZ line may sit inside/adjacent to the care block. It is
+        # not part of the care instruction and must not be highlighted.
+        if idx > start_idx and _visual_is_numeric_only_group(group):
+            continue
+
+        if idx > start_idx and field_type == "CARE" and _visual_is_short_code_group(group):
+            break
+
+        if line_text:
+            selected_groups.append(group)
+            meaningful_text_groups += 1
+
+        if meaningful_text_groups >= 20:
+            break
+
+    boxes = []
+    for group in selected_groups:
+        box = _boxes_from_words(group)
+        if box:
+            boxes.extend(box)
+    return boxes
+
+
+def _find_visual_block_boxes(page, target, field_name=""):
+    """Locate the complete OCR line block represented by a compared text value.
+
+    For CARE/CONTENT (and long ATTRIBUTE/GENERAL/BRAND fields), the comparison
+    result often represents several complete artwork lines. The visual layer
+    therefore maps every relevant OCR line in that block, rather than searching
+    only for the word that differs.
+    """
+    target = str(target or "").strip()
+    if not target or target.casefold() in {"not found", "-", "—"}:
+        return []
+
+    groups = _visual_group_words(page)
+    if not groups:
+        return []
+
+    target_lines = [
+        re.sub(r"\s+", " ", line).strip()
+        for line in target.splitlines()
+        if str(line).strip()
+    ]
+
+    # When the comparison PDF OUTPUT is a single long line, wrap it only for
+    # matching if the OCR itself has multiple physical lines. Otherwise use the
+    # whole matched OCR group.
+    if not target_lines:
+        return []
+
+    group_texts = [_visual_group_text(group) for group in groups]
+
+    # First pass: exact/compact line matches, preserving physical order.
+    chosen_indices = []
+    search_from = 0
+    for target_line in target_lines:
+        exact_idx = None
+        for idx in range(search_from, len(groups)):
+            candidate = group_texts[idx]
+            if not candidate:
+                continue
+            if (
+                _visual_norm(target_line) == _visual_norm(candidate)
+                or _visual_compact(target_line) == _visual_compact(candidate)
+            ):
+                exact_idx = idx
+                break
+        if exact_idx is not None:
+            chosen_indices.append(exact_idx)
+            search_from = exact_idx + 1
+
+    # If all target lines were found, return those physical lines.
+    if len(chosen_indices) == len(target_lines):
+        selected_groups = [groups[idx] for idx in chosen_indices]
+        boxes = []
+        for group in selected_groups:
+            boxes.extend(_boxes_from_words(group))
+        return boxes
+
+    # Second pass: fuzzy line alignment. Use a monotonic assignment so the
+    # highlight cannot jump to a distant unrelated block just because one word
+    # happens to be similar.
+    fuzzy_indices = []
+    search_from = 0
+    for target_line in target_lines:
+        best_idx = None
+        best_score = 0.0
+        for idx in range(search_from, min(len(groups), search_from + 12)):
+            score = _visual_match_line_score(target_line, group_texts[idx])
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        if best_idx is None or best_score < 0.68:
+            continue
+        fuzzy_indices.append(best_idx)
+        search_from = best_idx + 1
+
+    if not fuzzy_indices:
+        return []
+
+    # For a block field, at least half the source lines should align before we
+    # accept the result. This protects against accidental one-word matches.
+    if len(fuzzy_indices) < max(1, int(len(target_lines) * 0.5)):
+        return []
+
+    # Include intermediate physical OCR lines between first and last aligned
+    # targets when the comparison target represents a continuous block. This is
+    # what makes a 5-line care instruction appear as one clearly compared region.
+    first_idx = fuzzy_indices[0]
+    last_idx = fuzzy_indices[-1]
+    selected_groups = groups[first_idx:last_idx + 1]
+
+    boxes = []
+    for group in selected_groups:
+        box = _boxes_from_words(group)
+        if box:
+            boxes.extend(box)
+    return boxes
+
+
+def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, difference):
+    """Find the actual artwork region for a FAIL, presentation layer only."""
     actual_value = str(actual_value or "").strip()
     expected_value = str(expected_value or "").strip()
     difference = str(difference or "").strip()
 
-    # OSZ uses its sequence-position-aware visual resolver.
     if get_field_type(field_name) == "OSZ":
         boxes = _find_visual_osz_box(page, field_name, actual_value)
         if boxes:
             return boxes
 
-    # First try the complete actual PDF output.
+    # For block-based fields, ALWAYS try the complete compared block first.
+    # This intentionally prevents a care mismatch from highlighting only a word
+    # such as "ONLY".
+    if _visual_field_uses_block_mapping(field_name, expected_value, actual_value):
+        boxes = _find_visual_semantic_block_boxes(page, field_name)
+        if not boxes:
+            boxes = _find_visual_block_boxes(page, actual_value, field_name)
+        if boxes:
+            return boxes
+
+    # Fallback for scalar/structured failures: locate the actual PDF output.
     boxes = _find_visual_boxes(page, actual_value, field_name)
     if boxes:
         return boxes
@@ -1344,12 +1612,14 @@ def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, d
             if tag in {"replace", "insert"}:
                 candidate_tokens.extend(actual_tokens[b1:b2])
 
-    # The stored difference may be even more specific, e.g.\n    # "Extra: only non; Extra: 16; Extra: hag".
-    for item in re.findall(r"(?:Extra|Found|PDF)\s*:\s*([^;]+)", difference, flags=re.IGNORECASE):
+    # Stored differences can contain useful actual-value fragments.
+    for item in re.findall(
+        r"(?:Extra|Found|PDF)\s*:\s*([^;]+)",
+        difference,
+        flags=re.IGNORECASE
+    ):
         candidate_tokens.extend(tokenize(item))
 
-    # Keep order and remove weak one-character fragments unless the actual
-    # output itself is a single character/number.
     seen = set()
     cleaned = []
     for token in candidate_tokens:
@@ -1364,36 +1634,18 @@ def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, d
 
     found = []
     for token in cleaned:
-        token_boxes = _find_visual_boxes(page, token, field_name)
-        for box in token_boxes:
+        for box in _find_visual_boxes(page, token, field_name):
             if box not in found:
                 found.append(box)
-
-    if found:
-        return found
-
-    # Field-specific fallback for long care instructions: highlight the most
-    # distinctive actual words/phrases that differ from the Order Form.
-    if get_field_type(field_name) == "CARE":
-        actual_norm_tokens = [t for t in actual_tokens if len(t) >= 4]
-        expected_norm_tokens = set(t for t in expected_tokens if len(t) >= 4)
-        distinctive = [t for t in actual_norm_tokens if t not in expected_norm_tokens]
-        for token in distinctive:
-            token_boxes = _find_visual_boxes(page, token, field_name)
-            for box in token_boxes:
-                if box not in found:
-                    found.append(box)
-            if len(found) >= 6:
-                break
 
     return found
 
 
 def build_highlighted_page_image(page, page_report, field_colors=None):
-    """Return the full original artwork with field-specific mapped annotations.
+    """Render the original artwork with precise field mapping annotations.
 
-    This is a read-only presentation layer. It consumes the already-produced
-    comparison report and never changes comparison decisions.
+    Presentation-only layer. Comparison decisions are read from ``page_report``
+    and are never recalculated or modified here.
     """
     image_bytes = page.get("image_bytes")
     if not image_bytes:
@@ -1427,17 +1679,21 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         pdf_output = str(row.get("PDF OUTPUT", "")).strip()
         expected_value = str(row.get("ORDER FORM DATA", "")).strip()
 
-        # No visual target exists for NOT FOUND, and FAIL must never invent one.
         if not pdf_output or pdf_output.casefold() in {"not found", "—", "-"}:
             continue
 
-        if get_field_type(field_name) == "OSZ":
+        # Block fields are mapped to the whole compared physical region.
+        # Prefer semantic artwork-region detection because PDF OUTPUT may be a
+        # comparison-constructed long string rather than a verbatim OCR line.
+        if _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
+            boxes = _find_visual_semantic_block_boxes(page, field_name)
+            if not boxes:
+                boxes = _find_visual_block_boxes(page, pdf_output, field_name)
+        elif get_field_type(field_name) == "OSZ":
             boxes = _find_visual_osz_box(page, field_name, pdf_output)
         else:
             boxes = _find_visual_boxes(page, pdf_output, field_name)
 
-        # FAIL needs a visual target even when the full PDF OUTPUT is a long
-        # mismatch string that cannot be found as one contiguous OCR sequence.
         if status == "FAIL" and not boxes:
             boxes = _find_visual_failure_boxes(
                 page,
@@ -1453,7 +1709,6 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         color = field_colors.get(field_name, FIELD_VISUAL_COLORS[0])
         rgb = _hex_rgb(color)
 
-        # Highlight every located occurrence, but annotate a field only once.
         for box in boxes:
             left, top, right, bottom = box
             pad = max(2, int(min(base.size) * 0.0018))
@@ -1463,20 +1718,19 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             bottom = min(base.height - 1, bottom + pad)
 
             if status == "FAIL":
-                # Field identity stays in the field-specific color; the actual
-                # incorrect artwork text is marked red so the defect is obvious.
+                # Red is the defect color; the field-specific outline preserves
+                # field identity.
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
                     radius=max(3, pad),
-                    fill=(218, 54, 51, 105),
+                    fill=(218, 54, 51, 100),
                     outline=rgb + (255,),
                     width=max(2, pad),
                 )
-                error_pad = max(2, pad + 1)
                 draw.rounded_rectangle(
-                    (max(0, left - error_pad), max(0, top - error_pad),
-                     min(base.width - 1, right + error_pad), min(base.height - 1, bottom + error_pad)),
-                    radius=max(3, error_pad),
+                    (max(0, left - 1), max(0, top - 1),
+                     min(base.width - 1, right + 1), min(base.height - 1, bottom + 1)),
+                    radius=max(3, pad + 1),
                     outline=(218, 54, 51, 255),
                     width=max(2, pad // 2),
                 )
@@ -1497,13 +1751,11 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
                     "rgb": rgb,
                     "box": (left, top, right, bottom),
                     "number": number_by_field.get(field_name, 0),
-                    "expected": expected_value,
-                    "actual": pdf_output,
                 })
                 annotated_fields.add(field_name)
 
-    # Place one annotation per field. PASS is a compact single-line label;
-    # FAIL adds the expected-vs-actual detail so the reviewer knows what failed.
+    # Labels intentionally remain simple: the artwork communicates the scope
+    # of comparison, while detailed reasons stay in the comparison table.
     used_label_rects = []
     for item in annotations:
         box = item["box"]
@@ -1511,25 +1763,14 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         status = item["status"]
         rgb = item["rgb"]
         number = item["number"]
-        expected_value = item.get("expected", "")
-        actual_value = item.get("actual", "")
 
         title_text = f"{number}. {field_name} • {status}"
-        detail_text = ""
-        if status == "FAIL":
-            detail_text = (
-                f"OF: {_truncate_visual_value(expected_value)}  |  "
-                f"PDF: {_truncate_visual_value(actual_value)}"
-            )
-
         font = bold_font or regular_font
-        detail_font = regular_font
         tw, th = _text_size(draw, title_text, font)
-        dtw, dth = _text_size(draw, detail_text, detail_font) if detail_text else (0, 0)
 
         max_label_w = max(210, int(base.width * 0.38))
-        label_w = min(max(tw, dtw) + 26, max_label_w)
-        label_h = th + (dth + 7 if detail_text else 0) + 16
+        label_w = min(tw + 26, max_label_w)
+        label_h = th + 16
 
         label_x, label_y = _place_label_above_or_below(
             box,
@@ -1541,7 +1782,6 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         )
         used_label_rects.append((label_x, label_y, label_x + label_w, label_y + label_h))
 
-        # Connector from label edge to actual artwork box.
         box_cx = int((box[0] + box[2]) / 2)
         if label_y + label_h <= box[1]:
             label_anchor = (int(label_x + label_w / 2), int(label_y + label_h))
@@ -1558,7 +1798,7 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
 
         draw.line(
             (label_anchor[0], label_anchor[1], target_anchor[0], target_anchor[1]),
-            fill=rgb + (235,),
+            fill=((218, 54, 51) if status == "FAIL" else rgb) + (235,),
             width=max(2, int(min(base.size) * 0.00095)),
         )
 
@@ -1584,14 +1824,6 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             fill=(20, 28, 40, 255),
             font=font,
         )
-
-        if detail_text:
-            draw.text(
-                (label_x + bar_w + 8, label_y + 8 + th),
-                detail_text,
-                fill=(170, 40, 40, 255),
-                font=detail_font,
-            )
 
     return Image.alpha_composite(base, overlay).convert("RGB")
 
