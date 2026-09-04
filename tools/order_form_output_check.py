@@ -4,9 +4,11 @@ import fitz
 import re
 import unicodedata
 import io
+import hashlib
+import textwrap
 from io import BytesIO
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFilter, ImageFont
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
@@ -491,66 +493,299 @@ def _text_quality_score(text):
     return alnum + useful_lines * 8 + numeric_runs * 3
 
 
+def _tesseract_data_pass(image, lang="eng", config="--psm 6", offset_x=0, offset_y=0, scale_back=1.0):
+    """Run one OCR pass and return normalized word records in original-image coordinates."""
+    import pytesseract
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(
+        image,
+        lang=lang,
+        output_type=Output.DICT,
+        config=config,
+    )
+
+    words = []
+    texts = data.get("text", [])
+    count = len(texts)
+
+    for i in range(count):
+        raw_text = str(texts[i] or "").strip()
+        if not raw_text:
+            continue
+
+        try:
+            conf = float(data.get("conf", ["-1"] * count)[i])
+        except Exception:
+            conf = -1.0
+
+        try:
+            left = int(data.get("left", [0] * count)[i])
+            top = int(data.get("top", [0] * count)[i])
+            width = int(data.get("width", [0] * count)[i])
+            height = int(data.get("height", [0] * count)[i])
+        except Exception:
+            continue
+
+        # A resized crop is mapped back to the original full-page coordinates.
+        if scale_back != 1.0:
+            left = int(left / scale_back)
+            top = int(top / scale_back)
+            width = max(1, int(width / scale_back))
+            height = max(1, int(height / scale_back))
+
+        words.append({
+            "text": raw_text,
+            "left": int(left + offset_x),
+            "top": int(top + offset_y),
+            "width": width,
+            "height": height,
+            "conf": conf,
+            "block_num": int(data.get("block_num", [0] * count)[i]),
+            "par_num": int(data.get("par_num", [0] * count)[i]),
+            "line_num": int(data.get("line_num", [0] * count)[i]),
+        })
+
+    return words
+
+
+def _deduplicate_ocr_words(words):
+    """Merge duplicate detections from overlapping OCR passes."""
+    best = {}
+
+    for word in words:
+        text_norm = _visual_norm(word.get("text", ""))
+        if not text_norm:
+            continue
+
+        left = int(word.get("left", 0))
+        top = int(word.get("top", 0))
+        width = max(1, int(word.get("width", 1)))
+        height = max(1, int(word.get("height", 1)))
+
+        # Spatial bucketing allows tiny coordinate differences between OCR passes.
+        key = (
+            text_norm,
+            round(left / 12),
+            round(top / 12),
+        )
+
+        current = best.get(key)
+        if current is None or float(word.get("conf", -1)) > float(current.get("conf", -1)):
+            best[key] = word
+
+    result = list(best.values())
+    result.sort(key=lambda item: (
+        int(item.get("top", 0)),
+        int(item.get("left", 0)),
+    ))
+    return result
+
+
+def _ocr_words_to_text(words):
+    """Build readable OCR lines from word boxes using their physical Y positions."""
+    if not words:
+        return ""
+
+    ordered = sorted(
+        words,
+        key=lambda item: (
+            int(item.get("top", 0)),
+            int(item.get("left", 0)),
+        ),
+    )
+
+    lines = []
+    current = []
+    current_y = None
+    current_height = 0
+
+    for word in ordered:
+        top = int(word.get("top", 0))
+        height = max(1, int(word.get("height", 1)))
+        center_y = top + height / 2
+
+        if current_y is None:
+            current = [word]
+            current_y = center_y
+            current_height = height
+            continue
+
+        tolerance = max(8, int(max(current_height, height) * 0.65))
+        if abs(center_y - current_y) <= tolerance:
+            current.append(word)
+            current_y = (current_y * (len(current) - 1) + center_y) / len(current)
+            current_height = max(current_height, height)
+        else:
+            current.sort(key=lambda item: int(item.get("left", 0)))
+            lines.append(" ".join(str(item.get("text", "")) for item in current).strip())
+            current = [word]
+            current_y = center_y
+            current_height = height
+
+    if current:
+        current.sort(key=lambda item: int(item.get("left", 0)))
+        lines.append(" ".join(str(item.get("text", "")) for item in current).strip())
+
+    return "\n".join(line for line in lines if line)
+
+
+def _prepare_ocr_variant(image, mode):
+    """Create OCR-friendly variants without changing the final coordinate system."""
+    base = image.convert("RGB")
+
+    if mode == "gray":
+        return ImageOps.grayscale(base).convert("RGB")
+
+    if mode == "contrast":
+        gray = ImageOps.grayscale(base)
+        gray = ImageEnhance.Contrast(gray).enhance(1.8)
+        gray = ImageEnhance.Sharpness(gray).enhance(1.4)
+        return gray.convert("RGB")
+
+    if mode == "sharp":
+        return base.filter(ImageFilter.SHARPEN)
+
+    return base
+
+
 def _ocr_image_with_data(image):
-    """Run OCR once and return both text and word-level bounding boxes."""
+    """
+    OCR 2.0 pipeline for artwork QC.
+
+    The page is processed using several OCR views plus overlapping enlarged
+    horizontal crops. Crop OCR is mapped back to the original page coordinates,
+    allowing the comparison engine to locate tiny artwork text while preserving
+    the complete original artwork for visual highlighting.
+    """
     try:
         import pytesseract
-        from pytesseract import Output
     except ImportError as exc:
         raise RuntimeError(
             "OCR support is not installed. Add pytesseract to requirements.txt."
         ) from exc
 
     errors = []
-    for lang in ("eng", "eng+fra+spa"):
+    all_words = []
+
+    # We deliberately try English first. If that works, optional language packs
+    # are not required for ordinary apparel artwork.
+    languages = ["eng"]
+    selected_lang = "eng"
+
+    # Full-page passes. The rendered page is already high resolution, so these
+    # preserve the complete layout and provide a strong baseline.
+    full_passes = [
+        ("normal", "--psm 6"),
+        ("normal", "--psm 11"),
+        ("contrast", "--psm 11"),
+    ]
+
+    for mode, config in full_passes:
         try:
-            data = pytesseract.image_to_data(
-                image,
-                lang=lang,
-                output_type=Output.DICT,
-                config="--psm 6"
+            variant = _prepare_ocr_variant(image, mode)
+            all_words.extend(
+                _tesseract_data_pass(
+                    variant,
+                    lang="eng",
+                    config=config,
+                )
             )
-            words = []
-            grouped_text = {}
-            for i, raw_text in enumerate(data.get("text", [])):
-                word = str(raw_text or "").strip()
-                if not word:
-                    continue
-                try:
-                    conf = float(data.get("conf", ["-1"] * len(data.get("text", [])))[i])
-                except Exception:
-                    conf = -1.0
-                item = {
-                    "text": word,
-                    "left": int(data.get("left", [0])[i]),
-                    "top": int(data.get("top", [0])[i]),
-                    "width": int(data.get("width", [0])[i]),
-                    "height": int(data.get("height", [0])[i]),
-                    "conf": conf,
-                    "block_num": int(data.get("block_num", [0])[i]),
-                    "par_num": int(data.get("par_num", [0])[i]),
-                    "line_num": int(data.get("line_num", [0])[i]),
-                }
-                words.append(item)
-                line_key = (item["block_num"], item["par_num"], item["line_num"])
-                grouped_text.setdefault(line_key, []).append(item)
-
-            text_lines = []
-            for _key, line_words in sorted(grouped_text.items(), key=lambda pair: pair[0]):
-                line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
-                text_lines.append(" ".join(item["text"] for item in line_words))
-            text = "\n".join(text_lines)
-            if _usable_text(text):
-                return text, words, lang
         except Exception as exc:
-            errors.append(f"{lang}: {exc}")
+            errors.append(f"full/{mode}/{config}: {exc}")
 
-    if errors:
-        raise RuntimeError(
-            "OCR could not run. Tesseract may be missing or language data may "
-            "not be installed. Details: " + " | ".join(errors)
+    # Region OCR is important for wide artwork labels. The small variable-data
+    # block often becomes much easier for Tesseract when surrounding graphics
+    # are removed. We therefore OCR four overlapping quadrants plus a broad
+    # lower-page strip. All crops are enlarged before OCR and then mapped back
+    # into the original full-page coordinate system.
+    width, height = image.size
+    x_mid = int(width * 0.50)
+    y_mid = int(height * 0.52)
+    x_overlap = int(width * 0.12)
+    y_overlap = int(height * 0.12)
+
+    regions = [
+        # left, top, right, bottom
+        (0, 0, min(width, x_mid + x_overlap), min(height, y_mid + y_overlap)),
+        (max(0, x_mid - x_overlap), 0, width, min(height, y_mid + y_overlap)),
+        (0, max(0, y_mid - y_overlap), min(width, x_mid + x_overlap), height),
+        (max(0, x_mid - x_overlap), max(0, y_mid - y_overlap), width, height),
+        (0, int(height * 0.45), width, height),
+    ]
+
+    for region_index, (left, top, right, bottom) in enumerate(regions):
+        if right <= left or bottom <= top:
+            continue
+
+        crop = image.crop((left, top, right, bottom))
+
+        scale = 1.65
+        enlarged = crop.resize(
+            (
+                max(1, int(crop.width * scale)),
+                max(1, int(crop.height * scale)),
+            ),
+            Image.Resampling.LANCZOS,
         )
-    return "", [], ""
+
+        for mode, config in (
+            ("normal", "--psm 11"),
+            ("contrast", "--psm 11"),
+        ):
+            try:
+                variant = _prepare_ocr_variant(enlarged, mode)
+                all_words.extend(
+                    _tesseract_data_pass(
+                        variant,
+                        lang="eng",
+                        config=config,
+                        offset_x=left,
+                        offset_y=top,
+                        scale_back=scale,
+                    )
+                )
+            except Exception as exc:
+                errors.append(
+                    f"region/{region_index}/{mode}/{config}: {exc}"
+                )
+
+    words = _deduplicate_ocr_words(all_words)
+
+    # If English gave us nothing useful, try the broader language set once.
+    text = _ocr_words_to_text(words)
+    if not _usable_text(text):
+        try:
+            broader_words = []
+            for mode, config in (
+                ("normal", "--psm 6"),
+                ("contrast", "--psm 11"),
+            ):
+                variant = _prepare_ocr_variant(image, mode)
+                broader_words.extend(
+                    _tesseract_data_pass(
+                        variant,
+                        lang="eng+fra+spa",
+                        config=config,
+                    )
+                )
+
+            words = _deduplicate_ocr_words(broader_words)
+            text = _ocr_words_to_text(words)
+            if text:
+                selected_lang = "eng+fra+spa"
+        except Exception as exc:
+            errors.append(f"eng+fra+spa: {exc}")
+
+    if not text:
+        if errors:
+            raise RuntimeError(
+                "OCR could not produce usable text. Details: "
+                + " | ".join(errors[:10])
+            )
+        return "", [], selected_lang
+
+    return text, words, selected_lang
 
 
 def _ocr_image(image):
@@ -559,9 +794,12 @@ def _ocr_image(image):
 
 
 def _render_pdf_page(page):
+    # Higher internal resolution is intentional. The displayed visual image is
+    # scaled down separately in Streamlit, so this improves OCR without making
+    # the screen image unnecessarily large.
     pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(2.5, 2.5),
-        alpha=False
+        matrix=fitz.Matrix(8.0, 8.0),
+        alpha=False,
     )
     return Image.open(
         io.BytesIO(pixmap.tobytes("png"))
@@ -683,6 +921,74 @@ def extract_output_pages(file):
 # VISUAL ARTWORK HIGHLIGHTING
 # =========================================================
 
+# =========================================================
+# VISUAL ARTWORK HIGHLIGHTING
+# =========================================================
+
+VISUAL_FIELD_PALETTE = [
+    (30, 136, 229),
+    (156, 39, 176),
+    (0, 150, 136),
+    (255, 152, 0),
+    (76, 175, 80),
+    (233, 30, 99),
+    (121, 85, 72),
+    (63, 81, 181),
+    (0, 188, 212),
+    (255, 193, 7),
+    (244, 67, 54),
+    (67, 160, 71),
+    (94, 53, 177),
+    (3, 169, 244),
+    (255, 87, 34),
+    (0, 121, 107),
+    (117, 117, 117),
+    (205, 92, 92),
+    (46, 125, 50),
+    (123, 31, 162),
+    (2, 119, 189),
+    (239, 108, 0),
+    (0, 105, 92),
+    (173, 20, 87),
+]
+
+
+def _field_visual_color(field_name):
+    """Give every field a deterministic, reusable annotation color."""
+    digest = hashlib.md5(
+        str(field_name).encode("utf-8", errors="ignore")
+    ).hexdigest()
+    index = int(digest[:8], 16) % len(VISUAL_FIELD_PALETTE)
+    return VISUAL_FIELD_PALETTE[index]
+
+
+def _load_visual_font(size):
+    size = max(12, int(size))
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ]
+
+    for font_path in candidates:
+        try:
+            return ImageFont.truetype(font_path, size=size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+def _wrap_annotation(text, max_chars=30):
+    return "\n".join(
+        textwrap.wrap(
+            str(text),
+            width=max_chars,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+    )
+
+
 def _visual_norm(text):
     if text is None:
         return ""
@@ -697,128 +1003,502 @@ def _word_text_norm(text):
     return value.replace(" ", "")
 
 
-def _find_word_boxes_for_target(page, target):
-    """Find OCR word rectangles corresponding to a report's PDF OUTPUT value."""
+def _find_word_boxes_for_target(page, target, field_name=""):
+    """
+    Find OCR rectangles for a report value.
+
+    The OCR passes use several segmentation modes, so Tesseract's internal
+    block/line IDs are not reliable after the results are merged. Visual
+    matching therefore uses the physical coordinates of OCR words instead.
+    """
     target_norm = _visual_norm(target)
     if not target_norm or target_norm in {"not found", "—", "-"}:
         return []
 
-    words = [w for w in page.get("ocr_words", []) if str(w.get("text", "")).strip()]
+    words = [
+        w for w in page.get("ocr_words", [])
+        if str(w.get("text", "")).strip()
+    ]
     if not words:
         return []
 
-    # Group OCR words by OCR line, preserving page order.
-    grouped = {}
-    for word in words:
-        key = (
-            word.get("block_num", 0),
-            word.get("par_num", 0),
-            word.get("line_num", 0),
+    def word_center_y(word):
+        return int(word.get("top", 0)) + max(
+            1, int(word.get("height", 1))
+        ) / 2
+
+    ordered = sorted(
+        words,
+        key=lambda item: (
+            word_center_y(item),
+            int(item.get("left", 0)),
+        ),
+    )
+
+    # Build physical OCR lines from Y positions rather than OCR block IDs.
+    physical_lines = []
+    current = []
+    current_y = None
+    current_height = 0
+
+    for word in ordered:
+        center_y = word_center_y(word)
+        height = max(1, int(word.get("height", 1)))
+
+        if current_y is None:
+            current = [word]
+            current_y = center_y
+            current_height = height
+            continue
+
+        tolerance = max(
+            5,
+            int(max(current_height, height) * 0.85),
         )
-        grouped.setdefault(key, []).append(word)
 
-    target_tokens = target_norm.split()
-    matches = []
+        if abs(center_y - current_y) <= tolerance:
+            current.append(word)
+            current_y = (
+                current_y * (len(current) - 1) + center_y
+            ) / len(current)
+            current_height = max(current_height, height)
+        else:
+            current.sort(
+                key=lambda item: int(item.get("left", 0))
+            )
+            physical_lines.append(current)
+            current = [word]
+            current_y = center_y
+            current_height = height
 
-    for line_words in grouped.values():
-        line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
-        normalized_words = [_visual_norm(item["text"]) for item in line_words]
+    if current:
+        current.sort(
+            key=lambda item: int(item.get("left", 0))
+        )
+        physical_lines.append(current)
 
-        # Exact contiguous token-window search.
+    def build_box(group):
+        if not group:
+            return None
+
+        left = min(int(w.get("left", 0)) for w in group)
+        top = min(int(w.get("top", 0)) for w in group)
+        right = max(
+            int(w.get("left", 0)) + int(w.get("width", 0))
+            for w in group
+        )
+        bottom = max(
+            int(w.get("top", 0)) + int(w.get("height", 0))
+            for w in group
+        )
+
+        if right <= left or bottom <= top:
+            return None
+
+        return (left, top, right, bottom)
+
+    # ---------------------------------------------------------
+    # 1. Exact contiguous match on physical OCR lines.
+    # ---------------------------------------------------------
+    for line_words in physical_lines:
+        normalized_words = [
+            _visual_norm(word["text"])
+            for word in line_words
+        ]
+
         for start in range(len(line_words)):
             joined = ""
+
             for end in range(start, len(line_words)):
                 token = normalized_words[end]
                 if not token:
                     continue
+
                 joined = (joined + " " + token).strip()
-                if joined == target_norm or joined.replace(" ", "") == target_norm.replace(" ", ""):
-                    matches.append(line_words[start:end + 1])
-                    break
-                if len(joined.replace(" ", "")) > len(target_norm.replace(" ", "")) + 4:
+
+                if (
+                    joined == target_norm
+                    or joined.replace(" ", "")
+                    == target_norm.replace(" ", "")
+                ):
+                    box = build_box(line_words[start:end + 1])
+                    if box:
+                        return [box]
+
+                if len(joined.replace(" ", "")) > len(
+                    target_norm.replace(" ", "")
+                ) + 8:
                     break
 
-        # Single-token fallback.
-        compact_target = target_norm.replace(" ", "")
-        for word in line_words:
-            compact_word = _word_text_norm(word["text"])
-            if compact_word == compact_target or compact_target in compact_word:
-                matches.append([word])
+    # ---------------------------------------------------------
+    # 2. Exact match across neighbouring physical lines.
+    # ---------------------------------------------------------
+    compact_target = target_norm.replace(" ", "")
 
-    if not matches:
-        # Search across neighbouring OCR lines for multi-line output values.
-        ordered = []
-        for key, line_words in sorted(grouped.items(), key=lambda item: item[0]):
-            line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
-            ordered.extend(line_words)
-        compact_target = target_norm.replace(" ", "")
-        for start in range(len(ordered)):
-            current = ""
-            selected = []
-            for end in range(start, min(len(ordered), start + 15)):
-                token = _word_text_norm(ordered[end]["text"])
+    for start_line in range(len(physical_lines)):
+        selected = []
+        combined = ""
+
+        for end_line in range(
+            start_line,
+            min(len(physical_lines), start_line + 4),
+        ):
+            for word in physical_lines[end_line]:
+                token = _word_text_norm(word["text"])
                 if not token:
                     continue
-                current += token
-                selected.append(ordered[end])
-                if current == compact_target:
-                    matches.append(selected)
-                    break
-                if len(current) > len(compact_target) + 4:
+
+                combined += token
+                selected.append(word)
+
+                if combined == compact_target:
+                    box = build_box(selected)
+                    if box:
+                        return [box]
+
+                if len(combined) > len(compact_target) + 8:
                     break
 
-    # Convert groups to rectangles and deduplicate.
-    boxes = []
-    seen = set()
-    for group in matches:
-        if not group:
-            continue
-        left = min(int(w.get("left", 0)) for w in group)
-        top = min(int(w.get("top", 0)) for w in group)
-        right = max(int(w.get("left", 0)) + int(w.get("width", 0)) for w in group)
-        bottom = max(int(w.get("top", 0)) + int(w.get("height", 0)) for w in group)
-        key = (left, top, right, bottom)
-        if right <= left or bottom <= top or key in seen:
-            continue
-        seen.add(key)
-        boxes.append(key)
-    return boxes
+            if len(combined) > len(compact_target) + 8:
+                break
+
+    # ---------------------------------------------------------
+    # 3. Token-based fallback.
+    #
+    # Useful when OCR inserts/reorders words in dense artwork while
+    # still recognizing the important words individually.
+    # ---------------------------------------------------------
+    from difflib import SequenceMatcher
+
+    target_tokens = [
+        token for token in target_norm.split()
+        if (
+            len(token) >= 3
+            or token.isdigit()
+        )
+    ]
+
+    # Do not use extremely generic tokens by themselves.
+    if field_name:
+        field_type = get_field_type(field_name)
+    else:
+        field_type = ""
+
+    stop_tokens = {
+        "the", "and", "with", "from", "made", "only",
+        "wash", "not", "dry", "do",
+    }
+
+    token_candidates = []
+
+    for target_token in target_tokens:
+        candidates = []
+
+        for word in ordered:
+            word_norm = _visual_norm(word["text"])
+            compact_word = word_norm.replace(" ", "")
+
+            if not word_norm:
+                continue
+
+            exact = (
+                word_norm == target_token
+                or compact_word == target_token.replace(" ", "")
+            )
+
+            if exact:
+                similarity = 1.0
+            elif len(target_token) >= 4:
+                similarity = SequenceMatcher(
+                    None,
+                    target_token,
+                    compact_word,
+                    autojunk=False,
+                ).ratio()
+            else:
+                similarity = 0.0
+
+            if similarity >= 0.78:
+                candidates.append((similarity, word))
+
+        if candidates:
+            candidates.sort(
+                key=lambda pair: (
+                    -pair[0],
+                    int(pair[1].get("top", 0)),
+                    int(pair[1].get("left", 0)),
+                )
+            )
+            token_candidates.append(
+                (target_token, candidates[:12])
+            )
+
+    if not token_candidates:
+        return []
+
+    # Find a spatial cluster that contains the largest number of expected
+    # tokens. This prevents a word being highlighted from an unrelated area.
+    clusters = []
+
+    for target_token, candidates in token_candidates:
+        for similarity, word in candidates:
+            cy = word_center_y(word)
+            cx = (
+                int(word.get("left", 0))
+                + max(1, int(word.get("width", 1))) / 2
+            )
+
+            clusters.append({
+                "target": target_token,
+                "similarity": similarity,
+                "word": word,
+                "cx": cx,
+                "cy": cy,
+            })
+
+    if not clusters:
+        return []
+
+    best_cluster = None
+
+    for anchor in clusters:
+        members = []
+
+        for candidate in clusters:
+            # A single field can legitimately cover a compact multi-line block.
+            distance_x = abs(candidate["cx"] - anchor["cx"])
+            distance_y = abs(candidate["cy"] - anchor["cy"])
+
+            y_limit = 120 if field_type == "CARE" else 58
+
+            if (
+                distance_x <= max(260, page.get("image_width", 1000) * 0.18)
+                and distance_y <= y_limit
+            ):
+                members.append(candidate)
+
+        unique_targets = {}
+        for member in members:
+            token = member["target"]
+            previous = unique_targets.get(token)
+
+            if previous is None or member["similarity"] > previous["similarity"]:
+                unique_targets[token] = member
+
+        score = (
+            len(unique_targets),
+            sum(
+                member["similarity"]
+                for member in unique_targets.values()
+            ),
+        )
+
+        if best_cluster is None or score > best_cluster["score"]:
+            best_cluster = {
+                "score": score,
+                "members": list(unique_targets.values()),
+            }
+
+    if not best_cluster:
+        return []
+
+    expected_count = max(1, len(target_tokens))
+
+    # A field with multiple meaningful expected tokens should not be mapped to
+    # a random single OCR word unless that field itself is one token.
+    if (
+        expected_count >= 2
+        and best_cluster["score"][0] < min(2, expected_count)
+    ):
+        return []
+
+    selected_words = [
+        member["word"]
+        for member in best_cluster["members"]
+    ]
+
+    box = build_box(selected_words)
+    return [box] if box else []
 
 
 def build_highlighted_page_image(page, page_report):
-    """Return the complete artwork page with PASS/FAIL highlight overlays."""
+    """
+    Return the complete artwork page with field-specific colored highlights.
+
+    Every independently compared field gets its own deterministic color.
+    The annotation reads:
+        <Excel field name> • PASS
+    or:
+        <Excel field name> • FAIL
+    """
     image_bytes = page.get("image_bytes")
     if not image_bytes:
         return None
 
-    base = Image.open(BytesIO(image_bytes)).convert("RGBA")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    base = Image.open(
+        BytesIO(image_bytes)
+    ).convert("RGBA")
+
+    overlay = Image.new(
+        "RGBA",
+        base.size,
+        (0, 0, 0, 0),
+    )
     draw = ImageDraw.Draw(overlay)
 
     if page_report is not None and not page_report.empty:
-        for _, row in page_report.iterrows():
-            status = str(row.get("STATUS", ""))
-            if status not in {"PASS", "FAIL"}:
+        rows = page_report[
+            page_report["STATUS"].isin(["PASS", "FAIL"])
+        ].copy()
+
+        # Draw each field independently. Sorting by FIELD makes the visual
+        # result deterministic across reruns.
+        sort_columns = ["FIELD"]
+        if "FIELD NO" in rows.columns:
+            sort_columns.append("FIELD NO")
+
+        rows = rows.sort_values(
+            by=sort_columns,
+            kind="stable",
+        )
+
+        font_size = max(
+            14,
+            min(
+                34,
+                int(min(base.size) * 0.018),
+            ),
+        )
+        font = _load_visual_font(font_size)
+
+        for _, row in rows.iterrows():
+            field_name = str(row.get("FIELD", "") or "").strip()
+            status = str(row.get("STATUS", "") or "").strip()
+            target = str(row.get("PDF OUTPUT", "") or "").strip()
+
+            if not field_name or status not in {"PASS", "FAIL"}:
                 continue
-            target = row.get("PDF OUTPUT", "")
-            boxes = _find_word_boxes_for_target(page, target)
-            fill = (35, 134, 54, 75) if status == "PASS" else (218, 54, 51, 95)
-            outline = (35, 134, 54, 220) if status == "PASS" else (218, 54, 51, 240)
-            for left, top, right, bottom in boxes:
-                pad = max(3, int(min(base.size) * 0.004))
+
+            boxes = _find_word_boxes_for_target(
+                page,
+                target,
+                field_name,
+            )
+            if not boxes:
+                continue
+
+            rgb = _field_visual_color(field_name)
+
+            fill = (
+                int(rgb[0]),
+                int(rgb[1]),
+                int(rgb[2]),
+                58 if status == "PASS" else 78,
+            )
+            outline = (
+                int(rgb[0]),
+                int(rgb[1]),
+                int(rgb[2]),
+                235,
+            )
+
+            label_text = _wrap_annotation(
+                f"{field_name} • {status}",
+                max_chars=34,
+            )
+
+            label_bbox = draw.multiline_textbbox(
+                (0, 0),
+                label_text,
+                font=font,
+                spacing=2,
+            )
+            label_width = label_bbox[2] - label_bbox[0] + 14
+            label_height = label_bbox[3] - label_bbox[1] + 10
+
+            for box_index, (left, top, right, bottom) in enumerate(boxes):
+                pad = max(
+                    4,
+                    int(min(base.size) * 0.0035),
+                )
+
                 left = max(0, left - pad)
                 top = max(0, top - pad)
                 right = min(base.width - 1, right + pad)
                 bottom = min(base.height - 1, bottom + pad)
+
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
-                    radius=max(3, pad),
+                    radius=max(4, pad),
                     fill=fill,
                     outline=outline,
                     width=max(2, pad // 2),
                 )
 
-    return Image.alpha_composite(base, overlay).convert("RGB")
+                # Put the field annotation immediately above the matched text.
+                label_left = left
+                label_top = top - label_height - 4
+
+                if label_top < 0:
+                    label_top = min(
+                        base.height - label_height,
+                        bottom + 4,
+                    )
+
+                label_left = min(
+                    max(0, label_left),
+                    max(0, base.width - label_width),
+                )
+
+                label_right = min(
+                    base.width,
+                    label_left + label_width,
+                )
+                label_bottom = min(
+                    base.height,
+                    label_top + label_height,
+                )
+
+                # Slightly translucent white background helps the annotation
+                # remain readable without obscuring the complete artwork.
+                draw.rounded_rectangle(
+                    (
+                        label_left,
+                        label_top,
+                        label_right,
+                        label_bottom,
+                    ),
+                    radius=5,
+                    fill=(
+                        255,
+                        255,
+                        255,
+                        235,
+                    ),
+                    outline=outline,
+                    width=2,
+                )
+
+                draw.multiline_text(
+                    (
+                        label_left + 7,
+                        label_top + 4,
+                    ),
+                    label_text,
+                    fill=(
+                        rgb[0],
+                        rgb[1],
+                        rgb[2],
+                        255,
+                    ),
+                    font=font,
+                    spacing=2,
+                )
+
+    return Image.alpha_composite(
+        base,
+        overlay,
+    ).convert("RGB")
 
 
 def _visual_image_bytes(image):
@@ -3252,15 +3932,40 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
+                "Each compared field is highlighted in a different color and "
+                "annotated directly on the full artwork as FIELD • PASS/FAIL."
             )
+
+            # Compact color legend for the field-specific annotations.
+            legend_items = []
+            for field in sorted(set(
+                str(value)
+                for value in report_fields
+                if str(value).strip()
+            )):
+                rgb = _field_visual_color(field)
+                legend_items.append(
+                    f'<span style="display:inline-flex;align-items:center;'
+                    f'margin-right:14px;margin-bottom:6px;">'
+                    f'<span style="width:12px;height:12px;border-radius:3px;'
+                    f'background:rgb({rgb[0]},{rgb[1]},{rgb[2]});'
+                    f'display:inline-block;margin-right:5px;"></span>'
+                    f'{field}</span>'
+                )
+
+            if legend_items:
+                st.markdown(
+                    "".join(legend_items),
+                    unsafe_allow_html=True
+                )
+
             for page in visual_pages:
                 page_num = page.get("page")
                 page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
                 highlighted = build_highlighted_page_image(page, page_report)
                 if highlighted is not None:
                     st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width="stretch")
+                    st.image(highlighted, width=750)
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
