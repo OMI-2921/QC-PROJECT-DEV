@@ -2425,15 +2425,13 @@ def build_report(
 
     for page_index, page in enumerate(pdf_pages):
 
-        # Use explicit page → data-row mapping when supplied. Otherwise preserve
-        # the legacy positional behavior for callers that do not provide one.
         page_number = int(page.get("page", page_index + 1))
         if page_row_mapping and page_number in page_row_mapping:
             excel_index = int(page_row_mapping[page_number])
         else:
             excel_index = page_index
 
-        if excel_index < 0 or excel_index >= len(df):
+        if excel_index >= len(df):
             for field in selected_fields:
                 results.append({
                     "FIELD NO": field_no,
@@ -2778,642 +2776,346 @@ def main():
 
     _apply_tool_css()
 
-    # =========================================================
-    # TOOL 1 SESSION STATE
-    # =========================================================
     if "of_reset_id" not in st.session_state:
         st.session_state["of_reset_id"] = 0
-
     if "of_report" not in st.session_state:
         st.session_state["of_report"] = None
-
     if "of_visual_pages" not in st.session_state:
         st.session_state["of_visual_pages"] = None
-
     if "of_auto_detected_fields" not in st.session_state:
         st.session_state["of_auto_detected_fields"] = []
-
     if "of_auto_detect_key" not in st.session_state:
         st.session_state["of_auto_detect_key"] = None
-
     if "of_auto_output_pages" not in st.session_state:
         st.session_state["of_auto_output_pages"] = None
+    if "of_page_row_mapping" not in st.session_state:
+        st.session_state["of_page_row_mapping"] = {}
+    if "of_selected_pdf_pages" not in st.session_state:
+        st.session_state["of_selected_pdf_pages"] = []
 
-    # =========================================================
-    # TITLE
-    # =========================================================
-    st.markdown(
-        '<div class="main-title">🔍 PDF Proofreader</div>',
-        unsafe_allow_html=True
-    )
+    st.markdown('<div class="main-title">🔍 PDF Proofreader</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-title">Compare selected variable Order Form fields against PDF artwork.</div>', unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="sub-title">'
-        'Compare selected variable Order Form fields against PDF artwork.'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-    # =========================================================
-    # TOOL NAVIGATION
-    # =========================================================
     nav_left, nav_right = st.columns([1, 1])
-
     with nav_left:
         if st.button("← HOME", key="of_back_home", width="stretch"):
+            for key in ["of_report","of_visual_pages","of_auto_detected_fields","of_auto_detect_key","of_auto_output_pages","of_page_row_mapping","of_selected_pdf_pages"]:
+                st.session_state[key] = None if key in {"of_report","of_visual_pages","of_auto_detect_key","of_auto_output_pages"} else ([] if key == "of_auto_detected_fields" else {})
             st.session_state["selected_tool"] = None
-            st.session_state["of_report"] = None
-            st.session_state["of_visual_pages"] = None
-            st.session_state["of_auto_detected_fields"] = []
-            st.session_state["of_auto_detect_key"] = None
-            st.session_state["of_auto_output_pages"] = None
             st.rerun()
-
     with nav_right:
-        if st.button(
-            "🆕 NEW START",
-            key="of_new_start",
-            width="stretch"
-        ):
+        if st.button("🆕 NEW START", key="of_new_start", width="stretch"):
             st.session_state["of_reset_id"] += 1
             st.session_state["of_report"] = None
             st.session_state["of_visual_pages"] = None
             st.session_state["of_auto_detected_fields"] = []
             st.session_state["of_auto_detect_key"] = None
             st.session_state["of_auto_output_pages"] = None
+            st.session_state["of_page_row_mapping"] = {}
+            st.session_state["of_selected_pdf_pages"] = []
             st.rerun()
 
-    # =========================================================
-    # PRODUCT TYPE
-    # =========================================================
     product_type = st.selectbox(
         "Select Product Type",
-        options=[
-            "----- SELECT -----",
-            "PFL",
-            "HTL",
-            "Other"
-        ],
+        ["----- SELECT -----", "PFL", "HTL", "Other"],
         index=0,
         key=f"of_product_type_{st.session_state['of_reset_id']}",
-        help=(
-            "PFL = panelled artwork where variable data may continue "
-            "across panels. HTL / Other = standard continuous-data comparison."
-        )
+        help="PFL = panelled artwork where variable data may continue across panels. HTL / Other = standard continuous-data comparison."
     )
-
     if product_type == "----- SELECT -----":
-        st.info(
-            "Please select a Product Type before starting the comparison."
-        )
+        st.info("Please select a Product Type before starting the comparison.")
 
-    # =========================================================
-    # UPLOAD AREA
-    # =========================================================
     left_column, right_column = st.columns(2)
-
     with left_column:
-        st.markdown(
-            '<div class="section-title">📊 Order Form</div>',
-            unsafe_allow_html=True
-        )
-
-        excel_file = st.file_uploader(
-            "Upload Excel Order Form",
-            type=["xlsx", "xls"],
-            key=f"excel_upload_{st.session_state['of_reset_id']}"
-        )
-
+        st.markdown('<div class="section-title">📊 Order Form</div>', unsafe_allow_html=True)
+        excel_file = st.file_uploader("Upload Excel Order Form", type=["xlsx", "xls"], key=f"excel_upload_{st.session_state['of_reset_id']}")
     with right_column:
-        st.markdown(
-            '<div class="section-title">📄 Output Artwork</div>',
-            unsafe_allow_html=True
-        )
+        st.markdown('<div class="section-title">📄 Output Artwork</div>', unsafe_allow_html=True)
+        output_file = st.file_uploader("Upload Output Artwork", type=["pdf", "jpg", "jpeg", "png"], key=f"output_upload_{st.session_state['of_reset_id']}")
 
-        output_file = st.file_uploader(
-            "Upload Output Artwork",
-            type=["pdf", "jpg", "jpeg", "png"],
-            key=f"output_upload_{st.session_state['of_reset_id']}"
-        )
-
-    # =========================================================
-    # LOAD ORDER FORM
-    # =========================================================
     df = None
-
     if excel_file:
         try:
             df = load_excel(excel_file)
         except Exception as error:
-            st.error(
-                f"Unable to read the Excel Order Form: {error}"
-            )
+            st.error(f"Unable to read the Excel Order Form: {error}")
             return
 
-    # =========================================================
-    # COMPARISON METHOD
-    # =========================================================
-    comparison_method = None
-    selected_fields = []
-
-    if excel_file and output_file:
-        st.divider()
-
-        st.markdown(
-            '<div class="section-title">⚙️ Comparison Method</div>',
-            unsafe_allow_html=True
-        )
-
-        st.caption(
-            "Choose how the Order Form data should be matched to the Output. "
-            "Nothing is selected automatically."
-        )
-
-        comparison_method = st.radio(
-            "Comparison Method",
-            options=["Auto Detect", "Select Fields"],
-            index=None,
-            horizontal=True,
-            key=f"comparison_method_{st.session_state['of_reset_id']}"
-        )
-
-        # =========================================================
-        # AUTO DETECT / MANUAL FIELD SELECTION
-        # =========================================================
-        available_fields = get_available_fields(df)
-
-        if comparison_method == "Auto Detect":
-            # Auto Detect runs after the user has selected the artwork pages and
-            # row mapping below. Keep the field selector visible here; it will be
-            # populated after Auto Detect runs at Compare time.
-            detected_fields = st.session_state.get("of_auto_detected_fields", [])
-
-            st.markdown(
-                '<div class="section-title">🤖 Auto Detected Fields</div>',
-                unsafe_allow_html=True
-            )
-            st.caption(
-                "Auto Detect will propose populated fields. Review, remove, or add fields before comparison."
-            )
-
-            default_auto = [field for field in detected_fields if field in available_fields]
-            selected_fields = st.multiselect(
-                "Review detected fields",
-                options=available_fields,
-                default=default_auto,
-                placeholder="Type to search fields...",
-                label_visibility="collapsed",
-                key=f"auto_selected_fields_{st.session_state['of_reset_id']}"
-            )
-
-            if selected_fields:
-                st.caption("Selected fields: " + ", ".join(selected_fields))
-            else:
-                st.info("Click Compare to run Auto Detect, or add populated fields from the dropdown.")
-
-        else:
-            st.markdown(
-                '<div class="section-title">Select Variable Fields to Validate</div>',
-                unsafe_allow_html=True
-            )
-            st.caption(
-                "Only populated Order Form fields are shown. Type directly inside the dropdown to search."
-            )
-
-            selected_fields = st.multiselect(
-                "Select the fields from your Order Form",
-                options=available_fields,
-                default=st.session_state.get(
-                    f"selected_fields_{st.session_state['of_reset_id']}", []
-                ),
-                placeholder="Type to search fields...",
-                label_visibility="collapsed",
-                key=f"selected_fields_{st.session_state['of_reset_id']}"
-            )
-
-            if selected_fields:
-                preview_rows = []
-                for field in selected_fields:
-                    values = []
-                    for value in df[field].tolist():
-                        if is_blank_value(value):
-                            continue
-                        values.append(str(value).strip())
-                    preview_rows.append({
-                        "Excel Field": field,
-                        "Values": len(values),
-                        "Preview": " | ".join(values[:3])
-                    })
-
-                with st.expander("🔎 Preview Selected Fields"):
-                    st.dataframe(
-                        pd.DataFrame(preview_rows),
-                        width="stretch",
-                        hide_index=True
-                    )
-            else:
-                st.info("Select at least one Order Form field to continue.")
-
-    # =========================================================
-    # FILE INFORMATION + PAGE SELECTION / ROW MAPPING
-    # =========================================================
-    page_selection_ready = False
     selected_pdf_pages = []
     page_row_mapping = {}
+    page_selection_ready = False
     output_page_count = 0
 
     if excel_file and output_file:
         try:
             output_page_count = get_output_page_count(output_file)
         except Exception as error:
-            st.warning(f"Unable to determine output page count: {error}")
+            st.error(f"Unable to determine output page count: {error}")
 
-        st.markdown(
-            '<div class="section-title">📌 File Information</div>',
-            unsafe_allow_html=True
-        )
-
+        st.divider()
+        st.markdown('<div class="section-title">📌 File Information</div>', unsafe_allow_html=True)
         info1, info2, info3 = st.columns(3)
-
         with info1:
             st.metric("Excel Data Rows", len(df))
-
         with info2:
             st.metric("Output Pages", output_page_count)
-
         with info3:
-            extension = str(output_file.name).split(".")[-1].upper()
-            st.metric("Output Type", extension)
+            st.metric("Output Type", str(output_file.name).split(".")[-1].upper())
 
-        # ---------------------------------------------------------
-        # ARTWORK PAGE SELECTION
-        # ---------------------------------------------------------
-        st.markdown(
-            '<div class="section-title">📄 Artwork Pages to Compare</div>',
-            unsafe_allow_html=True
-        )
-
-        if output_page_count <= 1:
-            selected_pdf_pages = [1] if output_page_count == 1 else []
-            st.caption("Single-page artwork detected. Page 1 will be compared.")
+        st.markdown('<div class="section-title">📄 Artwork Pages to Compare</div>', unsafe_allow_html=True)
+        if output_page_count <= 0:
+            st.error("No PDF/artwork pages could be detected.")
+        elif output_page_count == 1:
+            selected_pdf_pages = [1]
+            st.caption("Single-page artwork detected. Page 1 will be compared automatically.")
         else:
             page_mode = st.radio(
                 "Artwork page selection",
-                options=["All Pages", "Specific Page(s)"],
+                ["All Pages", "Specific Page(s)"],
                 horizontal=True,
                 index=0,
                 key=f"page_selection_mode_{st.session_state['of_reset_id']}"
             )
-
             page_options = list(range(1, output_page_count + 1))
             if page_mode == "All Pages":
                 selected_pdf_pages = page_options
             else:
+                previous_pages = [p for p in st.session_state.get("of_selected_pdf_pages", []) if p in page_options]
                 selected_pdf_pages = st.multiselect(
                     "Select PDF page number(s)",
                     options=page_options,
-                    default=[],
+                    default=previous_pages,
                     placeholder="Select page number(s)...",
                     key=f"selected_pdf_pages_{st.session_state['of_reset_id']}"
                 )
-                if selected_pdf_pages:
-                    st.caption(
-                        "Selected page(s): " + ", ".join(map(str, selected_pdf_pages))
-                    )
-                else:
+                if not selected_pdf_pages:
                     st.info("Select at least one PDF page to continue.")
 
-        # ---------------------------------------------------------
-        # PAGE → ORDER FORM ROW MAPPING
-        # ---------------------------------------------------------
         if selected_pdf_pages:
-            st.markdown(
-                '<div class="section-title">🔗 Artwork Page → Order Form Row</div>',
-                unsafe_allow_html=True
-            )
-
+            st.markdown('<div class="section-title">🔗 Artwork Page → Order Form Row</div>', unsafe_allow_html=True)
             if len(df) == 1:
-                st.caption(
-                    "Single-row Order Form detected. Every selected artwork page will automatically use Data Row 1 (Excel Row 2)."
-                )
+                st.caption("Single-row Order Form detected. Every selected artwork page automatically uses Data Row 1 (Excel Row 2).")
                 for page_number in selected_pdf_pages:
                     page_row_mapping[int(page_number)] = 0
             else:
-                st.caption(
-                    "For multiple-row Order Forms, the default is Page N → Data Row N (Excel Row N+1). You can change any mapping below."
-                )
-
+                st.caption("Default: PDF Page N → Data Row N (Excel Row N+1). You may change the row for any selected page.")
+                row_options = []
+                for row_index in range(len(df)):
+                    preview_parts = []
+                    for candidate in ("varItemCode", "Item Code", "CD_STYLE_WO_FINISH", "LBL_DESIGN_STYLE"):
+                        if candidate in df.columns and not is_blank_value(df.iloc[row_index][candidate]):
+                            preview_parts.append(str(df.iloc[row_index][candidate]).strip())
+                            if len(preview_parts) >= 2:
+                                break
+                    label = f"Data Row {row_index + 1} (Excel Row {row_index + 2})"
+                    if preview_parts:
+                        label += " — " + " | ".join(preview_parts)
+                    row_options.append((label, row_index))
+                labels = [item[0] for item in row_options]
+                label_to_index = {item[0]: item[1] for item in row_options}
                 for page_number in selected_pdf_pages:
-                    natural_index = int(page_number) - 1
-                    natural_index = natural_index if 0 <= natural_index < len(df) else None
-
-                    options = []
-                    for row_index in range(len(df)):
-                        preview_parts = []
-                        for candidate in ["varItemCode", "Item Code", "CD_STYLE_WO_FINISH", "LBL_DESIGN_STYLE"]:
-                            if candidate in df.columns and not is_blank_value(df.iloc[row_index][candidate]):
-                                preview_parts.append(str(df.iloc[row_index][candidate]).strip())
-                                if len(preview_parts) >= 2:
-                                    break
-                        preview = " | ".join(preview_parts)
-                        label = f"Data Row {row_index + 1} (Excel Row {row_index + 2})"
-                        if preview:
-                            label += f" — {preview}"
-                        options.append((label, row_index))
-
-                    label_to_index = {label: idx for label, idx in options}
-                    option_labels = list(label_to_index.keys())
-
-                    if natural_index is not None:
-                        default_label = option_labels[natural_index]
-                    else:
-                        default_label = option_labels[0]
-
-                    chosen_label = st.selectbox(
+                    natural_index = page_number - 1
+                    if not 0 <= natural_index < len(df):
+                        natural_index = 0
+                    previous_index = st.session_state.get("of_page_row_mapping", {}).get(int(page_number), natural_index)
+                    if not 0 <= previous_index < len(df):
+                        previous_index = natural_index
+                    chosen = st.selectbox(
                         f"Artwork Page {page_number} → Order Form Row",
-                        options=option_labels,
-                        index=option_labels.index(default_label),
+                        labels,
+                        index=previous_index,
                         key=f"page_row_map_{page_number}_{st.session_state['of_reset_id']}"
                     )
-                    page_row_mapping[int(page_number)] = label_to_index[chosen_label]
-
+                    page_row_mapping[int(page_number)] = label_to_index[chosen]
             page_selection_ready = True
 
+        st.session_state["of_selected_pdf_pages"] = [int(x) for x in selected_pdf_pages]
         st.session_state["of_page_row_mapping"] = page_row_mapping
-        st.session_state["of_selected_pdf_pages"] = selected_pdf_pages
 
-    # =========================================================
-    # COMPARE BUTTON
-    # Extraction and comparison start ONLY after COMPARE.
-    # =========================================================
+    comparison_method = None
+    selected_fields = []
+
+    if excel_file and output_file and page_selection_ready:
+        st.divider()
+        st.markdown('<div class="section-title">⚙️ Comparison Method</div>', unsafe_allow_html=True)
+        comparison_method = st.radio(
+            "Comparison Method",
+            ["Auto Detect", "Select Fields"],
+            index=None,
+            horizontal=True,
+            key=f"comparison_method_{st.session_state['of_reset_id']}"
+        )
+        available_fields = get_available_fields(df)
+
+        if comparison_method == "Select Fields":
+            st.markdown('<div class="section-title">Select Variable Fields to Validate</div>', unsafe_allow_html=True)
+            st.caption("Only populated Order Form fields are shown. Type directly inside the dropdown to search; no Enter key is required.")
+            previous = [field for field in st.session_state.get(f"selected_fields_{st.session_state['of_reset_id']}", []) if field in available_fields]
+            selected_fields = st.multiselect(
+                "Select the fields from your Order Form",
+                options=available_fields,
+                default=previous,
+                placeholder="Type to search fields...",
+                label_visibility="collapsed",
+                key=f"selected_fields_{st.session_state['of_reset_id']}"
+            )
+            if selected_fields:
+                preview_rows = []
+                for field in selected_fields:
+                    values = [str(value).strip() for value in df[field].tolist() if not is_blank_value(value)]
+                    preview_rows.append({"Excel Field": field, "Values": len(values), "Preview": " | ".join(values[:3])})
+                with st.expander("🔎 Preview Selected Fields"):
+                    st.dataframe(pd.DataFrame(preview_rows), width="stretch", hide_index=True)
+            else:
+                st.info("Select at least one Order Form field to continue.")
+
+        elif comparison_method == "Auto Detect":
+            st.markdown('<div class="section-title">🤖 Auto Detected Fields</div>', unsafe_allow_html=True)
+            st.caption("Auto Detect uses the same validation engine as manual selection. Review detected fields, then add/remove fields directly in the dropdown.")
+            selected_pages_key = tuple(int(x) for x in selected_pdf_pages)
+            mapping_key = tuple(sorted((int(k), int(v)) for k, v in page_row_mapping.items()))
+            auto_key = (
+                str(getattr(excel_file, "name", "")), int(getattr(excel_file, "size", 0)),
+                str(getattr(output_file, "name", "")), int(getattr(output_file, "size", 0)),
+                product_type, selected_pages_key, mapping_key
+            )
+            if st.session_state.get("of_auto_detect_key") != auto_key:
+                try:
+                    with st.spinner("Auto Detect is reading the selected artwork page(s) with OCR..."):
+                        all_pages = extract_output_pages(output_file)
+                        selected_set = set(selected_pages_key)
+                        auto_pages = [page for page in all_pages if int(page.get("page", 0)) in selected_set]
+                        detected_fields = auto_detect_fields(df, auto_pages, product_type, page_row_mapping=page_row_mapping)
+                    st.session_state["of_auto_detected_fields"] = detected_fields
+                    st.session_state["of_auto_output_pages"] = auto_pages
+                    st.session_state["of_auto_detect_key"] = auto_key
+                except Exception as error:
+                    st.error(f"Unable to run Auto Detect: {type(error).__name__}: {error}")
+                    with st.expander("Technical error details", expanded=False):
+                        import traceback
+                        st.code(traceback.format_exc())
+            detected_fields = [field for field in st.session_state.get("of_auto_detected_fields", []) if field in available_fields]
+            selected_fields = st.multiselect(
+                "Review detected fields",
+                options=available_fields,
+                default=detected_fields,
+                placeholder="Type to search or add fields...",
+                label_visibility="collapsed",
+                key=f"auto_selected_fields_{st.session_state['of_reset_id']}"
+            )
+            if selected_fields:
+                st.caption("Selected fields: " + ", ".join(selected_fields))
+            else:
+                st.info("No fields are currently selected. Add populated fields from the dropdown.")
+
     if excel_file and output_file:
         st.markdown("<br>", unsafe_allow_html=True)
-
         compare_ready = (
             comparison_method is not None
-            and (
-                comparison_method == "Auto Detect"
-                or bool(selected_fields)
-            )
+            and bool(selected_fields)
             and product_type != "----- SELECT -----"
             and page_selection_ready
         )
-
-        if st.button(
-            "🔍  COMPARE & PROOFREAD",
-            width="stretch",
-            key=f"of_compare_button_{st.session_state['of_reset_id']}",
-            disabled=not compare_ready
-        ):
+        if st.button("🔍  COMPARE & PROOFREAD", width="stretch", key=f"of_compare_button_{st.session_state['of_reset_id']}", disabled=not compare_ready):
             try:
-                with st.spinner(
-                    "Reading output and preparing comparison..."
-                ):
-                    # OCR the complete artwork once, then restrict comparison to
-                    # the pages selected by the user. Page numbers remain the real
-                    # PDF page numbers, so Page 5 never becomes Page 1 internally.
-                    if (
-                        comparison_method == "Auto Detect"
-                        and st.session_state.get("of_auto_output_pages")
-                    ):
+                with st.spinner("Reading output and preparing comparison..."):
+                    if comparison_method == "Auto Detect" and st.session_state.get("of_auto_output_pages"):
                         all_output_pages = st.session_state["of_auto_output_pages"]
                     else:
                         all_output_pages = extract_output_pages(output_file)
-
-                    if not all_output_pages:
-                        raise ValueError("No readable output pages were detected.")
-
-                    selected_page_numbers = [
-                        int(n) for n in st.session_state.get("of_selected_pdf_pages", [])
-                    ]
-                    if not selected_page_numbers:
-                        raise ValueError("No PDF pages are selected for comparison.")
-
-                    output_pages = [
-                        page for page in all_output_pages
-                        if int(page.get("page", 0)) in set(selected_page_numbers)
-                    ]
-
+                    selected_numbers = set(int(n) for n in st.session_state.get("of_selected_pdf_pages", []))
+                    output_pages = [page for page in all_output_pages if int(page.get("page", 0)) in selected_numbers]
                     if not output_pages:
                         raise ValueError("The selected PDF pages could not be loaded.")
-
-                    page_row_mapping = {
-                        int(k): int(v)
-                        for k, v in st.session_state.get("of_page_row_mapping", {}).items()
-                    }
-
+                    page_row_mapping = {int(k): int(v) for k, v in st.session_state.get("of_page_row_mapping", {}).items()}
                     if comparison_method == "Auto Detect":
-                        detected_fields = auto_detect_fields(
-                            df,
-                            output_pages,
-                            product_type,
-                            page_row_mapping=page_row_mapping
-                        )
-                        st.session_state["of_auto_detected_fields"] = detected_fields
-
-                        # Re-read the current user selection after Auto Detect so
-                        # their editable selection is honored for the actual check.
-                        selected_fields = [
-                            field for field in st.session_state.get(
-                                f"auto_selected_fields_{st.session_state['of_reset_id']}",
-                                []
-                            )
-                            if field in get_available_fields(df)
-                        ]
-
-                        if not selected_fields:
-                            selected_fields = detected_fields
-
+                        available_fields = get_available_fields(df)
+                        selected_fields = [field for field in st.session_state.get(f"auto_selected_fields_{st.session_state['of_reset_id']}", []) if field in available_fields]
                     if not selected_fields:
                         raise ValueError("No fields are selected for comparison.")
-
-                    st.session_state["of_report"] = build_report(
-                        df,
-                        output_pages,
-                        selected_fields,
-                        product_type,
-                        page_row_mapping=page_row_mapping
-                    )
+                    st.session_state["of_report"] = build_report(df, output_pages, selected_fields, product_type, page_row_mapping=page_row_mapping)
                     st.session_state["of_report_selected_fields"] = selected_fields
                     st.session_state["of_report_product_type"] = product_type
                     st.session_state["of_report_comparison_method"] = comparison_method
                     st.session_state["of_visual_pages"] = output_pages
-
             except Exception as error:
                 import traceback
-                st.error(
-                    f"Unable to process the Output Artwork: {type(error).__name__}: {error}"
-                )
+                st.error(f"Unable to process the Output Artwork: {type(error).__name__}: {error}")
                 with st.expander("Technical error details", expanded=True):
                     st.code(traceback.format_exc())
 
-    # =========================================================
-    # SAVED REPORT
-    # =========================================================
     report = st.session_state.get("of_report")
-
     if report is not None:
         st.divider()
-
-        st.markdown(
-            '<div class="section-title">QC Report</div>',
-            unsafe_allow_html=True
-        )
-
-        report_product_type = st.session_state.get(
-            "of_report_product_type",
-            product_type
-        )
-
-        report_method = st.session_state.get(
-            "of_report_comparison_method",
-            "Select Fields"
-        )
-
-        report_fields = st.session_state.get(
-            "of_report_selected_fields",
-            []
-        )
-
-        st.caption(
-            f"Comparison method: {report_method} • "
-            f"Product type: {report_product_type}"
-        )
-
+        st.markdown('<div class="section-title">QC Report</div>', unsafe_allow_html=True)
+        report_product_type = st.session_state.get("of_report_product_type", product_type)
+        report_method = st.session_state.get("of_report_comparison_method", "Select Fields")
+        report_fields = st.session_state.get("of_report_selected_fields", [])
+        st.caption(f"Comparison method: {report_method} • Product type: {report_product_type}")
         if report_method == "Auto Detect" and report_fields:
-            st.caption(
-                "Auto-detected fields: " + ", ".join(report_fields)
-            )
-
-        pass_count = int(
-            (report["STATUS"] == "PASS").sum()
-        )
-
-        fail_count = int(
-            (report["STATUS"] == "FAIL").sum()
-        )
-
-        not_found_count = int(
-            (report["STATUS"] == "NOT FOUND").sum()
-        )
-
-        skip_count = int(
-            (report["STATUS"] == "SKIP").sum()
-        )
-
+            st.caption("Auto-detected / selected fields: " + ", ".join(report_fields))
+        pass_count = int((report["STATUS"] == "PASS").sum())
+        fail_count = int((report["STATUS"] == "FAIL").sum())
+        not_found_count = int((report["STATUS"] == "NOT FOUND").sum())
+        skip_count = int((report["STATUS"] == "SKIP").sum())
         col1, col2, col3, col4 = st.columns(4)
-
-        with col1:
-            st.metric("PASS", pass_count)
-
-        with col2:
-            st.metric("FAIL", fail_count)
-
-        with col3:
-            st.metric("NOT FOUND", not_found_count)
-
-        with col4:
-            st.metric("IGNORED", skip_count)
-
-        styled_report = (
-            report
-            .style
-            .map(
-                style_status,
-                subset=["STATUS"]
-            )
-        )
-
-        st.dataframe(
-            styled_report,
-            width="stretch",
-            hide_index=True
-        )
-
+        with col1: st.metric("PASS", pass_count)
+        with col2: st.metric("FAIL", fail_count)
+        with col3: st.metric("NOT FOUND", not_found_count)
+        with col4: st.metric("IGNORED", skip_count)
+        st.dataframe(report.style.map(style_status, subset=["STATUS"]), width="stretch", hide_index=True)
         st.divider()
-
-        # =========================================================
-        # VISUAL ARTWORK COMPARISON
-        # =========================================================
         visual_pages = st.session_state.get("of_visual_pages") or []
         if visual_pages:
-            st.markdown(
-                '<div class="section-title">🖼️ Visual Artwork Comparison</div>',
-                unsafe_allow_html=True
-            )
-            st.caption(
-                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
-            )
+            st.markdown('<div class="section-title">🖼️ Visual Artwork Comparison</div>', unsafe_allow_html=True)
+            st.caption("The complete selected artwork page is shown below with compared OCR text highlighted directly on the original artwork.")
             for page in visual_pages:
                 page_num = page.get("page")
                 page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
                 highlighted = build_highlighted_page_image(page, page_report)
                 if highlighted is not None:
                     st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width="stretch")
-
+                    st.image(highlighted, width=750)
         with st.expander("ℹ️ How this validation works"):
-            st.write(
-                """
-                **Variable-data validation**
+            st.write("""
+**Variable-data validation**
 
-                Only the fields selected from the Order Form are treated as variable artwork data.
+Only the populated fields selected from the Order Form are treated as variable artwork data.
 
-                **OCR validation**
+**OCR validation**
 
-                Artwork pages are rendered as images and OCR is used as the primary extraction source for non-editable artwork.
+Artwork pages are rendered as images and OCR is used as the primary extraction source for non-editable artwork.
 
-                **Combined output lines**
+**Page selection**
 
-                Multiple Order Form fields can be matched independently when the artwork prints them on one line.
+For multi-page artwork, choose All Pages or specific PDF page number(s). Only the selected pages are compared.
 
-                **Page mapping**
+**Page → Order Form mapping**
 
-                For multiple-row Order Forms, Page N defaults to Data Row N (Excel Row N+1), and each selected page can be remapped manually.
+For multiple-row Order Forms, Page N defaults to Data Row N (Excel Row N+1), and every selected page can be remapped manually.
 
-                For a single-row Order Form, every selected PDF page uses Data Row 1 (Excel Row 2).
+For a single-row Order Form, every selected PDF page uses Data Row 1 (Excel Row 2).
 
-                **PFL mode**
+**Combined output lines**
 
-                Panel-numbered artwork is treated as a continuous stream so selected variable data can continue from one panel into the next panel.
+Multiple Order Form fields can be matched independently when the artwork prints them on one line.
 
-                **Mismatch detection**
+**PFL mode**
 
-                If the selected Order Form value is present in the PDF → PASS.
+Panel-numbered artwork is treated as a continuous stream so selected variable data can continue from one panel into the next panel.
+""")
+        excel_data = create_excel_report(report=report, product_type=report_product_type, comparison_method=report_method, selected_fields=report_fields, visual_pages=visual_pages)
+        st.download_button(label="⬇️ Download Excel QC Report", data=excel_data, file_name="PDF_Proofreading_QC_Report.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch", key=f"of_download_excel_qc_report_{st.session_state['of_reset_id']}")
 
-                If the expected value is absent but a relevant alternative value is detected → FAIL.
-
-                If an Order Form field is blank, that field is not required and is ignored.
-                """
-            )
-
-        excel_data = create_excel_report(
-            report=report,
-            product_type=report_product_type,
-            comparison_method=report_method,
-            selected_fields=report_fields,
-            visual_pages=visual_pages
-        )
-
-        st.download_button(
-            label="⬇️ Download Excel QC Report",
-            data=excel_data,
-            file_name="PDF_Proofreading_QC_Report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
-            key=f"of_download_excel_qc_report_{st.session_state['of_reset_id']}"
-        )
-
-    # =========================================================
-    # INITIAL INSTRUCTIONS
-    # =========================================================
     if not excel_file:
         st.caption("Upload an Order Form to begin.")
     elif not output_file:
         st.caption("Upload the Output Artwork to continue.")
     elif product_type == "----- SELECT -----":
         st.caption("Select the Product Type to continue.")
+    elif not page_selection_ready:
+        st.caption("Select the artwork page(s) to compare.")
     elif comparison_method is None:
         st.caption("Select a Comparison Method to continue.")
-    elif comparison_method == "Select Fields" and not selected_fields:
+    elif not selected_fields:
         st.caption("Select the variable fields you want to validate.")
