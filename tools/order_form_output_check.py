@@ -4,11 +4,9 @@ import fitz
 import re
 import unicodedata
 import io
-import hashlib
-import textwrap
 from io import BytesIO
 
-from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageDraw
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
@@ -493,299 +491,66 @@ def _text_quality_score(text):
     return alnum + useful_lines * 8 + numeric_runs * 3
 
 
-def _tesseract_data_pass(image, lang="eng", config="--psm 6", offset_x=0, offset_y=0, scale_back=1.0):
-    """Run one OCR pass and return normalized word records in original-image coordinates."""
-    import pytesseract
-    from pytesseract import Output
-
-    data = pytesseract.image_to_data(
-        image,
-        lang=lang,
-        output_type=Output.DICT,
-        config=config,
-    )
-
-    words = []
-    texts = data.get("text", [])
-    count = len(texts)
-
-    for i in range(count):
-        raw_text = str(texts[i] or "").strip()
-        if not raw_text:
-            continue
-
-        try:
-            conf = float(data.get("conf", ["-1"] * count)[i])
-        except Exception:
-            conf = -1.0
-
-        try:
-            left = int(data.get("left", [0] * count)[i])
-            top = int(data.get("top", [0] * count)[i])
-            width = int(data.get("width", [0] * count)[i])
-            height = int(data.get("height", [0] * count)[i])
-        except Exception:
-            continue
-
-        # A resized crop is mapped back to the original full-page coordinates.
-        if scale_back != 1.0:
-            left = int(left / scale_back)
-            top = int(top / scale_back)
-            width = max(1, int(width / scale_back))
-            height = max(1, int(height / scale_back))
-
-        words.append({
-            "text": raw_text,
-            "left": int(left + offset_x),
-            "top": int(top + offset_y),
-            "width": width,
-            "height": height,
-            "conf": conf,
-            "block_num": int(data.get("block_num", [0] * count)[i]),
-            "par_num": int(data.get("par_num", [0] * count)[i]),
-            "line_num": int(data.get("line_num", [0] * count)[i]),
-        })
-
-    return words
-
-
-def _deduplicate_ocr_words(words):
-    """Merge duplicate detections from overlapping OCR passes."""
-    best = {}
-
-    for word in words:
-        text_norm = _visual_norm(word.get("text", ""))
-        if not text_norm:
-            continue
-
-        left = int(word.get("left", 0))
-        top = int(word.get("top", 0))
-        width = max(1, int(word.get("width", 1)))
-        height = max(1, int(word.get("height", 1)))
-
-        # Spatial bucketing allows tiny coordinate differences between OCR passes.
-        key = (
-            text_norm,
-            round(left / 12),
-            round(top / 12),
-        )
-
-        current = best.get(key)
-        if current is None or float(word.get("conf", -1)) > float(current.get("conf", -1)):
-            best[key] = word
-
-    result = list(best.values())
-    result.sort(key=lambda item: (
-        int(item.get("top", 0)),
-        int(item.get("left", 0)),
-    ))
-    return result
-
-
-def _ocr_words_to_text(words):
-    """Build readable OCR lines from word boxes using their physical Y positions."""
-    if not words:
-        return ""
-
-    ordered = sorted(
-        words,
-        key=lambda item: (
-            int(item.get("top", 0)),
-            int(item.get("left", 0)),
-        ),
-    )
-
-    lines = []
-    current = []
-    current_y = None
-    current_height = 0
-
-    for word in ordered:
-        top = int(word.get("top", 0))
-        height = max(1, int(word.get("height", 1)))
-        center_y = top + height / 2
-
-        if current_y is None:
-            current = [word]
-            current_y = center_y
-            current_height = height
-            continue
-
-        tolerance = max(8, int(max(current_height, height) * 0.65))
-        if abs(center_y - current_y) <= tolerance:
-            current.append(word)
-            current_y = (current_y * (len(current) - 1) + center_y) / len(current)
-            current_height = max(current_height, height)
-        else:
-            current.sort(key=lambda item: int(item.get("left", 0)))
-            lines.append(" ".join(str(item.get("text", "")) for item in current).strip())
-            current = [word]
-            current_y = center_y
-            current_height = height
-
-    if current:
-        current.sort(key=lambda item: int(item.get("left", 0)))
-        lines.append(" ".join(str(item.get("text", "")) for item in current).strip())
-
-    return "\n".join(line for line in lines if line)
-
-
-def _prepare_ocr_variant(image, mode):
-    """Create OCR-friendly variants without changing the final coordinate system."""
-    base = image.convert("RGB")
-
-    if mode == "gray":
-        return ImageOps.grayscale(base).convert("RGB")
-
-    if mode == "contrast":
-        gray = ImageOps.grayscale(base)
-        gray = ImageEnhance.Contrast(gray).enhance(1.8)
-        gray = ImageEnhance.Sharpness(gray).enhance(1.4)
-        return gray.convert("RGB")
-
-    if mode == "sharp":
-        return base.filter(ImageFilter.SHARPEN)
-
-    return base
-
-
 def _ocr_image_with_data(image):
-    """
-    OCR 2.0 pipeline for artwork QC.
-
-    The page is processed using several OCR views plus overlapping enlarged
-    horizontal crops. Crop OCR is mapped back to the original page coordinates,
-    allowing the comparison engine to locate tiny artwork text while preserving
-    the complete original artwork for visual highlighting.
-    """
+    """Run OCR once and return both text and word-level bounding boxes."""
     try:
         import pytesseract
+        from pytesseract import Output
     except ImportError as exc:
         raise RuntimeError(
             "OCR support is not installed. Add pytesseract to requirements.txt."
         ) from exc
 
     errors = []
-    all_words = []
-
-    # We deliberately try English first. If that works, optional language packs
-    # are not required for ordinary apparel artwork.
-    languages = ["eng"]
-    selected_lang = "eng"
-
-    # Full-page passes. The rendered page is already high resolution, so these
-    # preserve the complete layout and provide a strong baseline.
-    full_passes = [
-        ("normal", "--psm 6"),
-        ("normal", "--psm 11"),
-        ("contrast", "--psm 11"),
-    ]
-
-    for mode, config in full_passes:
+    for lang in ("eng", "eng+fra+spa"):
         try:
-            variant = _prepare_ocr_variant(image, mode)
-            all_words.extend(
-                _tesseract_data_pass(
-                    variant,
-                    lang="eng",
-                    config=config,
-                )
+            data = pytesseract.image_to_data(
+                image,
+                lang=lang,
+                output_type=Output.DICT,
+                config="--psm 6"
             )
+            words = []
+            grouped_text = {}
+            for i, raw_text in enumerate(data.get("text", [])):
+                word = str(raw_text or "").strip()
+                if not word:
+                    continue
+                try:
+                    conf = float(data.get("conf", ["-1"] * len(data.get("text", [])))[i])
+                except Exception:
+                    conf = -1.0
+                item = {
+                    "text": word,
+                    "left": int(data.get("left", [0])[i]),
+                    "top": int(data.get("top", [0])[i]),
+                    "width": int(data.get("width", [0])[i]),
+                    "height": int(data.get("height", [0])[i]),
+                    "conf": conf,
+                    "block_num": int(data.get("block_num", [0])[i]),
+                    "par_num": int(data.get("par_num", [0])[i]),
+                    "line_num": int(data.get("line_num", [0])[i]),
+                }
+                words.append(item)
+                line_key = (item["block_num"], item["par_num"], item["line_num"])
+                grouped_text.setdefault(line_key, []).append(item)
+
+            text_lines = []
+            for _key, line_words in sorted(grouped_text.items(), key=lambda pair: pair[0]):
+                line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+                text_lines.append(" ".join(item["text"] for item in line_words))
+            text = "\n".join(text_lines)
+            if _usable_text(text):
+                return text, words, lang
         except Exception as exc:
-            errors.append(f"full/{mode}/{config}: {exc}")
+            errors.append(f"{lang}: {exc}")
 
-    # Region OCR is important for wide artwork labels. The small variable-data
-    # block often becomes much easier for Tesseract when surrounding graphics
-    # are removed. We therefore OCR four overlapping quadrants plus a broad
-    # lower-page strip. All crops are enlarged before OCR and then mapped back
-    # into the original full-page coordinate system.
-    width, height = image.size
-    x_mid = int(width * 0.50)
-    y_mid = int(height * 0.52)
-    x_overlap = int(width * 0.12)
-    y_overlap = int(height * 0.12)
-
-    regions = [
-        # left, top, right, bottom
-        (0, 0, min(width, x_mid + x_overlap), min(height, y_mid + y_overlap)),
-        (max(0, x_mid - x_overlap), 0, width, min(height, y_mid + y_overlap)),
-        (0, max(0, y_mid - y_overlap), min(width, x_mid + x_overlap), height),
-        (max(0, x_mid - x_overlap), max(0, y_mid - y_overlap), width, height),
-        (0, int(height * 0.45), width, height),
-    ]
-
-    for region_index, (left, top, right, bottom) in enumerate(regions):
-        if right <= left or bottom <= top:
-            continue
-
-        crop = image.crop((left, top, right, bottom))
-
-        scale = 1.65
-        enlarged = crop.resize(
-            (
-                max(1, int(crop.width * scale)),
-                max(1, int(crop.height * scale)),
-            ),
-            Image.Resampling.LANCZOS,
+    if errors:
+        raise RuntimeError(
+            "OCR could not run. Tesseract may be missing or language data may "
+            "not be installed. Details: " + " | ".join(errors)
         )
-
-        for mode, config in (
-            ("normal", "--psm 11"),
-            ("contrast", "--psm 11"),
-        ):
-            try:
-                variant = _prepare_ocr_variant(enlarged, mode)
-                all_words.extend(
-                    _tesseract_data_pass(
-                        variant,
-                        lang="eng",
-                        config=config,
-                        offset_x=left,
-                        offset_y=top,
-                        scale_back=scale,
-                    )
-                )
-            except Exception as exc:
-                errors.append(
-                    f"region/{region_index}/{mode}/{config}: {exc}"
-                )
-
-    words = _deduplicate_ocr_words(all_words)
-
-    # If English gave us nothing useful, try the broader language set once.
-    text = _ocr_words_to_text(words)
-    if not _usable_text(text):
-        try:
-            broader_words = []
-            for mode, config in (
-                ("normal", "--psm 6"),
-                ("contrast", "--psm 11"),
-            ):
-                variant = _prepare_ocr_variant(image, mode)
-                broader_words.extend(
-                    _tesseract_data_pass(
-                        variant,
-                        lang="eng+fra+spa",
-                        config=config,
-                    )
-                )
-
-            words = _deduplicate_ocr_words(broader_words)
-            text = _ocr_words_to_text(words)
-            if text:
-                selected_lang = "eng+fra+spa"
-        except Exception as exc:
-            errors.append(f"eng+fra+spa: {exc}")
-
-    if not text:
-        if errors:
-            raise RuntimeError(
-                "OCR could not produce usable text. Details: "
-                + " | ".join(errors[:10])
-            )
-        return "", [], selected_lang
-
-    return text, words, selected_lang
+    return "", [], ""
 
 
 def _ocr_image(image):
@@ -794,12 +559,9 @@ def _ocr_image(image):
 
 
 def _render_pdf_page(page):
-    # Higher internal resolution is intentional. The displayed visual image is
-    # scaled down separately in Streamlit, so this improves OCR without making
-    # the screen image unnecessarily large.
     pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(8.0, 8.0),
-        alpha=False,
+        matrix=fitz.Matrix(2.5, 2.5),
+        alpha=False
     )
     return Image.open(
         io.BytesIO(pixmap.tobytes("png"))
@@ -921,74 +683,6 @@ def extract_output_pages(file):
 # VISUAL ARTWORK HIGHLIGHTING
 # =========================================================
 
-# =========================================================
-# VISUAL ARTWORK HIGHLIGHTING
-# =========================================================
-
-VISUAL_FIELD_PALETTE = [
-    (30, 136, 229),
-    (156, 39, 176),
-    (0, 150, 136),
-    (255, 152, 0),
-    (76, 175, 80),
-    (233, 30, 99),
-    (121, 85, 72),
-    (63, 81, 181),
-    (0, 188, 212),
-    (255, 193, 7),
-    (244, 67, 54),
-    (67, 160, 71),
-    (94, 53, 177),
-    (3, 169, 244),
-    (255, 87, 34),
-    (0, 121, 107),
-    (117, 117, 117),
-    (205, 92, 92),
-    (46, 125, 50),
-    (123, 31, 162),
-    (2, 119, 189),
-    (239, 108, 0),
-    (0, 105, 92),
-    (173, 20, 87),
-]
-
-
-def _field_visual_color(field_name):
-    """Give every field a deterministic, reusable annotation color."""
-    digest = hashlib.md5(
-        str(field_name).encode("utf-8", errors="ignore")
-    ).hexdigest()
-    index = int(digest[:8], 16) % len(VISUAL_FIELD_PALETTE)
-    return VISUAL_FIELD_PALETTE[index]
-
-
-def _load_visual_font(size):
-    size = max(12, int(size))
-    candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
-    ]
-
-    for font_path in candidates:
-        try:
-            return ImageFont.truetype(font_path, size=size)
-        except Exception:
-            continue
-
-    return ImageFont.load_default()
-
-
-def _wrap_annotation(text, max_chars=30):
-    return "\n".join(
-        textwrap.wrap(
-            str(text),
-            width=max_chars,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
-    )
-
-
 def _visual_norm(text):
     if text is None:
         return ""
@@ -1003,502 +697,128 @@ def _word_text_norm(text):
     return value.replace(" ", "")
 
 
-def _find_word_boxes_for_target(page, target, field_name=""):
-    """
-    Find OCR rectangles for a report value.
-
-    The OCR passes use several segmentation modes, so Tesseract's internal
-    block/line IDs are not reliable after the results are merged. Visual
-    matching therefore uses the physical coordinates of OCR words instead.
-    """
+def _find_word_boxes_for_target(page, target):
+    """Find OCR word rectangles corresponding to a report's PDF OUTPUT value."""
     target_norm = _visual_norm(target)
     if not target_norm or target_norm in {"not found", "—", "-"}:
         return []
 
-    words = [
-        w for w in page.get("ocr_words", [])
-        if str(w.get("text", "")).strip()
-    ]
+    words = [w for w in page.get("ocr_words", []) if str(w.get("text", "")).strip()]
     if not words:
         return []
 
-    def word_center_y(word):
-        return int(word.get("top", 0)) + max(
-            1, int(word.get("height", 1))
-        ) / 2
-
-    ordered = sorted(
-        words,
-        key=lambda item: (
-            word_center_y(item),
-            int(item.get("left", 0)),
-        ),
-    )
-
-    # Build physical OCR lines from Y positions rather than OCR block IDs.
-    physical_lines = []
-    current = []
-    current_y = None
-    current_height = 0
-
-    for word in ordered:
-        center_y = word_center_y(word)
-        height = max(1, int(word.get("height", 1)))
-
-        if current_y is None:
-            current = [word]
-            current_y = center_y
-            current_height = height
-            continue
-
-        tolerance = max(
-            5,
-            int(max(current_height, height) * 0.85),
+    # Group OCR words by OCR line, preserving page order.
+    grouped = {}
+    for word in words:
+        key = (
+            word.get("block_num", 0),
+            word.get("par_num", 0),
+            word.get("line_num", 0),
         )
+        grouped.setdefault(key, []).append(word)
 
-        if abs(center_y - current_y) <= tolerance:
-            current.append(word)
-            current_y = (
-                current_y * (len(current) - 1) + center_y
-            ) / len(current)
-            current_height = max(current_height, height)
-        else:
-            current.sort(
-                key=lambda item: int(item.get("left", 0))
-            )
-            physical_lines.append(current)
-            current = [word]
-            current_y = center_y
-            current_height = height
+    target_tokens = target_norm.split()
+    matches = []
 
-    if current:
-        current.sort(
-            key=lambda item: int(item.get("left", 0))
-        )
-        physical_lines.append(current)
+    for line_words in grouped.values():
+        line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+        normalized_words = [_visual_norm(item["text"]) for item in line_words]
 
-    def build_box(group):
-        if not group:
-            return None
-
-        left = min(int(w.get("left", 0)) for w in group)
-        top = min(int(w.get("top", 0)) for w in group)
-        right = max(
-            int(w.get("left", 0)) + int(w.get("width", 0))
-            for w in group
-        )
-        bottom = max(
-            int(w.get("top", 0)) + int(w.get("height", 0))
-            for w in group
-        )
-
-        if right <= left or bottom <= top:
-            return None
-
-        return (left, top, right, bottom)
-
-    # ---------------------------------------------------------
-    # 1. Exact contiguous match on physical OCR lines.
-    # ---------------------------------------------------------
-    for line_words in physical_lines:
-        normalized_words = [
-            _visual_norm(word["text"])
-            for word in line_words
-        ]
-
+        # Exact contiguous token-window search.
         for start in range(len(line_words)):
             joined = ""
-
             for end in range(start, len(line_words)):
                 token = normalized_words[end]
                 if not token:
                     continue
-
                 joined = (joined + " " + token).strip()
-
-                if (
-                    joined == target_norm
-                    or joined.replace(" ", "")
-                    == target_norm.replace(" ", "")
-                ):
-                    box = build_box(line_words[start:end + 1])
-                    if box:
-                        return [box]
-
-                if len(joined.replace(" ", "")) > len(
-                    target_norm.replace(" ", "")
-                ) + 8:
+                if joined == target_norm or joined.replace(" ", "") == target_norm.replace(" ", ""):
+                    matches.append(line_words[start:end + 1])
+                    break
+                if len(joined.replace(" ", "")) > len(target_norm.replace(" ", "")) + 4:
                     break
 
-    # ---------------------------------------------------------
-    # 2. Exact match across neighbouring physical lines.
-    # ---------------------------------------------------------
-    compact_target = target_norm.replace(" ", "")
+        # Single-token fallback.
+        compact_target = target_norm.replace(" ", "")
+        for word in line_words:
+            compact_word = _word_text_norm(word["text"])
+            if compact_word == compact_target or compact_target in compact_word:
+                matches.append([word])
 
-    for start_line in range(len(physical_lines)):
-        selected = []
-        combined = ""
-
-        for end_line in range(
-            start_line,
-            min(len(physical_lines), start_line + 4),
-        ):
-            for word in physical_lines[end_line]:
-                token = _word_text_norm(word["text"])
+    if not matches:
+        # Search across neighbouring OCR lines for multi-line output values.
+        ordered = []
+        for key, line_words in sorted(grouped.items(), key=lambda item: item[0]):
+            line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+            ordered.extend(line_words)
+        compact_target = target_norm.replace(" ", "")
+        for start in range(len(ordered)):
+            current = ""
+            selected = []
+            for end in range(start, min(len(ordered), start + 15)):
+                token = _word_text_norm(ordered[end]["text"])
                 if not token:
                     continue
-
-                combined += token
-                selected.append(word)
-
-                if combined == compact_target:
-                    box = build_box(selected)
-                    if box:
-                        return [box]
-
-                if len(combined) > len(compact_target) + 8:
+                current += token
+                selected.append(ordered[end])
+                if current == compact_target:
+                    matches.append(selected)
+                    break
+                if len(current) > len(compact_target) + 4:
                     break
 
-            if len(combined) > len(compact_target) + 8:
-                break
-
-    # ---------------------------------------------------------
-    # 3. Token-based fallback.
-    #
-    # Useful when OCR inserts/reorders words in dense artwork while
-    # still recognizing the important words individually.
-    # ---------------------------------------------------------
-    from difflib import SequenceMatcher
-
-    target_tokens = [
-        token for token in target_norm.split()
-        if (
-            len(token) >= 3
-            or token.isdigit()
-        )
-    ]
-
-    # Do not use extremely generic tokens by themselves.
-    if field_name:
-        field_type = get_field_type(field_name)
-    else:
-        field_type = ""
-
-    stop_tokens = {
-        "the", "and", "with", "from", "made", "only",
-        "wash", "not", "dry", "do",
-    }
-
-    token_candidates = []
-
-    for target_token in target_tokens:
-        candidates = []
-
-        for word in ordered:
-            word_norm = _visual_norm(word["text"])
-            compact_word = word_norm.replace(" ", "")
-
-            if not word_norm:
-                continue
-
-            exact = (
-                word_norm == target_token
-                or compact_word == target_token.replace(" ", "")
-            )
-
-            if exact:
-                similarity = 1.0
-            elif len(target_token) >= 4:
-                similarity = SequenceMatcher(
-                    None,
-                    target_token,
-                    compact_word,
-                    autojunk=False,
-                ).ratio()
-            else:
-                similarity = 0.0
-
-            if similarity >= 0.78:
-                candidates.append((similarity, word))
-
-        if candidates:
-            candidates.sort(
-                key=lambda pair: (
-                    -pair[0],
-                    int(pair[1].get("top", 0)),
-                    int(pair[1].get("left", 0)),
-                )
-            )
-            token_candidates.append(
-                (target_token, candidates[:12])
-            )
-
-    if not token_candidates:
-        return []
-
-    # Find a spatial cluster that contains the largest number of expected
-    # tokens. This prevents a word being highlighted from an unrelated area.
-    clusters = []
-
-    for target_token, candidates in token_candidates:
-        for similarity, word in candidates:
-            cy = word_center_y(word)
-            cx = (
-                int(word.get("left", 0))
-                + max(1, int(word.get("width", 1))) / 2
-            )
-
-            clusters.append({
-                "target": target_token,
-                "similarity": similarity,
-                "word": word,
-                "cx": cx,
-                "cy": cy,
-            })
-
-    if not clusters:
-        return []
-
-    best_cluster = None
-
-    for anchor in clusters:
-        members = []
-
-        for candidate in clusters:
-            # A single field can legitimately cover a compact multi-line block.
-            distance_x = abs(candidate["cx"] - anchor["cx"])
-            distance_y = abs(candidate["cy"] - anchor["cy"])
-
-            y_limit = 120 if field_type == "CARE" else 58
-
-            if (
-                distance_x <= max(260, page.get("image_width", 1000) * 0.18)
-                and distance_y <= y_limit
-            ):
-                members.append(candidate)
-
-        unique_targets = {}
-        for member in members:
-            token = member["target"]
-            previous = unique_targets.get(token)
-
-            if previous is None or member["similarity"] > previous["similarity"]:
-                unique_targets[token] = member
-
-        score = (
-            len(unique_targets),
-            sum(
-                member["similarity"]
-                for member in unique_targets.values()
-            ),
-        )
-
-        if best_cluster is None or score > best_cluster["score"]:
-            best_cluster = {
-                "score": score,
-                "members": list(unique_targets.values()),
-            }
-
-    if not best_cluster:
-        return []
-
-    expected_count = max(1, len(target_tokens))
-
-    # A field with multiple meaningful expected tokens should not be mapped to
-    # a random single OCR word unless that field itself is one token.
-    if (
-        expected_count >= 2
-        and best_cluster["score"][0] < min(2, expected_count)
-    ):
-        return []
-
-    selected_words = [
-        member["word"]
-        for member in best_cluster["members"]
-    ]
-
-    box = build_box(selected_words)
-    return [box] if box else []
+    # Convert groups to rectangles and deduplicate.
+    boxes = []
+    seen = set()
+    for group in matches:
+        if not group:
+            continue
+        left = min(int(w.get("left", 0)) for w in group)
+        top = min(int(w.get("top", 0)) for w in group)
+        right = max(int(w.get("left", 0)) + int(w.get("width", 0)) for w in group)
+        bottom = max(int(w.get("top", 0)) + int(w.get("height", 0)) for w in group)
+        key = (left, top, right, bottom)
+        if right <= left or bottom <= top or key in seen:
+            continue
+        seen.add(key)
+        boxes.append(key)
+    return boxes
 
 
 def build_highlighted_page_image(page, page_report):
-    """
-    Return the complete artwork page with field-specific colored highlights.
-
-    Every independently compared field gets its own deterministic color.
-    The annotation reads:
-        <Excel field name> • PASS
-    or:
-        <Excel field name> • FAIL
-    """
+    """Return the complete artwork page with PASS/FAIL highlight overlays."""
     image_bytes = page.get("image_bytes")
     if not image_bytes:
         return None
 
-    base = Image.open(
-        BytesIO(image_bytes)
-    ).convert("RGBA")
-
-    overlay = Image.new(
-        "RGBA",
-        base.size,
-        (0, 0, 0, 0),
-    )
+    base = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     if page_report is not None and not page_report.empty:
-        rows = page_report[
-            page_report["STATUS"].isin(["PASS", "FAIL"])
-        ].copy()
-
-        # Draw each field independently. Sorting by FIELD makes the visual
-        # result deterministic across reruns.
-        sort_columns = ["FIELD"]
-        if "FIELD NO" in rows.columns:
-            sort_columns.append("FIELD NO")
-
-        rows = rows.sort_values(
-            by=sort_columns,
-            kind="stable",
-        )
-
-        font_size = max(
-            14,
-            min(
-                34,
-                int(min(base.size) * 0.018),
-            ),
-        )
-        font = _load_visual_font(font_size)
-
-        for _, row in rows.iterrows():
-            field_name = str(row.get("FIELD", "") or "").strip()
-            status = str(row.get("STATUS", "") or "").strip()
-            target = str(row.get("PDF OUTPUT", "") or "").strip()
-
-            if not field_name or status not in {"PASS", "FAIL"}:
+        for _, row in page_report.iterrows():
+            status = str(row.get("STATUS", ""))
+            if status not in {"PASS", "FAIL"}:
                 continue
-
-            boxes = _find_word_boxes_for_target(
-                page,
-                target,
-                field_name,
-            )
-            if not boxes:
-                continue
-
-            rgb = _field_visual_color(field_name)
-
-            fill = (
-                int(rgb[0]),
-                int(rgb[1]),
-                int(rgb[2]),
-                58 if status == "PASS" else 78,
-            )
-            outline = (
-                int(rgb[0]),
-                int(rgb[1]),
-                int(rgb[2]),
-                235,
-            )
-
-            label_text = _wrap_annotation(
-                f"{field_name} • {status}",
-                max_chars=34,
-            )
-
-            label_bbox = draw.multiline_textbbox(
-                (0, 0),
-                label_text,
-                font=font,
-                spacing=2,
-            )
-            label_width = label_bbox[2] - label_bbox[0] + 14
-            label_height = label_bbox[3] - label_bbox[1] + 10
-
-            for box_index, (left, top, right, bottom) in enumerate(boxes):
-                pad = max(
-                    4,
-                    int(min(base.size) * 0.0035),
-                )
-
+            target = row.get("PDF OUTPUT", "")
+            boxes = _find_word_boxes_for_target(page, target)
+            fill = (35, 134, 54, 75) if status == "PASS" else (218, 54, 51, 95)
+            outline = (35, 134, 54, 220) if status == "PASS" else (218, 54, 51, 240)
+            for left, top, right, bottom in boxes:
+                pad = max(3, int(min(base.size) * 0.004))
                 left = max(0, left - pad)
                 top = max(0, top - pad)
                 right = min(base.width - 1, right + pad)
                 bottom = min(base.height - 1, bottom + pad)
-
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
-                    radius=max(4, pad),
+                    radius=max(3, pad),
                     fill=fill,
                     outline=outline,
                     width=max(2, pad // 2),
                 )
 
-                # Put the field annotation immediately above the matched text.
-                label_left = left
-                label_top = top - label_height - 4
-
-                if label_top < 0:
-                    label_top = min(
-                        base.height - label_height,
-                        bottom + 4,
-                    )
-
-                label_left = min(
-                    max(0, label_left),
-                    max(0, base.width - label_width),
-                )
-
-                label_right = min(
-                    base.width,
-                    label_left + label_width,
-                )
-                label_bottom = min(
-                    base.height,
-                    label_top + label_height,
-                )
-
-                # Slightly translucent white background helps the annotation
-                # remain readable without obscuring the complete artwork.
-                draw.rounded_rectangle(
-                    (
-                        label_left,
-                        label_top,
-                        label_right,
-                        label_bottom,
-                    ),
-                    radius=5,
-                    fill=(
-                        255,
-                        255,
-                        255,
-                        235,
-                    ),
-                    outline=outline,
-                    width=2,
-                )
-
-                draw.multiline_text(
-                    (
-                        label_left + 7,
-                        label_top + 4,
-                    ),
-                    label_text,
-                    fill=(
-                        rgb[0],
-                        rgb[1],
-                        rgb[2],
-                        255,
-                    ),
-                    font=font,
-                    spacing=2,
-                )
-
-    return Image.alpha_composite(
-        base,
-        overlay,
-    ).convert("RGB")
+    return Image.alpha_composite(base, overlay).convert("RGB")
 
 
 def _visual_image_bytes(image):
@@ -3105,19 +2425,15 @@ def build_report(
 
     for page_index, page in enumerate(pdf_pages):
 
-        # Preserve the original PDF page number when only specific pages
-        # were selected. Page 5 must still map to Data Row 5.
-        try:
-            original_page_index = int(page.get("page", page_index + 1)) - 1
-        except Exception:
-            original_page_index = page_index
-
-        if page_row_mapping is not None:
-            excel_index = page_row_mapping.get(original_page_index)
+        # Use explicit page → data-row mapping when supplied. Otherwise preserve
+        # the legacy positional behavior for callers that do not provide one.
+        page_number = int(page.get("page", page_index + 1))
+        if page_row_mapping and page_number in page_row_mapping:
+            excel_index = int(page_row_mapping[page_number])
         else:
-            excel_index = original_page_index
+            excel_index = page_index
 
-        if excel_index >= len(df):
+        if excel_index < 0 or excel_index >= len(df):
             for field in selected_fields:
                 results.append({
                     "FIELD NO": field_no,
@@ -3595,165 +2911,6 @@ def main():
             return
 
     # =========================================================
-    # OUTPUT PAGE SELECTION + PAGE → ORDER FORM ROW MAPPING
-    # =========================================================
-    output_page_count = 0
-    mapping_complete = True
-    page_row_mapping = {}
-    selected_page_numbers = []
-    selected_page_indices = []
-
-    if excel_file and output_file:
-        try:
-            output_page_count = get_output_page_count(output_file)
-        except Exception as error:
-            st.warning(f"Unable to determine output page count: {error}")
-
-        if output_page_count > 1:
-            st.markdown(
-                '<div class="section-title">📄 Artwork Page Selection</div>',
-                unsafe_allow_html=True
-            )
-            st.caption(
-                "Choose all artwork pages or select specific page number(s). "
-                "Specific page selection is useful when checking one page from a large multi-page PDF."
-            )
-
-            page_mode = st.radio(
-                "Artwork Pages to Compare",
-                options=["All Pages", "Specific Page(s)"],
-                horizontal=True,
-                key=f"of_page_mode_{st.session_state['of_reset_id']}"
-            )
-
-            if page_mode == "Specific Page(s)":
-                page_options = list(range(1, output_page_count + 1))
-                previous_pages = st.session_state.get("of_selected_page_numbers", [])
-                if not previous_pages:
-                    previous_pages = [1]
-                selected_page_numbers = st.multiselect(
-                    "Select Artwork Page Number(s)",
-                    options=page_options,
-                    default=[p for p in previous_pages if p in page_options],
-                    placeholder="Select page number(s)...",
-                    key=f"of_selected_pages_{st.session_state['of_reset_id']}"
-                )
-                st.session_state["of_selected_page_numbers"] = selected_page_numbers
-            else:
-                selected_page_numbers = list(range(1, output_page_count + 1))
-                st.session_state["of_selected_page_numbers"] = selected_page_numbers
-        elif output_page_count == 1:
-            selected_page_numbers = [1]
-            st.session_state["of_selected_page_numbers"] = [1]
-
-        selected_page_indices = [p - 1 for p in selected_page_numbers]
-
-        # Mapping rules:
-        # 1 data row  -> every selected page uses Data Row 1 / Excel Row 2.
-        # Multiple rows -> Page N automatically maps to Data Row N whenever
-        # that row exists. Only pages beyond the available rows need manual
-        # row selection.
-        if selected_page_indices:
-            if len(df) == 1:
-                for page_index in selected_page_indices:
-                    page_row_mapping[page_index] = 0
-            else:
-                unmatched_pages = []
-                for page_index in selected_page_indices:
-                    if page_index < len(df):
-                        page_row_mapping[page_index] = page_index
-                    else:
-                        unmatched_pages.append(page_index)
-
-                if unmatched_pages:
-                    st.markdown(
-                        '<div class="section-title">🔗 Additional Page → Order Form Row Mapping</div>',
-                        unsafe_allow_html=True
-                    )
-                    st.caption(
-                        "These selected artwork pages do not have an automatic matching Order Form row. "
-                        "Choose the correct data row below."
-                    )
-
-                    row_choices = []
-                    for data_index in range(len(df)):
-                        row = df.iloc[data_index]
-                        preview_parts = []
-                        preferred = []
-                        for col in df.columns:
-                            compact = normalize_text(col).replace(" ", "").replace("_", "").replace("-", "")
-                            if any(token in compact for token in (
-                                "itemcode", "itemnumber", "stylecode", "cdstyle",
-                                "size", "color", "colour", "gender", "productgender",
-                                "cdimport", "rn"
-                            )):
-                                preferred.append(col)
-                        ordered_cols = preferred + [col for col in df.columns if col not in preferred]
-                        seen_preview = set()
-                        for col in ordered_cols:
-                            value = row[col]
-                            if is_blank_value(value):
-                                continue
-                            value_text = str(value).strip()
-                            if not value_text:
-                                continue
-                            compact_col = normalize_text(col).replace(" ", "")
-                            if compact_col in seen_preview:
-                                continue
-                            seen_preview.add(compact_col)
-                            preview_parts.append(f"{col}: {value_text}")
-                            if len(preview_parts) >= 3:
-                                break
-                        preview = " | ".join(preview_parts)
-                        label = f"Data Row {data_index + 1} (Excel Row {data_index + 2})"
-                        if preview:
-                            label += f" — {preview}"
-                        row_choices.append((data_index, label))
-
-                    option_labels = ["— SELECT ORDER FORM ROW —"] + [label for _idx, label in row_choices]
-                    label_to_index = {label: idx for idx, label in row_choices}
-
-                    for page_index in unmatched_pages:
-                        existing = st.session_state["of_page_row_mapping"].get(page_index)
-                        default_pos = 0
-                        if existing is not None:
-                            for pos, (data_index, _label) in enumerate(row_choices, start=1):
-                                if data_index == existing:
-                                    default_pos = pos
-                                    break
-                        selected_label = st.selectbox(
-                            f"Artwork Page {page_index + 1}",
-                            options=option_labels,
-                            index=default_pos,
-                            key=f"of_page_row_select_{st.session_state['of_reset_id']}_{page_index}",
-                            help="Data Row 1 corresponds to Excel Row 2; Data Row 2 corresponds to Excel Row 3; and so on."
-                        )
-                        if selected_label == "— SELECT ORDER FORM ROW —":
-                            mapping_complete = False
-                        else:
-                            page_row_mapping[page_index] = label_to_index[selected_label]
-
-            st.session_state["of_page_row_mapping"] = page_row_mapping
-
-            if len(df) == 1 and selected_page_numbers:
-                st.success(
-                    "✅ Single-data-row Order Form detected. Every selected artwork page will be compared against Data Row 1 (Excel Row 2)."
-                )
-            elif mapping_complete and selected_page_numbers:
-                mapping_preview = [
-                    f"Page {page_index + 1} → Data Row {page_row_mapping[page_index] + 1} (Excel Row {page_row_mapping[page_index] + 2})"
-                    for page_index in selected_page_indices
-                    if page_index in page_row_mapping
-                ]
-                st.success("✅ Page-to-row mapping ready. " + " • ".join(mapping_preview))
-            elif selected_page_numbers:
-                st.warning("Please complete the row selection for every artwork page shown above.")
-        else:
-            mapping_complete = False
-            if output_page_count > 1:
-                st.info("Select at least one artwork page to compare.")
-
-    # =========================================================
     # COMPARISON METHOD
     # =========================================================
     comparison_method = None
@@ -3786,41 +2943,9 @@ def main():
         available_fields = get_available_fields(df)
 
         if comparison_method == "Auto Detect":
-            auto_key = (
-                str(getattr(excel_file, "name", "")),
-                int(getattr(excel_file, "size", 0)),
-                str(getattr(output_file, "name", "")),
-                int(getattr(output_file, "size", 0)),
-                product_type,
-                tuple(selected_page_numbers),
-                tuple(sorted(page_row_mapping.items())),
-            )
-
-            if st.session_state.get("of_auto_detect_key") != auto_key:
-                try:
-                    with st.spinner("Auto Detect is reading the artwork with OCR..."):
-                        auto_all_pages = extract_output_pages(output_file)
-                        auto_pages = [
-                            page for page in auto_all_pages
-                            if int(page.get("page", 0)) in set(selected_page_numbers)
-                        ]
-                        detected_fields = auto_detect_fields(
-                            df,
-                            auto_pages,
-                            product_type,
-                            page_row_mapping=page_row_mapping
-                        )
-                    st.session_state["of_auto_detected_fields"] = detected_fields
-                    st.session_state["of_auto_output_pages"] = auto_pages
-                    st.session_state["of_auto_detect_key"] = auto_key
-                except Exception as error:
-                    st.error(
-                        f"Unable to run Auto Detect: {type(error).__name__}: {error}"
-                    )
-                    with st.expander("Technical error details", expanded=False):
-                        import traceback
-                        st.code(traceback.format_exc())
-
+            # Auto Detect runs after the user has selected the artwork pages and
+            # row mapping below. Keep the field selector visible here; it will be
+            # populated after Auto Detect runs at Compare time.
             detected_fields = st.session_state.get("of_auto_detected_fields", [])
 
             st.markdown(
@@ -3828,8 +2953,7 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Auto Detect proposes populated fields that can be associated with the artwork. "
-                "Review the list, remove fields, or add another populated field before comparison."
+                "Auto Detect will propose populated fields. Review, remove, or add fields before comparison."
             )
 
             default_auto = [field for field in detected_fields if field in available_fields]
@@ -3845,7 +2969,7 @@ def main():
             if selected_fields:
                 st.caption("Selected fields: " + ", ".join(selected_fields))
             else:
-                st.info("Auto Detect did not select any populated fields. Add fields manually from the list above.")
+                st.info("Click Compare to run Auto Detect, or add populated fields from the dropdown.")
 
         else:
             st.markdown(
@@ -3853,22 +2977,15 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Only populated Order Form fields are shown. Open the dropdown and type to search by Excel column name or field terminology."
+                "Only populated Order Form fields are shown. Type directly inside the dropdown to search."
             )
-
-            # Streamlit's multiselect has built-in live search.
-            # The user can click the dropdown and start typing immediately;
-            # matching fields are filtered as the text is entered, without
-            # requiring a separate search box or pressing Enter.
-            previous = st.session_state.get(
-                f"selected_fields_{st.session_state['of_reset_id']}", []
-            )
-            previous = [field for field in previous if field in available_fields]
 
             selected_fields = st.multiselect(
                 "Select the fields from your Order Form",
                 options=available_fields,
-                default=previous,
+                default=st.session_state.get(
+                    f"selected_fields_{st.session_state['of_reset_id']}", []
+                ),
                 placeholder="Type to search fields...",
                 label_visibility="collapsed",
                 key=f"selected_fields_{st.session_state['of_reset_id']}"
@@ -3898,17 +3015,18 @@ def main():
                 st.info("Select at least one Order Form field to continue.")
 
     # =========================================================
-    # FILE INFORMATION
-    # Page count is metadata only. Output text/OCR is NOT extracted here.
+    # FILE INFORMATION + PAGE SELECTION / ROW MAPPING
     # =========================================================
+    page_selection_ready = False
+    selected_pdf_pages = []
+    page_row_mapping = {}
+    output_page_count = 0
+
     if excel_file and output_file:
         try:
             output_page_count = get_output_page_count(output_file)
         except Exception as error:
-            output_page_count = 0
-            st.warning(
-                f"Unable to determine output page count: {error}"
-            )
+            st.warning(f"Unable to determine output page count: {error}")
 
         st.markdown(
             '<div class="section-title">📌 File Information</div>',
@@ -3927,15 +3045,102 @@ def main():
             extension = str(output_file.name).split(".")[-1].upper()
             st.metric("Output Type", extension)
 
-        if output_page_count and len(df) != output_page_count:
-            st.info(
-                f"ℹ️ The Order Form contains {len(df)} data row(s) while the "
-                f"artwork contains {output_page_count} page(s). This is allowed. "
-                "The current comparison maps Output Page 1 → Excel Row 2, "
-                "Output Page 2 → Excel Row 3, and so on."
+        # ---------------------------------------------------------
+        # ARTWORK PAGE SELECTION
+        # ---------------------------------------------------------
+        st.markdown(
+            '<div class="section-title">📄 Artwork Pages to Compare</div>',
+            unsafe_allow_html=True
+        )
+
+        if output_page_count <= 1:
+            selected_pdf_pages = [1] if output_page_count == 1 else []
+            st.caption("Single-page artwork detected. Page 1 will be compared.")
+        else:
+            page_mode = st.radio(
+                "Artwork page selection",
+                options=["All Pages", "Specific Page(s)"],
+                horizontal=True,
+                index=0,
+                key=f"page_selection_mode_{st.session_state['of_reset_id']}"
             )
-        elif output_page_count:
-            st.success("✅ Excel rows and output pages match.")
+
+            page_options = list(range(1, output_page_count + 1))
+            if page_mode == "All Pages":
+                selected_pdf_pages = page_options
+            else:
+                selected_pdf_pages = st.multiselect(
+                    "Select PDF page number(s)",
+                    options=page_options,
+                    default=[],
+                    placeholder="Select page number(s)...",
+                    key=f"selected_pdf_pages_{st.session_state['of_reset_id']}"
+                )
+                if selected_pdf_pages:
+                    st.caption(
+                        "Selected page(s): " + ", ".join(map(str, selected_pdf_pages))
+                    )
+                else:
+                    st.info("Select at least one PDF page to continue.")
+
+        # ---------------------------------------------------------
+        # PAGE → ORDER FORM ROW MAPPING
+        # ---------------------------------------------------------
+        if selected_pdf_pages:
+            st.markdown(
+                '<div class="section-title">🔗 Artwork Page → Order Form Row</div>',
+                unsafe_allow_html=True
+            )
+
+            if len(df) == 1:
+                st.caption(
+                    "Single-row Order Form detected. Every selected artwork page will automatically use Data Row 1 (Excel Row 2)."
+                )
+                for page_number in selected_pdf_pages:
+                    page_row_mapping[int(page_number)] = 0
+            else:
+                st.caption(
+                    "For multiple-row Order Forms, the default is Page N → Data Row N (Excel Row N+1). You can change any mapping below."
+                )
+
+                for page_number in selected_pdf_pages:
+                    natural_index = int(page_number) - 1
+                    natural_index = natural_index if 0 <= natural_index < len(df) else None
+
+                    options = []
+                    for row_index in range(len(df)):
+                        preview_parts = []
+                        for candidate in ["varItemCode", "Item Code", "CD_STYLE_WO_FINISH", "LBL_DESIGN_STYLE"]:
+                            if candidate in df.columns and not is_blank_value(df.iloc[row_index][candidate]):
+                                preview_parts.append(str(df.iloc[row_index][candidate]).strip())
+                                if len(preview_parts) >= 2:
+                                    break
+                        preview = " | ".join(preview_parts)
+                        label = f"Data Row {row_index + 1} (Excel Row {row_index + 2})"
+                        if preview:
+                            label += f" — {preview}"
+                        options.append((label, row_index))
+
+                    label_to_index = {label: idx for label, idx in options}
+                    option_labels = list(label_to_index.keys())
+
+                    if natural_index is not None:
+                        default_label = option_labels[natural_index]
+                    else:
+                        default_label = option_labels[0]
+
+                    chosen_label = st.selectbox(
+                        f"Artwork Page {page_number} → Order Form Row",
+                        options=option_labels,
+                        index=option_labels.index(default_label),
+                        key=f"page_row_map_{page_number}_{st.session_state['of_reset_id']}"
+                    )
+                    page_row_mapping[int(page_number)] = label_to_index[chosen_label]
+
+            page_selection_ready = True
+
+        st.session_state["of_page_row_mapping"] = page_row_mapping
+        st.session_state["of_selected_pdf_pages"] = selected_pdf_pages
 
     # =========================================================
     # COMPARE BUTTON
@@ -3951,8 +3156,7 @@ def main():
                 or bool(selected_fields)
             )
             and product_type != "----- SELECT -----"
-            and bool(selected_page_numbers)
-            and mapping_complete
+            and page_selection_ready
         )
 
         if st.button(
@@ -3965,28 +3169,63 @@ def main():
                 with st.spinner(
                     "Reading output and preparing comparison..."
                 ):
-                    # Reuse the OCR pages already prepared for Auto Detect.
+                    # OCR the complete artwork once, then restrict comparison to
+                    # the pages selected by the user. Page numbers remain the real
+                    # PDF page numbers, so Page 5 never becomes Page 1 internally.
                     if (
                         comparison_method == "Auto Detect"
                         and st.session_state.get("of_auto_output_pages")
                     ):
-                        output_pages = st.session_state["of_auto_output_pages"]
+                        all_output_pages = st.session_state["of_auto_output_pages"]
                     else:
                         all_output_pages = extract_output_pages(output_file)
+
+                    if not all_output_pages:
+                        raise ValueError("No readable output pages were detected.")
+
+                    selected_page_numbers = [
+                        int(n) for n in st.session_state.get("of_selected_pdf_pages", [])
+                    ]
+                    if not selected_page_numbers:
+                        raise ValueError("No PDF pages are selected for comparison.")
+
                     output_pages = [
                         page for page in all_output_pages
                         if int(page.get("page", 0)) in set(selected_page_numbers)
                     ]
 
                     if not output_pages:
-                        raise ValueError(
-                            "No readable output pages were detected."
+                        raise ValueError("The selected PDF pages could not be loaded.")
+
+                    page_row_mapping = {
+                        int(k): int(v)
+                        for k, v in st.session_state.get("of_page_row_mapping", {}).items()
+                    }
+
+                    if comparison_method == "Auto Detect":
+                        detected_fields = auto_detect_fields(
+                            df,
+                            output_pages,
+                            product_type,
+                            page_row_mapping=page_row_mapping
                         )
+                        st.session_state["of_auto_detected_fields"] = detected_fields
+
+                        # Re-read the current user selection after Auto Detect so
+                        # their editable selection is honored for the actual check.
+                        selected_fields = [
+                            field for field in st.session_state.get(
+                                f"auto_selected_fields_{st.session_state['of_reset_id']}",
+                                []
+                            )
+                            if field in get_available_fields(df)
+                        ]
+
+                        if not selected_fields:
+                            selected_fields = detected_fields
 
                     if not selected_fields:
-                        raise ValueError(
-                            "No fields are selected for comparison."
-                        )
+                        raise ValueError("No fields are selected for comparison.")
 
                     st.session_state["of_report"] = build_report(
                         df,
@@ -3999,8 +3238,6 @@ def main():
                     st.session_state["of_report_product_type"] = product_type
                     st.session_state["of_report_comparison_method"] = comparison_method
                     st.session_state["of_visual_pages"] = output_pages
-                    st.session_state["of_report_page_row_mapping"] = dict(page_row_mapping)
-                    st.session_state["of_report_selected_pages"] = list(selected_page_numbers)
 
             except Exception as error:
                 import traceback
@@ -4042,10 +3279,6 @@ def main():
             f"Comparison method: {report_method} • "
             f"Product type: {report_product_type}"
         )
-
-        report_selected_pages = st.session_state.get("of_report_selected_pages", [])
-        if report_selected_pages:
-            st.caption("Artwork pages compared: " + ", ".join(str(p) for p in report_selected_pages))
 
         if report_method == "Auto Detect" and report_fields:
             st.caption(
@@ -4109,40 +3342,15 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Each compared field is highlighted in a different color and "
-                "annotated directly on the full artwork as FIELD • PASS/FAIL."
+                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
             )
-
-            # Compact color legend for the field-specific annotations.
-            legend_items = []
-            for field in sorted(set(
-                str(value)
-                for value in report_fields
-                if str(value).strip()
-            )):
-                rgb = _field_visual_color(field)
-                legend_items.append(
-                    f'<span style="display:inline-flex;align-items:center;'
-                    f'margin-right:14px;margin-bottom:6px;">'
-                    f'<span style="width:12px;height:12px;border-radius:3px;'
-                    f'background:rgb({rgb[0]},{rgb[1]},{rgb[2]});'
-                    f'display:inline-block;margin-right:5px;"></span>'
-                    f'{field}</span>'
-                )
-
-            if legend_items:
-                st.markdown(
-                    "".join(legend_items),
-                    unsafe_allow_html=True
-                )
-
             for page in visual_pages:
                 page_num = page.get("page")
                 page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
                 highlighted = build_highlighted_page_image(page, page_report)
                 if highlighted is not None:
                     st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width=750)
+                    st.image(highlighted, width="stretch")
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
@@ -4161,13 +3369,9 @@ def main():
 
                 **Page mapping**
 
-                PDF Page 1 → Excel Row 2
+                For multiple-row Order Forms, Page N defaults to Data Row N (Excel Row N+1), and each selected page can be remapped manually.
 
-                PDF Page 2 → Excel Row 3
-
-                PDF Page 3 → Excel Row 4
-
-                and so on.
+                For a single-row Order Form, every selected PDF page uses Data Row 1 (Excel Row 2).
 
                 **PFL mode**
 
