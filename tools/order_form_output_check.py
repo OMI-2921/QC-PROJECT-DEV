@@ -267,12 +267,71 @@ def normalize_text(text):
 
 
 def normalize_symbol_text(text):
+    """Normalize a custom-font symbol keystroke without changing its code point.
+
+    The symbol itself is the data. Custom font workflows may use Unicode
+    private-use characters or ordinary keystrokes mapped to custom glyphs.
+    NFKC/case-fold normalization can change or erase the very character we are
+    trying to validate, so this helper removes only whitespace and invisible
+    zero-width markers.
+    """
     if is_blank_value(text):
         return ""
-    value = unicodedata.normalize("NFKC", str(text))
+
+    value = str(text)
     value = value.replace("\u200b", "").replace("\ufeff", "")
     value = re.sub(r"\s+", "", value)
-    return value.casefold()
+    return value
+
+
+def _symbol_contains_private_or_nontext_glyph(text):
+    """Return True when a value contains a glyph/code point safer to match by exact substring."""
+    if is_blank_value(text):
+        return False
+
+    for char in str(text):
+        code = ord(char)
+        category = unicodedata.category(char)
+        # Basic/supplementary private-use areas plus Unicode symbol/math/mark
+        # categories are typical for custom-font glyph keys.
+        if (0xE000 <= code <= 0xF8FF) or (0xF0000 <= code <= 0xFFFFD) or (
+            category.startswith("S") or category.startswith("M")
+        ):
+            return True
+    return False
+
+
+def _symbol_text_matches(expected, actual):
+    """Exact custom-font keystroke matching without unsafe fuzzy matching.
+
+    The symbol itself is the data. The complete normalized character sequence
+    is checked first. For custom/private-use glyphs, an exact contained sequence
+    is safe. For ordinary ASCII keys used by a custom font (for example 'A'),
+    matching is token-based against the ORIGINAL text so that 'A' cannot match
+    the 'A' inside 'MADE'.
+    """
+    expected_raw = normalize_symbol_text(expected)
+    actual_text = str(actual or "")
+    actual_raw = normalize_symbol_text(actual_text)
+
+    if not expected_raw or not actual_raw:
+        return False
+
+    if expected_raw == actual_raw:
+        return True
+
+    if _symbol_contains_private_or_nontext_glyph(expected_raw):
+        return expected_raw in actual_raw
+
+    # Important: use the original whitespace/punctuation boundaries here.
+    # normalize_symbol_text removes spaces, which would turn 'A V' into 'AV'
+    # and incorrectly prevent the custom key 'A' from matching as its own unit.
+    units = [
+        normalize_symbol_text(unit)
+        for unit in re.split(r"[^A-Za-z0-9_]+", actual_text)
+        if unit
+    ]
+    return expected_raw in units
 
 
 def compact_text(text):
@@ -799,6 +858,30 @@ def extract_output_pages(file):
             for page_number, page in enumerate(document, start=1):
                 direct_text = page.get_text("text") or ""
                 image = _render_pdf_page(page)
+
+                # Keep original PDF word coordinates as a visual fallback for
+                # custom-font symbols. OCR may not recognize the glyph at all.
+                direct_words = []
+                try:
+                    pdf_words = page.get_text("words") or []
+                    sx = image.width / max(1.0, float(page.rect.width))
+                    sy = image.height / max(1.0, float(page.rect.height))
+                    for word in pdf_words:
+                        if len(word) < 5:
+                            continue
+                        x0, y0, x1, y1, word_text = word[:5]
+                        word_text = str(word_text or "")
+                        if not word_text.strip():
+                            continue
+                        direct_words.append({
+                            "text": word_text,
+                            "left": int(round(float(x0) * sx)),
+                            "top": int(round(float(y0) * sy)),
+                            "width": int(round((float(x1) - float(x0)) * sx)),
+                            "height": int(round((float(y1) - float(y0)) * sy)),
+                        })
+                except Exception:
+                    direct_words = []
                 ocr_text = ""
                 ocr_words = []
                 ocr_error = None
@@ -836,6 +919,7 @@ def extract_output_pages(file):
                     "ocr_text": str(ocr_text or ""),
                     "ocr_alt_text": str(ocr_alt_text or ""),
                     "ocr_words": ocr_words,
+                    "direct_words": direct_words,
                     "ocr_lang": ocr_lang,
                     "ocr_scale_x": ocr_scale,
                     "ocr_scale_y": ocr_scale,
@@ -870,6 +954,7 @@ def extract_output_pages(file):
             "ocr_text": str(ocr_text),
             "ocr_alt_text": str(ocr_alt_text),
             "ocr_words": ocr_words,
+            "direct_words": [],
             "ocr_lang": ocr_lang,
             "ocr_scale_x": ocr_scale,
             "ocr_scale_y": ocr_scale,
@@ -1017,6 +1102,34 @@ def _boxes_from_words(words):
     right = max(int(word.get("left", 0)) + int(word.get("width", 0)) for word in words)
     bottom = max(int(word.get("top", 0)) + int(word.get("height", 0)) for word in words)
     return [(left, top, right, bottom)] if right > left and bottom > top else []
+
+
+def _find_visual_symbol_boxes(page, target):
+    """Locate custom-font symbol keystrokes using OCR/direct PDF word boxes.
+
+    Presentation-only. The comparison decision has already been made by the
+    SYMBOL checker. This function only finds the visual location of that exact
+    keystroke.
+    """
+    expected = normalize_symbol_text(target)
+    if not expected:
+        return []
+
+    def raw_matches(expected_value, actual_value):
+        return _symbol_text_matches(expected_value, actual_value)
+
+    # Prefer the original PDF text layer because it preserves custom-font
+    # keystrokes even when OCR does not recognize them.
+    for word in page.get("direct_words", []) or []:
+        if raw_matches(expected, word.get("text", "")):
+            return _boxes_from_words([word])
+
+    # OCR fallback when the symbol survived OCR as a usable token.
+    for word in page.get("ocr_words", []) or []:
+        if raw_matches(expected, word.get("text", "")):
+            return _boxes_from_words([word])
+
+    return []
 
 
 def _find_visual_boxes(page, target, field_name=""):
@@ -1585,6 +1698,14 @@ def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, d
         if boxes:
             return boxes
 
+    if get_field_type(field_name) == "SYMBOL":
+        boxes = _find_visual_symbol_boxes(page, actual_value)
+        if boxes:
+            return boxes
+        boxes = _find_visual_symbol_boxes(page, expected_value)
+        if boxes:
+            return boxes
+
     # For block-based fields, ALWAYS try the complete compared block first.
     # This intentionally prevents a care mismatch from highlighting only a word
     # such as "ONLY".
@@ -1700,7 +1821,11 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         field_type = get_field_type(field_name)
 
         # Long/block fields must NEVER fall back to a single differing token.
-        if _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
+        if field_type == "SYMBOL":
+            boxes = _find_visual_symbol_boxes(page, pdf_output)
+            if not boxes:
+                boxes = _find_visual_symbol_boxes(page, expected_value)
+        elif _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
             boxes = _find_visual_semantic_block_boxes(page, field_name)
             if not boxes:
                 boxes = _find_visual_block_boxes(page, pdf_output, field_name)
@@ -1942,10 +2067,27 @@ def build_page_state(page, product_type):
             f"Output page {page.get('page', '?')} contains malformed OCR/text lines: {invalid_lines[:5]}"
         )
 
+    # A custom-font symbol may be perfectly preserved in the PDF text layer
+    # while OCR converts the glyph into an unrelated character. Keep an
+    # auxiliary raw direct-text line list for SYMBOL validation only.
+    direct_text = str(page.get("direct_text", "") or "")
+    direct_lines = []
+    for raw_index, raw in enumerate(direct_text.splitlines()):
+        clean = str(raw or "").replace("\u200b", "").replace("\ufeff", "").strip()
+        if not clean:
+            continue
+        direct_lines.append({
+            "line_id": 1000000 + raw_index,
+            "raw_index": raw_index,
+            "text": clean,
+            "norm": normalize_text(clean),
+        })
+
     return {
         "page": page.get("page"),
         "source_type": page.get("source_type", "pdf_text"),
         "lines": lines,
+        "direct_lines": direct_lines,
         "consumed": set(),
         "consumed_spans": {},
         # Keep the existing line-based OSZ runs intact.  The additional
@@ -3119,20 +3261,74 @@ def check_field(
         }
 
     # -----------------------------------------------------
-    # Symbol: exact symbol/text only. Never substring-match.
+    # Symbol: exact custom-font keystroke match.
     # -----------------------------------------------------
     if field_type == "SYMBOL":
+        expected_symbol = normalize_symbol_text(expected)
+
+        if not expected_symbol:
+            return {
+                "status": "NOT FOUND",
+                "pdf": "Not found",
+                "difference": "Symbol/value was not detected exactly.",
+                "match_type": "NOT_FOUND"
+            }
+
+        # PASS 1: current OCR/comparison lines. The expected symbol can share
+        # a line with other content, so do not require the whole line to equal
+        # the symbol. _symbol_text_matches still enforces exact code-point/token
+        # matching and never uses fuzzy similarity.
         for line in state["lines"]:
             if not line_is_available(line, state):
                 continue
 
-            if normalize_symbol_text(expected) == normalize_symbol_text(line["text"]):
-                consume_lines(state, [line])
+            if _symbol_text_matches(expected_symbol, line["text"]):
+                actual_raw = normalize_symbol_text(line["text"])
+                # Consume only the line/span used by the symbol check. This keeps
+                # other fields on the same OCR line independently usable.
+                if expected_symbol in actual_raw:
+                    start_pos = actual_raw.find(expected_symbol)
+                    consume_span(
+                        state,
+                        line,
+                        start_pos,
+                        start_pos + len(expected_symbol)
+                    )
+                else:
+                    consume_lines(state, [line])
+
                 return {
                     "status": "PASS",
                     "pdf": line["text"],
                     "difference": "—",
-                    "match_type": "SYMBOL_EXACT"
+                    "match_type": "SYMBOL_KEYSTROKE_EXACT"
+                }
+
+        # PASS 2: raw PDF text layer. This is critical for custom fonts because
+        # OCR may replace a private-use glyph even though the original PDF text
+        # contains the exact keystroke. This fallback is isolated to SYMBOL.
+        for line in state.get("direct_lines", []):
+            if not line_is_available(line, state):
+                continue
+
+            if _symbol_text_matches(expected_symbol, line["text"]):
+                actual_raw = normalize_symbol_text(line["text"])
+                if expected_symbol in actual_raw:
+                    start_pos = actual_raw.find(expected_symbol)
+                    consume_span(
+                        state,
+                        line,
+                        start_pos,
+                        start_pos + len(expected_symbol)
+                    )
+                else:
+                    consume_lines(state, [line])
+
+                return {
+                    "status": "PASS",
+                    "pdf": line["text"],
+                    "difference": "—",
+                    "match_type": "SYMBOL_DIRECT_PDF_EXACT"
                 }
 
         return {
