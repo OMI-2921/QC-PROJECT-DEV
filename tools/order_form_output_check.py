@@ -443,6 +443,7 @@ def get_field_type(field_name):
         or "waist" in compact
         or "inseam" in compact
         or compact == "fit"
+        or re.fullmatch(r"s\d+", compact)
     ):
         return "SIZE"
 
@@ -492,7 +493,13 @@ def _text_quality_score(text):
 
 
 def _ocr_image_with_data(image):
-    """Run OCR once and return both text and word-level bounding boxes."""
+    """
+    Fast multi-pass OCR for small artwork text.
+
+    PSM 11 is the primary pass for separated artwork text and PSM 6 is kept as
+    a compact-layout fallback. Text from both passes is merged, while the
+    strongest pass supplies the word boxes used for visual highlighting.
+    """
     try:
         import pytesseract
         from pytesseract import Output
@@ -501,25 +508,64 @@ def _ocr_image_with_data(image):
             "OCR support is not installed. Add pytesseract to requirements.txt."
         ) from exc
 
+    try:
+        from PIL import ImageOps, ImageEnhance, ImageFilter
+    except Exception:
+        ImageOps = ImageEnhance = ImageFilter = None
+
+    work_image = image.convert("RGB")
+    if work_image.width < 1600:
+        scale = 1600 / max(1, work_image.width)
+        work_image = work_image.resize(
+            (int(work_image.width * scale), int(work_image.height * scale)),
+            Image.Resampling.LANCZOS
+        )
+
+    variants = [("color", work_image)]
+    if ImageOps is not None:
+        gray = ImageOps.grayscale(work_image)
+        gray = ImageOps.autocontrast(gray)
+        if ImageEnhance is not None:
+            gray = ImageEnhance.Contrast(gray).enhance(1.25)
+        if ImageFilter is not None:
+            gray = gray.filter(ImageFilter.SHARPEN)
+        variants.append(("gray", gray))
+
+    # Keep the OCR workload controlled: 4 primary passes max.
+    requested_passes = [
+        ("color", 11, "eng"),
+        ("gray", 11, "eng"),
+        ("color", 6, "eng"),
+    ]
+
     errors = []
-    for lang in ("eng", "eng+fra+spa"):
+    results = []
+
+    for variant_name, psm, lang in requested_passes:
+        variant_image = dict(variants).get(variant_name, work_image)
         try:
             data = pytesseract.image_to_data(
-                image,
+                variant_image,
                 lang=lang,
                 output_type=Output.DICT,
-                config="--psm 6"
+                config=f"--psm {psm}"
             )
+
             words = []
             grouped_text = {}
+            conf_values = []
+
             for i, raw_text in enumerate(data.get("text", [])):
                 word = str(raw_text or "").strip()
                 if not word:
                     continue
                 try:
-                    conf = float(data.get("conf", ["-1"] * len(data.get("text", [])))[i])
+                    conf = float(
+                        data.get("conf", ["-1"] * len(data.get("text", [])))[i]
+                    )
                 except Exception:
                     conf = -1.0
+
                 item = {
                     "text": word,
                     "left": int(data.get("left", [0])[i]),
@@ -532,25 +578,58 @@ def _ocr_image_with_data(image):
                     "line_num": int(data.get("line_num", [0])[i]),
                 }
                 words.append(item)
-                line_key = (item["block_num"], item["par_num"], item["line_num"])
+                if conf >= 0:
+                    conf_values.append(conf)
+                line_key = (
+                    item["block_num"],
+                    item["par_num"],
+                    item["line_num"]
+                )
                 grouped_text.setdefault(line_key, []).append(item)
 
             text_lines = []
             for _key, line_words in sorted(grouped_text.items(), key=lambda pair: pair[0]):
-                line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+                line_words.sort(key=lambda item: (item.get("top", 0), item.get("left", 0)))
                 text_lines.append(" ".join(item["text"] for item in line_words))
-            text = "\n".join(text_lines)
-            if _usable_text(text):
-                return text, words, lang
-        except Exception as exc:
-            errors.append(f"{lang}: {exc}")
 
-    if errors:
-        raise RuntimeError(
-            "OCR could not run. Tesseract may be missing or language data may "
-            "not be installed. Details: " + " | ".join(errors)
-        )
-    return "", [], ""
+            text = "\n".join(text_lines)
+            if not _usable_text(text):
+                continue
+
+            avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
+            quality = _text_quality_score(text) + (avg_conf * 0.20)
+            results.append({
+                "text": text,
+                "words": words,
+                "lang": lang,
+                "quality": quality,
+            })
+        except Exception as exc:
+            errors.append(f"{variant_name}/psm{psm}/{lang}: {exc}")
+
+    if not results:
+        if errors:
+            raise RuntimeError(
+                "OCR could not run. Tesseract may be missing. Details: "
+                + " | ".join(errors[:4])
+            )
+        return "", [], ""
+
+    best = max(results, key=lambda item: item["quality"])
+
+    merged_lines = []
+    seen = set()
+    for result in sorted(results, key=lambda item: item["quality"], reverse=True):
+        for line in result["text"].splitlines():
+            clean = re.sub(r"\s+", " ", line).strip()
+            if not clean:
+                continue
+            key = normalize_text(clean)
+            if key and key not in seen:
+                seen.add(key)
+                merged_lines.append(clean)
+
+    return "\n".join(merged_lines), best["words"], best["lang"]
 
 
 def _ocr_image(image):
@@ -560,7 +639,7 @@ def _ocr_image(image):
 
 def _render_pdf_page(page):
     pixmap = page.get_pixmap(
-        matrix=fitz.Matrix(2.5, 2.5),
+        matrix=fitz.Matrix(6.0, 6.0),
         alpha=False
     )
     return Image.open(
@@ -2402,7 +2481,8 @@ def build_report(
     df,
     pdf_pages,
     selected_fields,
-    product_type
+    product_type,
+    page_row_mapping=None
 ):
     """
     Full validation report.
@@ -2424,13 +2504,21 @@ def build_report(
 
     for page_index, page in enumerate(pdf_pages):
 
-        excel_index = page_index
+        page_number = int(page.get("page", page_index + 1))
+
+        if page_row_mapping is not None and page_number not in page_row_mapping:
+            continue
+
+        if page_row_mapping and page_number in page_row_mapping:
+            excel_index = int(page_row_mapping[page_number])
+        else:
+            excel_index = page_index
 
         if excel_index >= len(df):
             for field in selected_fields:
                 results.append({
                     "FIELD NO": field_no,
-                    "PDF PAGE": page["page"],
+                    "PDF PAGE": page_number,
                     "EXCEL ROW": "N/A",
                     "FIELD": field,
                     "ORDER FORM DATA": "No Excel row",
@@ -2479,7 +2567,7 @@ def build_report(
 
             results.append({
                 "FIELD NO": field_no,
-                "PDF PAGE": page["page"],
+                "PDF PAGE": page_number,
                 "EXCEL ROW": excel_index + 2,
                 "FIELD": field,
                 "ORDER FORM DATA": item["value"],
@@ -2497,119 +2585,230 @@ def build_report(
 # AUTO DETECT
 # =========================================================
 
-def _auto_detect_value_match(expected, field_name, output_pages):
-    """
-    OCR-tolerant evidence check used only by Auto Detect.
+def _auto_detect_page_text(page):
+    """Return normalized OCR/direct text for one artwork page."""
+    if not page:
+        return ""
 
-    This is intentionally more permissive than the final PASS/FAIL engine:
-    Auto Detect's job is to propose fields for review, not to make the final
-    validation decision.
-    """
-    if is_blank_value(expected):
+    values = []
+    for key in ("ocr_text", "text", "direct_text"):
+        value = page.get(key, "")
+        if value and str(value).strip():
+            values.append(str(value))
+
+    return normalize_text("\n".join(values))
+
+
+def _auto_detect_lines(page):
+    text = _auto_detect_page_text(page)
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _auto_number_evidence(expected, text):
+    """Exact numeric evidence with boundaries; never accepts a substring of a larger number."""
+    numeric = normalize_numeric(expected)
+    if numeric is None:
+        return False
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(numeric)}(?![A-Za-z0-9])",
+            text
+        )
+    )
+
+
+def _auto_identifier_evidence(expected, text):
+    """High-confidence asymmetric identifier evidence."""
+    expected_compact = re.sub(r"[^a-z0-9]", "", normalize_text(expected))
+    if not expected_compact or len(expected_compact) < 4:
         return False
 
-    expected_text = str(expected).strip()
-    expected_norm = normalize_text(expected_text)
+    tokens = re.findall(r"[a-z0-9]+", normalize_text(text))
+    for token in tokens:
+        if token == expected_compact:
+            return True
+        # Expected code may have an OCR-added suffix/prefix, but only when the
+        # expected identifier is reasonably distinctive.
+        if expected_compact in token and len(expected_compact) >= 5:
+            return True
+    return False
+
+
+def _auto_material_evidence(expected, text):
+    """Detect composition values without turning common words/numbers into matches."""
+    expected_parts = extract_content_values(expected)
+    if not expected_parts:
+        return False
+
+    compact_text_value = re.sub(r"[^a-z0-9%]", "", normalize_text(text))
+    matches = 0
+
+    for part in expected_parts:
+        part_norm = normalize_text(part)
+        material = re.sub(r"[^a-z]", "", part_norm.casefold())
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", part_norm)
+
+        if material and len(material) >= 3:
+            # Accept exact material and the common OCR collapse with its percentage.
+            if material in compact_text_value:
+                matches += 1
+                continue
+            if pct_match and re.search(
+                rf"{re.escape(pct_match.group(1))}\s*%?\s*{re.escape(material)}",
+                normalize_text(text),
+            ):
+                matches += 1
+                continue
+
+    # A real composition field should have at least one material + strong
+    # composition signal (% or another material). This prevents random words
+    # from selecting thousands of translated columns.
+    has_percent = bool(re.search(r"\d+(?:\.\d+)?\s*%|\d+\s*[a-z]{3,}", normalize_text(text)))
+    return matches >= max(1, min(2, len(expected_parts))) and has_percent
+
+
+def _auto_coo_evidence(expected, field_name, text):
+    """High-confidence COO evidence for Auto Detect."""
+    from rapidfuzz import fuzz
+
+    expected_coo = extract_coo_value(expected)
+    target = normalize_text(expected_coo if expected_coo else expected)
+    norm = normalize_text(text)
+
+    # First try a compact exact comparison so OCR spacing such as
+    # "Made Inindia" still matches "MADE IN INDIA".
+    target_compact = re.sub(r"[^a-z0-9]", "", target)
+    text_compact = re.sub(r"[^a-z0-9]", "", norm)
+    if target_compact and target_compact in text_compact:
+        return True
+
+    # Otherwise compare the complete expected COO against individual OCR lines.
+    # Do not match merely on the country name: that caused translated COO
+    # columns such as German/Turkish to be falsely auto-selected.
+    lines = _auto_detect_lines({"ocr_text": text})
+    for line in lines:
+        line_compact = re.sub(r"[^a-z0-9]", "", line)
+        if target_compact and fuzz.ratio(target_compact, line_compact) >= 92:
+            return True
+
+    return False
+
+
+def _auto_text_evidence(expected, field_name, text):
+    """Conservative text matching for Auto Detect only."""
+    from rapidfuzz import fuzz
+
+    expected_norm = normalize_text(expected)
     if not expected_norm:
         return False
 
     field_type = get_field_type(field_name)
-
-    page_texts = []
-    for page in output_pages or []:
-        for key in ("ocr_text", "text", "direct_text"):
-            value = normalize_text(page.get(key, ""))
-            if value:
-                page_texts.append(value)
-
-    if not page_texts:
-        return False
-
-    haystack = "\n".join(page_texts)
-
-    # Direct normalized evidence first.
-    compact_expected = re.sub(r"[^a-z0-9]+", "", expected_norm)
+    compact_expected = re.sub(r"[^a-z0-9]", "", expected_norm)
+    norm_text = normalize_text(text)
 
     if field_type == "IDENTIFIER":
-        # Identifier Auto Detect is intentionally asymmetric. OCR may add a
-        # prefix/suffix around an otherwise correct identifier.
-        for token in re.findall(r"[a-z0-9]+", haystack):
-            if token == compact_expected:
-                return True
-            if compact_expected and compact_expected in token:
-                return True
-        return False
-
-    if field_type in {"SIZE", "COLOR", "GENDER", "BRAND", "ATTRIBUTE", "GENERAL"}:
-        if expected_norm in haystack:
-            return True
-        if compact_expected and compact_expected in re.sub(r"[^a-z0-9]+", "", haystack):
-            return True
-    else:
-        if expected_norm in haystack:
-            return True
-
-    # OCR-tolerant fuzzy evidence.
-    try:
-        from rapidfuzz import fuzz
-    except Exception:
-        return False
-
-    if field_type == "CONTENT":
-        expected_parts = extract_content_values(expected_text)
-        if expected_parts:
-            for part in expected_parts:
-                part_norm = normalize_text(part)
-                if any(
-                    fuzz.partial_ratio(part_norm, line) >= 84
-                    for line in page_texts
-                ):
-                    return True
-            return False
-
-    if field_type == "COO":
-        # COO is best detected from its distinctive "made in" / language
-        # anchor rather than by comparing the entire phrase character-for-char.
-        region = get_field_region(field_name)
-        anchors = {
-            "EN": ("made in",),
-            "FR": ("fabrique en",),
-            "SP": ("hecho en",),
-            "": ("made in", "fabrique en", "hecho en"),
-        }.get(region, ("made in", "fabrique en", "hecho en"))
-        return any(anchor in haystack for anchor in anchors)
+        return _auto_identifier_evidence(expected, norm_text)
 
     if field_type == "RN":
-        compact_digits = re.sub(r"\D", "", expected_text)
-        if not compact_digits:
+        digits = re.sub(r"\D", "", expected_norm)
+        if not digits or len(digits) < 4:
             return False
-        return compact_digits in re.sub(r"\D", "", haystack)
+        # Require RN/CA context, or an exact standalone digit sequence on a
+        # short line. This prevents a number like 2 from selecting RN fields.
+        if re.search(r"\b(?:rn|ca)\s*[#:\-./ ]*\d+", norm_text):
+            return digits in re.sub(r"\D", "", norm_text)
+        return bool(re.search(rf"(?<!\d){re.escape(digits)}(?!\d)", norm_text))
+
+    if field_type == "COO":
+        return _auto_coo_evidence(expected, field_name, norm_text)
+
+    if field_type == "CONTENT":
+        return _auto_material_evidence(expected, norm_text)
+
+    if field_type == "CARE":
+        # Care must match several distinctive words, not one common token.
+        tokens = [t for t in re.findall(r"[a-z]+", expected_norm) if len(t) >= 4]
+        if len(tokens) < 3:
+            return False
+        unique = set(tokens)
+        hits = sum(1 for token in unique if token in norm_text)
+        return hits >= max(3, int(len(unique) * 0.35))
+
+    if field_type == "SIZE":
+        # Sizes are high-confidence only when the complete size/range appears.
+        compact_text = re.sub(r"[^a-z0-9./-]", "", norm_text)
+        return bool(
+            compact_expected
+            and compact_expected in compact_text
+        ) or _auto_number_evidence(expected_norm, norm_text)
+
+    if field_type == "COLOR":
+        # Full color phrase or strong fuzzy similarity to one OCR line.
+        if expected_norm in norm_text:
+            return True
+        lines = _auto_detect_lines({"ocr_text": text})
+        if not lines:
+            return False
+        return max(
+            fuzz.ratio(expected_norm, line)
+            for line in lines
+        ) >= 86
+
+    if field_type == "GENDER":
+        aliases = {
+            "men": ("men", "men's", "mens", "male"),
+            "women": ("women", "women's", "womens", "female"),
+            "boys": ("boys", "boy", "boy's", "boys'"),
+            "girls": ("girls", "girl", "girl's", "girls'"),
+        }
+        key = expected_norm.replace("'", "").replace("s", "")
+        for base, variants in aliases.items():
+            if base.startswith(key) or key.startswith(base.replace("s", "")):
+                return any(v in norm_text for v in variants)
+        return expected_norm in norm_text
+
+    if field_type == "BRAND":
+        if compact_expected and compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
+            return True
+        lines = _auto_detect_lines({"ocr_text": text})
+        return bool(lines) and max(
+            fuzz.ratio(expected_norm, line)
+            for line in lines
+        ) >= 88
+
+    if field_type == "ATTRIBUTE":
+        tokens = [t for t in re.findall(r"[a-z0-9]+", expected_norm) if len(t) >= 3]
+        if not tokens:
+            return False
+        best = 0
+        for line in _auto_detect_lines({"ocr_text": text}):
+            line_tokens = set(re.findall(r"[a-z0-9]+", line))
+            overlap = len(set(tokens) & line_tokens) / max(1, len(set(tokens)))
+            best = max(best, overlap)
+        return best >= 0.60
 
     if field_type == "QUANTITY":
-        compact_digits = normalize_numeric(expected_text)
-        if compact_digits is None:
-            return False
-        return bool(
-            re.search(
-                rf"(?<![A-Za-z0-9]){re.escape(compact_digits)}(?![A-Za-z0-9])",
-                haystack
-            )
-        )
+        # Quantity is intentionally not auto-selected. Artwork often contains
+        # many unrelated numbers (sizes, dimensions, panel counts, etc.). The
+        # designer can explicitly select Qty in the editable dropdown.
+        return False
 
-    # Compare against individual OCR lines so a small OCR typo does not prevent
-    # Auto Detect from proposing the field.
-    tokens = expected_norm.split()
-    if len(tokens) == 1 and len(expected_norm) <= 4:
-        threshold = 88
-    elif field_type in {"SIZE", "GENDER", "COLOR", "BRAND"}:
-        threshold = 72
-    else:
-        threshold = 80
+    if field_type == "BATCH":
+        return False
 
-    for line in page_texts:
-        if fuzz.partial_ratio(expected_norm, line) >= threshold:
-            return True
+    if field_type == "OSZ":
+        # OSZ is sequence-based in the final engine. Auto Detect only proposes
+        # it when the exact value is a standalone number.
+        return _auto_number_evidence(expected, norm_text)
 
+    # GENERAL: deliberately conservative. Auto Detect should not turn every
+    # populated technical/configuration column into a selected field.
+    if len(compact_expected) < 5:
+        return False
+    if normalize_numeric(expected) is not None:
+        return False
+    if compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
+        return True
     return False
 
 
@@ -2620,26 +2819,38 @@ def auto_detect_fields(
     page_row_mapping=None
 ):
     """
-    Auto Detect proposes populated fields using OCR-tolerant evidence.
+    Conservative Auto Detect.
 
-    The final PASS/FAIL result is still produced by build_report/check_field.
-    Auto Detect no longer requires an exact final PASS/FAIL result just to
-    populate the editable field list.
+    It proposes only fields for which the selected Order Form row has
+    high-confidence evidence in its mapped artwork page. Populated Excel cells
+    alone are never enough to select a field.
     """
     available_fields = get_available_fields(df)
+    allowed_auto_types = {
+        "IDENTIFIER",
+        "BRAND",
+        "GENDER",
+        "SIZE",
+        "COLOR",
+        "COO",
+        "CONTENT",
+        "CARE",
+        "ATTRIBUTE",
+        "RN",
+        "OSZ",
+    }
 
     candidates = [
         field for field in available_fields
         if not is_admin_field(field)
+        and get_field_type(field) in allowed_auto_types
     ]
 
     if not candidates or not output_pages:
         return []
 
-    # Evaluate each data row against the PDF page it naturally maps to.
-    detected = []
+    # Build explicit Page -> Data Row mappings.
     rows_to_check = []
-
     if page_row_mapping:
         for page in output_pages:
             page_number = int(page.get("page", 1))
@@ -2658,20 +2869,36 @@ def auto_detect_fields(
     if not rows_to_check:
         return []
 
+    detected = []
+    detected_signatures = set()
+
+    # Process in field order so duplicate columns sharing exactly the same
+    # value do not flood Auto Detect. The first high-confidence field is kept;
+    # the user can still add the other populated columns from the editable
+    # dropdown. This is especially useful for duplicated language/size columns.
     for field in candidates:
-        found = False
+        evidence_count = 0
+        representative_value = None
         for page, row in rows_to_check:
             value = row.get(field, "")
             if is_blank_value(value):
                 continue
+            representative_value = str(value).strip()
+            if _auto_text_evidence(value, field, _auto_detect_page_text(page)):
+                evidence_count += 1
 
-            # Use page-local OCR evidence first.
-            if _auto_detect_value_match(value, field, [page]):
-                found = True
-                break
+        if evidence_count < 1 or representative_value is None:
+            continue
 
-        if found:
-            detected.append(field)
+        signature = (
+            get_field_type(field),
+            normalize_text(representative_value),
+        )
+        if signature in detected_signatures:
+            continue
+
+        detected_signatures.add(signature)
+        detected.append(field)
 
     return detected
 
@@ -3025,22 +3252,132 @@ def main():
             return
 
     # =========================================================
-    # COMPARISON METHOD
+    # FILE INFORMATION + PAGE SELECTION + ROW MAPPING
     # =========================================================
-    comparison_method = None
-    selected_fields = []
+    output_page_count = 0
+    selected_pdf_pages = []
+    page_row_mapping = {}
+    mapping_ready = False
 
     if excel_file and output_file:
-        st.divider()
+        try:
+            output_page_count = get_output_page_count(output_file)
+        except Exception as error:
+            st.error(f"Unable to determine Output Artwork page count: {error}")
+            output_page_count = 0
 
+        st.markdown(
+            '<div class="section-title">📌 File Information</div>',
+            unsafe_allow_html=True
+        )
+
+        info1, info2, info3 = st.columns(3)
+        with info1:
+            st.metric("Excel Data Rows", len(df))
+        with info2:
+            st.metric("Output Pages", output_page_count)
+        with info3:
+            extension = str(output_file.name).split(".")[-1].upper()
+            st.metric("Output Type", extension)
+
+        if output_page_count == 1:
+            selected_pdf_pages = [1]
+            st.caption("One Output page detected. Select which Order Form data row this page should use.")
+        elif output_page_count > 1:
+            page_mode = st.radio(
+                "Artwork page selection",
+                options=["All Pages", "Specific Page(s)"],
+                horizontal=True,
+                key=f"page_mode_{st.session_state['of_reset_id']}"
+            )
+
+            if page_mode == "All Pages":
+                selected_pdf_pages = list(range(1, output_page_count + 1))
+            else:
+                selected_pdf_pages = st.multiselect(
+                    "Select Output Page(s)",
+                    options=list(range(1, output_page_count + 1)),
+                    placeholder="Type or select page number(s)...",
+                    key=f"selected_pdf_pages_{st.session_state['of_reset_id']}"
+                )
+                selected_pdf_pages = sorted(int(page) for page in selected_pdf_pages)
+
+            st.caption(
+                "Page numbers are the actual PDF page numbers. They are never renumbered after selection."
+            )
+
+        # -----------------------------------------------------
+        # PAGE → ORDER FORM ROW MAPPING
+        # -----------------------------------------------------
+        if selected_pdf_pages:
+            st.markdown(
+                '<div class="section-title">🔗 Page → Order Form Row Mapping</div>',
+                unsafe_allow_html=True
+            )
+
+            if len(df) == 1:
+                for page_number in selected_pdf_pages:
+                    page_row_mapping[int(page_number)] = 0
+                st.success(
+                    "✅ Excel contains one data row. Every selected PDF page will use Data Row 1 (Excel Row 2)."
+                )
+                mapping_ready = True
+
+            else:
+                st.caption(
+                    "Each selected PDF page is mapped to an Order Form data row. "
+                    "The default follows Page N → Data Row N, but you can change it."
+                )
+
+                mapping_labels = [
+                    f"Data Row {i + 1}  (Excel Row {i + 2})"
+                    for i in range(len(df))
+                ]
+
+                all_mapped = True
+                for page_number in selected_pdf_pages:
+                    natural_index = int(page_number) - 1
+                    default_index = natural_index if natural_index < len(df) else None
+
+                    selected_row_label = st.selectbox(
+                        f"PDF Page {page_number} → Order Form Data Row",
+                        options=mapping_labels,
+                        index=default_index,
+                        placeholder="Select an Order Form data row...",
+                        key=(
+                            f"page_row_map_{page_number}_"
+                            f"{st.session_state['of_reset_id']}"
+                        )
+                    )
+
+                    if selected_row_label:
+                        selected_row_index = mapping_labels.index(selected_row_label)
+                        page_row_mapping[int(page_number)] = selected_row_index
+                    else:
+                        all_mapped = False
+
+                mapping_ready = bool(selected_pdf_pages) and all_mapped
+
+                if mapping_ready:
+                    st.success("✅ Page-to-row mapping is ready for comparison.")
+                else:
+                    st.info(
+                        "Please select an Order Form data row for every selected PDF page before comparison."
+                    )
+
+        # =========================================================
+        # COMPARISON METHOD
+        # =========================================================
+        comparison_method = None
+        selected_fields = []
+
+        st.divider()
         st.markdown(
             '<div class="section-title">⚙️ Comparison Method</div>',
             unsafe_allow_html=True
         )
-
         st.caption(
-            "Choose how the Order Form data should be matched to the Output. "
-            "Nothing is selected automatically."
+            "Choose how the Order Form data should be matched to the Output."
         )
 
         comparison_method = st.radio(
@@ -3051,9 +3388,6 @@ def main():
             key=f"comparison_method_{st.session_state['of_reset_id']}"
         )
 
-        # =========================================================
-        # AUTO DETECT / MANUAL FIELD SELECTION
-        # =========================================================
         available_fields = get_available_fields(df)
 
         if comparison_method == "Auto Detect":
@@ -3063,70 +3397,87 @@ def main():
                 str(getattr(output_file, "name", "")),
                 int(getattr(output_file, "size", 0)),
                 product_type,
+                tuple(sorted(page_row_mapping.items()))
             )
 
-            if st.session_state.get("of_auto_detect_key") != auto_key:
-                try:
-                    with st.spinner("Auto Detect is reading the artwork with OCR..."):
-                        auto_pages = extract_output_pages(output_file)
-                        detected_fields = auto_detect_fields(
-                            df,
-                            auto_pages,
-                            product_type
-                        )
-                    st.session_state["of_auto_detected_fields"] = detected_fields
-                    st.session_state["of_auto_output_pages"] = auto_pages
-                    st.session_state["of_auto_detect_key"] = auto_key
-                except Exception as error:
-                    st.error(
-                        f"Unable to run Auto Detect: {type(error).__name__}: {error}"
-                    )
-                    with st.expander("Technical error details", expanded=False):
-                        import traceback
-                        st.code(traceback.format_exc())
+            auto_widget_key = f"auto_selected_fields_{st.session_state['of_reset_id']}"
 
-            detected_fields = st.session_state.get("of_auto_detected_fields", [])
+            if not mapping_ready:
+                st.info(
+                    "Complete the Page → Order Form Row Mapping first. Auto Detect will then read only the mapped artwork page(s)."
+                )
+                detected_fields = []
+            else:
+                if st.session_state.get("of_auto_detect_key") != auto_key:
+                    try:
+                        with st.spinner("Auto Detect is reading the mapped artwork page(s) with OCR..."):
+                            auto_pages = extract_output_pages(output_file)
+                            detected_fields = auto_detect_fields(
+                                df,
+                                auto_pages,
+                                product_type,
+                                page_row_mapping=page_row_mapping
+                            )
+                        st.session_state["of_auto_detected_fields"] = detected_fields
+                        st.session_state["of_auto_output_pages"] = auto_pages
+                        st.session_state["of_auto_detect_key"] = auto_key
+                        # Reset the editable Auto Detect selection only when the
+                        # files/mapping actually change. Manual edits then remain
+                        # untouched on subsequent Streamlit reruns.
+                        st.session_state[auto_widget_key] = list(detected_fields)
+                    except Exception as error:
+                        st.error(
+                            f"Unable to run Auto Detect: {type(error).__name__}: {error}"
+                        )
+                        with st.expander("Technical error details", expanded=False):
+                            import traceback
+                            st.code(traceback.format_exc())
+
+                detected_fields = st.session_state.get("of_auto_detected_fields", [])
 
             st.markdown(
                 '<div class="section-title">🤖 Auto Detected Fields</div>',
                 unsafe_allow_html=True
             )
             st.caption(
-                "Auto Detect proposes populated fields that can be associated with the artwork. "
-                "Review the list, remove fields, or add another populated field before comparison."
+                "Only fields with strong evidence in the mapped artwork are pre-selected. "
+                "You can remove a detected field or add another populated field before comparison."
             )
 
             default_auto = [field for field in detected_fields if field in available_fields]
+            # Session state is populated above only when Auto Detect input changes.
+            # This keeps the field list editable without Streamlit overwriting the
+            # user's add/remove choices on every rerun.
             selected_fields = st.multiselect(
                 "Review detected fields",
                 options=available_fields,
-                default=default_auto,
+                placeholder="Type to search or add a populated field...",
                 label_visibility="collapsed",
-                key=f"auto_selected_fields_{st.session_state['of_reset_id']}"
+                key=auto_widget_key
             )
 
             if selected_fields:
                 st.caption("Selected fields: " + ", ".join(selected_fields))
             else:
-                st.info("Auto Detect did not select any populated fields. Add fields manually from the list above.")
+                st.warning(
+                    "Auto Detect did not find high-confidence populated fields in the mapped artwork. "
+                    "You can add fields directly from the dropdown."
+                )
 
-        else:
+        elif comparison_method == "Select Fields":
             st.markdown(
                 '<div class="section-title">Select Variable Fields to Validate</div>',
                 unsafe_allow_html=True
             )
             st.caption(
-                "Only populated Order Form fields are shown. Click the dropdown and type to search by field name."
+                "Only populated Order Form fields are shown. Search directly inside the dropdown by typing the field name."
             )
 
             previous = st.session_state.get(
                 f"selected_fields_{st.session_state['of_reset_id']}",
                 []
             )
-            previous = [
-                field for field in previous
-                if field in available_fields
-            ]
+            previous = [field for field in previous if field in available_fields]
 
             selected_fields = st.multiselect(
                 "Select the fields from your Order Form",
@@ -3145,7 +3496,6 @@ def main():
                         if is_blank_value(value):
                             continue
                         values.append(str(value).strip())
-
                     preview_rows.append({
                         "Excel Field": field,
                         "Values": len(values),
@@ -3163,56 +3513,16 @@ def main():
                     "No fields are currently selected. Click the field dropdown and type to search for a populated field."
                 )
 
-    # =========================================================
-    # FILE INFORMATION
-    # Page count is metadata only. Output text/OCR is NOT extracted here.
-    # =========================================================
-    if excel_file and output_file:
-        try:
-            output_page_count = get_output_page_count(output_file)
-        except Exception as error:
-            output_page_count = 0
-            st.warning(
-                f"Unable to determine output page count: {error}"
-            )
-
-        st.markdown(
-            '<div class="section-title">📌 File Information</div>',
-            unsafe_allow_html=True
-        )
-
-        info1, info2, info3 = st.columns(3)
-
-        with info1:
-            st.metric("Excel Data Rows", len(df))
-
-        with info2:
-            st.metric("Output Pages", output_page_count)
-
-        with info3:
-            extension = str(output_file.name).split(".")[-1].upper()
-            st.metric("Output Type", extension)
-
-        if output_page_count:
-            st.caption(
-                "PDF page count and Excel row count are shown for reference. "
-                "They do not need to be equal for comparison."
-            )
-
-    # =========================================================
-    # COMPARE BUTTON
-    # Extraction and comparison start ONLY after COMPARE.
-    # =========================================================
-    if excel_file and output_file:
+        # =========================================================
+        # COMPARE BUTTON
+        # =========================================================
         st.markdown("<br>", unsafe_allow_html=True)
 
         compare_ready = (
             comparison_method is not None
-            and (
-                comparison_method == "Auto Detect"
-                or bool(selected_fields)
-            )
+            and bool(selected_fields)
             and product_type != "----- SELECT -----"
+            and mapping_ready
         )
 
         if st.button(
@@ -3222,10 +3532,7 @@ def main():
             disabled=not compare_ready
         ):
             try:
-                with st.spinner(
-                    "Reading output and preparing comparison..."
-                ):
-                    # Reuse the OCR pages already prepared for Auto Detect.
+                with st.spinner("Reading output and preparing comparison..."):
                     if (
                         comparison_method == "Auto Detect"
                         and st.session_state.get("of_auto_output_pages")
@@ -3235,25 +3542,25 @@ def main():
                         output_pages = extract_output_pages(output_file)
 
                     if not output_pages:
-                        raise ValueError(
-                            "No readable output pages were detected."
-                        )
+                        raise ValueError("No readable output pages were detected.")
 
                     if not selected_fields:
-                        raise ValueError(
-                            "No fields are selected for comparison."
-                        )
+                        raise ValueError("No fields are selected for comparison.")
 
                     st.session_state["of_report"] = build_report(
                         df,
                         output_pages,
                         selected_fields,
-                        product_type
+                        product_type,
+                        page_row_mapping=page_row_mapping
                     )
                     st.session_state["of_report_selected_fields"] = selected_fields
                     st.session_state["of_report_product_type"] = product_type
                     st.session_state["of_report_comparison_method"] = comparison_method
-                    st.session_state["of_visual_pages"] = output_pages
+                    st.session_state["of_visual_pages"] = [
+                        page for page in output_pages
+                        if int(page.get("page", 0)) in selected_pdf_pages
+                    ]
 
             except Exception as error:
                 import traceback
@@ -3262,7 +3569,6 @@ def main():
                 )
                 with st.expander("Technical error details", expanded=True):
                     st.code(traceback.format_exc())
-
     # =========================================================
     # SAVED REPORT
     # =========================================================
@@ -3366,7 +3672,7 @@ def main():
                 highlighted = build_highlighted_page_image(page, page_report)
                 if highlighted is not None:
                     st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width="stretch")
+                    st.image(highlighted, width=750)
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
@@ -3385,13 +3691,11 @@ def main():
 
                 **Page mapping**
 
-                PDF Page 1 → Excel Row 2
+                Each selected PDF page is mapped to a specific Order Form data row.
 
-                PDF Page 2 → Excel Row 3
+                By default, Page N → Data Row N (Excel Row N+1), but the mapping can be changed manually.
 
-                PDF Page 3 → Excel Row 4
-
-                and so on.
+                When the Excel contains only one data row, every selected PDF page uses Data Row 1 (Excel Row 2).
 
                 **PFL mode**
 
