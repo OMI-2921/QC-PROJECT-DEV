@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-ANNOTATION-07"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-NO-REASON-EXACT-10"
 import pandas as pd
 import fitz
 import re
@@ -1642,10 +1642,19 @@ def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, d
 
 
 def build_highlighted_page_image(page, page_report, field_colors=None):
-    """Render the original artwork with precise field mapping annotations.
+    """Draw the existing comparison result onto the original artwork.
 
-    Presentation-only layer. Comparison decisions are read from ``page_report``
-    and are never recalculated or modified here.
+    IMPORTANT: presentation-only. This function never re-runs comparison
+    logic. It only visualizes rows already present in ``page_report``.
+
+    Visual rules:
+      - PASS: highlight the actual matched artwork value/block in its field color.
+      - FAIL: highlight the actual incorrect artwork value/block with a red fill
+        while retaining the field-specific outline color.
+      - CARE/CONTENT/long text: highlight the complete physical block that was
+        compared, not only the word that differs.
+      - Annotation text is ALWAYS just ``FIELD • STATUS``. Detailed reasons stay
+        exclusively in the comparison table.
     """
     image_bytes = page.get("image_bytes")
     if not image_bytes:
@@ -1660,77 +1669,95 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
     if page_report is None or page_report.empty:
         return base.convert("RGB")
 
-    annotations = []
     field_order = []
     for _, row in page_report.iterrows():
-        field = str(row.get("FIELD", ""))
+        field = str(row.get("FIELD", "")).strip()
         if field and field not in field_order:
             field_order.append(field)
+    number_by_field = {field: i + 1 for i, field in enumerate(field_order)}
 
-    number_by_field = {field: index + 1 for index, field in enumerate(field_order)}
+    # Collect one visual annotation per field. For block fields the anchor is the
+    # union of all line boxes, while the actual artwork still gets line-by-line
+    # boxes so the compared physical block is clear.
+    annotations = []
     annotated_fields = set()
 
     for _, row in page_report.iterrows():
-        status = str(row.get("STATUS", "")).strip()
+        status = str(row.get("STATUS", "")).strip().upper()
         if status not in {"PASS", "FAIL"}:
             continue
 
         field_name = str(row.get("FIELD", "")).strip()
-        pdf_output = str(row.get("PDF OUTPUT", "")).strip()
-        expected_value = str(row.get("ORDER FORM DATA", "")).strip()
-
-        if not pdf_output or pdf_output.casefold() in {"not found", "—", "-"}:
+        if not field_name:
             continue
 
-        # Block fields are mapped to the whole compared physical region.
-        # Prefer semantic artwork-region detection because PDF OUTPUT may be a
-        # comparison-constructed long string rather than a verbatim OCR line.
+        expected_value = str(row.get("ORDER FORM DATA", "") or "").strip()
+        pdf_output = str(row.get("PDF OUTPUT", "") or "").strip()
+
+        if pdf_output.casefold() in {"", "not found", "—", "-"}:
+            continue
+
+        field_type = get_field_type(field_name)
+
+        # Long/block fields must NEVER fall back to a single differing token.
         if _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
             boxes = _find_visual_semantic_block_boxes(page, field_name)
             if not boxes:
                 boxes = _find_visual_block_boxes(page, pdf_output, field_name)
-        elif get_field_type(field_name) == "OSZ":
+            if not boxes and status == "FAIL":
+                boxes = _find_visual_failure_boxes(
+                    page, field_name, expected_value, pdf_output,
+                    row.get("DIFFERENCE", "")
+                )
+        elif field_type == "OSZ":
             boxes = _find_visual_osz_box(page, field_name, pdf_output)
+            if not boxes and status == "FAIL":
+                boxes = _find_visual_failure_boxes(
+                    page, field_name, expected_value, pdf_output,
+                    row.get("DIFFERENCE", "")
+                )
         else:
             boxes = _find_visual_boxes(page, pdf_output, field_name)
-
-        if status == "FAIL" and not boxes:
-            boxes = _find_visual_failure_boxes(
-                page,
-                field_name,
-                expected_value,
-                pdf_output,
-                row.get("DIFFERENCE", ""),
-            )
+            if not boxes and status == "FAIL":
+                boxes = _find_visual_failure_boxes(
+                    page, field_name, expected_value, pdf_output,
+                    row.get("DIFFERENCE", "")
+                )
 
         if not boxes:
             continue
 
         color = field_colors.get(field_name, FIELD_VISUAL_COLORS[0])
         rgb = _hex_rgb(color)
+        padded_boxes = []
 
-        for box in boxes:
-            left, top, right, bottom = box
+        for raw_box in boxes:
+            left, top, right, bottom = raw_box
             pad = max(2, int(min(base.size) * 0.0018))
-            left = max(0, left - pad)
-            top = max(0, top - pad)
-            right = min(base.width - 1, right + pad)
-            bottom = min(base.height - 1, bottom + pad)
+            left = max(0, int(left) - pad)
+            top = max(0, int(top) - pad)
+            right = min(base.width - 1, int(right) + pad)
+            bottom = min(base.height - 1, int(bottom) + pad)
+            if right <= left or bottom <= top:
+                continue
+
+            padded_boxes.append((left, top, right, bottom))
 
             if status == "FAIL":
-                # Red is the defect color; the field-specific outline preserves
-                # field identity.
+                # Red fill = defect, field color outline = field identity.
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
                     radius=max(3, pad),
-                    fill=(218, 54, 51, 100),
+                    fill=(218, 54, 51, 105),
                     outline=rgb + (255,),
                     width=max(2, pad),
                 )
+                error_pad = max(2, pad + 1)
                 draw.rounded_rectangle(
-                    (max(0, left - 1), max(0, top - 1),
-                     min(base.width - 1, right + 1), min(base.height - 1, bottom + 1)),
-                    radius=max(3, pad + 1),
+                    (max(0, left - error_pad), max(0, top - error_pad),
+                     min(base.width - 1, right + error_pad),
+                     min(base.height - 1, bottom + error_pad)),
+                    radius=max(3, error_pad),
                     outline=(218, 54, 51, 255),
                     width=max(2, pad // 2),
                 )
@@ -1743,19 +1770,30 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
                     width=max(2, pad),
                 )
 
-            if field_name not in annotated_fields:
-                annotations.append({
-                    "field": field_name,
-                    "status": status,
-                    "color": color,
-                    "rgb": rgb,
-                    "box": (left, top, right, bottom),
-                    "number": number_by_field.get(field_name, 0),
-                })
-                annotated_fields.add(field_name)
+        if not padded_boxes or field_name in annotated_fields:
+            continue
 
-    # Labels intentionally remain simple: the artwork communicates the scope
-    # of comparison, while detailed reasons stay in the comparison table.
+        # Anchor the annotation to the complete compared region for block fields.
+        if _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
+            annotation_box = (
+                min(box[0] for box in padded_boxes),
+                min(box[1] for box in padded_boxes),
+                max(box[2] for box in padded_boxes),
+                max(box[3] for box in padded_boxes),
+            )
+        else:
+            annotation_box = padded_boxes[0]
+
+        annotations.append({
+            "field": field_name,
+            "status": status,
+            "rgb": rgb,
+            "box": annotation_box,
+            "number": number_by_field.get(field_name, 0),
+        })
+        annotated_fields.add(field_name)
+
+    # One compact label per field. NEVER display failure reasons here.
     used_label_rects = []
     for item in annotations:
         box = item["box"]
@@ -1764,23 +1802,20 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         rgb = item["rgb"]
         number = item["number"]
 
-        title_text = f"{number}. {field_name} • {status}"
+        label_text = f"{number}. {field_name} • {status}"
         font = bold_font or regular_font
-        tw, th = _text_size(draw, title_text, font)
+        tw, th = _text_size(draw, label_text, font)
 
         max_label_w = max(210, int(base.width * 0.38))
         label_w = min(tw + 26, max_label_w)
         label_h = th + 16
 
         label_x, label_y = _place_label_above_or_below(
-            box,
-            label_w,
-            label_h,
-            base.width,
-            base.height,
-            used_label_rects,
+            box, label_w, label_h, base.width, base.height, used_label_rects
         )
-        used_label_rects.append((label_x, label_y, label_x + label_w, label_y + label_h))
+        used_label_rects.append(
+            (label_x, label_y, label_x + label_w, label_y + label_h)
+        )
 
         box_cx = int((box[0] + box[2]) / 2)
         if label_y + label_h <= box[1]:
@@ -1796,9 +1831,10 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             label_anchor = (int(label_x), int(label_y + label_h / 2))
             target_anchor = (box[2], int((box[1] + box[3]) / 2))
 
+        connector_color = (218, 54, 51) if status == "FAIL" else rgb
         draw.line(
             (label_anchor[0], label_anchor[1], target_anchor[0], target_anchor[1]),
-            fill=((218, 54, 51) if status == "FAIL" else rgb) + (235,),
+            fill=connector_color + (235,),
             width=max(2, int(min(base.size) * 0.00095)),
         )
 
@@ -1820,13 +1856,12 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
 
         draw.text(
             (label_x + bar_w + 8, label_y + 6),
-            title_text,
+            label_text,
             fill=(20, 28, 40, 255),
             font=font,
         )
 
     return Image.alpha_composite(base, overlay).convert("RGB")
-
 
 def _visual_image_bytes(image):
     if image is None:
