@@ -1,4 +1,8 @@
 import streamlit as st
+
+# Build marker used in Auto Detect cache keys so code updates cannot reuse
+# stale detected-field selections from an older engine version.
+AUTO_DETECT_ENGINE_VERSION = "2026-09-04-AUTODETECT-ROWMAP-FIX-03"
 import pandas as pd
 import fitz
 import re
@@ -3653,6 +3657,7 @@ def main():
 
         if comparison_method == "Auto Detect":
             auto_key = (
+                AUTO_DETECT_ENGINE_VERSION,
                 str(getattr(excel_file, "name", "")),
                 int(getattr(excel_file, "size", 0)),
                 str(getattr(output_file, "name", "")),
@@ -3715,6 +3720,11 @@ def main():
                 placeholder="Type to search or add a populated field...",
                 label_visibility="collapsed",
                 key=auto_widget_key
+            )
+
+            st.caption(
+                f"Auto Detect engine: {AUTO_DETECT_ENGINE_VERSION} • "
+                f"{len(selected_fields)} field(s) currently selected"
             )
 
             if selected_fields:
