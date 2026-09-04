@@ -6,10 +6,11 @@ import unicodedata
 import io
 from io import BytesIO
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as XLImage
 
 def _apply_tool_css():
     # =========================================================
@@ -490,23 +491,57 @@ def _text_quality_score(text):
     return alnum + useful_lines * 8 + numeric_runs * 3
 
 
-def _ocr_image(image):
+def _ocr_image_with_data(image):
+    """Run OCR once and return both text and word-level bounding boxes."""
     try:
         import pytesseract
+        from pytesseract import Output
     except ImportError as exc:
         raise RuntimeError(
             "OCR support is not installed. Add pytesseract to requirements.txt."
         ) from exc
 
-    # Prefer English first. Many Streamlit/Tesseract deployments do not carry
-    # the optional French/Spanish traineddata files, and forcing missing
-    # language packs can break OCR completely.
     errors = []
     for lang in ("eng", "eng+fra+spa"):
         try:
-            text = pytesseract.image_to_string(image, lang=lang)
+            data = pytesseract.image_to_data(
+                image,
+                lang=lang,
+                output_type=Output.DICT,
+                config="--psm 6"
+            )
+            words = []
+            grouped_text = {}
+            for i, raw_text in enumerate(data.get("text", [])):
+                word = str(raw_text or "").strip()
+                if not word:
+                    continue
+                try:
+                    conf = float(data.get("conf", ["-1"] * len(data.get("text", [])))[i])
+                except Exception:
+                    conf = -1.0
+                item = {
+                    "text": word,
+                    "left": int(data.get("left", [0])[i]),
+                    "top": int(data.get("top", [0])[i]),
+                    "width": int(data.get("width", [0])[i]),
+                    "height": int(data.get("height", [0])[i]),
+                    "conf": conf,
+                    "block_num": int(data.get("block_num", [0])[i]),
+                    "par_num": int(data.get("par_num", [0])[i]),
+                    "line_num": int(data.get("line_num", [0])[i]),
+                }
+                words.append(item)
+                line_key = (item["block_num"], item["par_num"], item["line_num"])
+                grouped_text.setdefault(line_key, []).append(item)
+
+            text_lines = []
+            for _key, line_words in sorted(grouped_text.items(), key=lambda pair: pair[0]):
+                line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+                text_lines.append(" ".join(item["text"] for item in line_words))
+            text = "\n".join(text_lines)
             if _usable_text(text):
-                return text
+                return text, words, lang
         except Exception as exc:
             errors.append(f"{lang}: {exc}")
 
@@ -515,8 +550,12 @@ def _ocr_image(image):
             "OCR could not run. Tesseract may be missing or language data may "
             "not be installed. Details: " + " | ".join(errors)
         )
+    return "", [], ""
 
-    return ""
+
+def _ocr_image(image):
+    text, _words, _lang = _ocr_image_with_data(image)
+    return text
 
 
 def _render_pdf_page(page):
@@ -527,6 +566,12 @@ def _render_pdf_page(page):
     return Image.open(
         io.BytesIO(pixmap.tobytes("png"))
     ).convert("RGB")
+
+
+def _image_to_png_bytes(image):
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 def get_output_page_count(file):
@@ -549,12 +594,10 @@ def get_output_page_count(file):
 
 def extract_output_pages(file):
     """
-    Extract artwork page text.
+    Extract artwork pages with OCR as the primary source.
 
-    For PDF artwork, OCR is attempted for every page. This is intentional:
-    a PDF can look non-editable in a viewer while still containing a weak or
-    stale text layer. The OCR result is therefore preferred when it is usable;
-    the embedded PDF text remains a fallback.
+    Every page also stores the rendered full-page image and OCR word boxes so
+    the exact artwork can later be displayed with highlight overlays.
     """
     name = str(getattr(file, "name", "")).casefold()
 
@@ -570,16 +613,17 @@ def extract_output_pages(file):
         try:
             for page_number, page in enumerate(document, start=1):
                 direct_text = page.get_text("text") or ""
+                image = _render_pdf_page(page)
                 ocr_text = ""
+                ocr_words = []
                 ocr_error = None
+                ocr_lang = ""
 
                 try:
-                    ocr_text = _ocr_image(_render_pdf_page(page)) or ""
+                    ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
                 except Exception as exc:
                     ocr_error = exc
 
-                # Prefer OCR for non-editable/scanned artwork. When OCR is not
-                # available, use a usable embedded text layer rather than failing.
                 if _usable_text(ocr_text):
                     text = ocr_text
                     source_type = "ocr"
@@ -597,7 +641,12 @@ def extract_output_pages(file):
                     "text": str(text),
                     "source_type": source_type,
                     "direct_text": str(direct_text or ""),
-                    "ocr_text": str(ocr_text or "")
+                    "ocr_text": str(ocr_text or ""),
+                    "ocr_words": ocr_words,
+                    "ocr_lang": ocr_lang,
+                    "image_bytes": _image_to_png_bytes(image),
+                    "image_width": image.width,
+                    "image_height": image.height,
                 })
         finally:
             document.close()
@@ -608,21 +657,174 @@ def extract_output_pages(file):
     if name.endswith((".jpg", ".jpeg", ".png")):
         file.seek(0)
         image = Image.open(file).convert("RGB")
-        text = _ocr_image(image)
-        if not _usable_text(text):
+        ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
+        if not _usable_text(ocr_text):
             raise RuntimeError("No readable artwork text was detected in the image.")
         file.seek(0)
         return [{
             "page": 1,
-            "text": str(text),
+            "text": str(ocr_text),
             "source_type": "ocr",
             "direct_text": "",
-            "ocr_text": str(text)
+            "ocr_text": str(ocr_text),
+            "ocr_words": ocr_words,
+            "ocr_lang": ocr_lang,
+            "image_bytes": _image_to_png_bytes(image),
+            "image_width": image.width,
+            "image_height": image.height,
         }]
 
     raise ValueError(
         "Unsupported output format. Please upload PDF, JPG, JPEG, or PNG."
     )
+
+
+# =========================================================
+# VISUAL ARTWORK HIGHLIGHTING
+# =========================================================
+
+def _visual_norm(text):
+    if text is None:
+        return ""
+    value = unicodedata.normalize("NFKC", str(text)).casefold()
+    value = value.replace("%", "")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _word_text_norm(text):
+    value = _visual_norm(text)
+    return value.replace(" ", "")
+
+
+def _find_word_boxes_for_target(page, target):
+    """Find OCR word rectangles corresponding to a report's PDF OUTPUT value."""
+    target_norm = _visual_norm(target)
+    if not target_norm or target_norm in {"not found", "—", "-"}:
+        return []
+
+    words = [w for w in page.get("ocr_words", []) if str(w.get("text", "")).strip()]
+    if not words:
+        return []
+
+    # Group OCR words by OCR line, preserving page order.
+    grouped = {}
+    for word in words:
+        key = (
+            word.get("block_num", 0),
+            word.get("par_num", 0),
+            word.get("line_num", 0),
+        )
+        grouped.setdefault(key, []).append(word)
+
+    target_tokens = target_norm.split()
+    matches = []
+
+    for line_words in grouped.values():
+        line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+        normalized_words = [_visual_norm(item["text"]) for item in line_words]
+
+        # Exact contiguous token-window search.
+        for start in range(len(line_words)):
+            joined = ""
+            for end in range(start, len(line_words)):
+                token = normalized_words[end]
+                if not token:
+                    continue
+                joined = (joined + " " + token).strip()
+                if joined == target_norm or joined.replace(" ", "") == target_norm.replace(" ", ""):
+                    matches.append(line_words[start:end + 1])
+                    break
+                if len(joined.replace(" ", "")) > len(target_norm.replace(" ", "")) + 4:
+                    break
+
+        # Single-token fallback.
+        compact_target = target_norm.replace(" ", "")
+        for word in line_words:
+            compact_word = _word_text_norm(word["text"])
+            if compact_word == compact_target or compact_target in compact_word:
+                matches.append([word])
+
+    if not matches:
+        # Search across neighbouring OCR lines for multi-line output values.
+        ordered = []
+        for key, line_words in sorted(grouped.items(), key=lambda item: item[0]):
+            line_words.sort(key=lambda item: (item.get("left", 0), item.get("top", 0)))
+            ordered.extend(line_words)
+        compact_target = target_norm.replace(" ", "")
+        for start in range(len(ordered)):
+            current = ""
+            selected = []
+            for end in range(start, min(len(ordered), start + 15)):
+                token = _word_text_norm(ordered[end]["text"])
+                if not token:
+                    continue
+                current += token
+                selected.append(ordered[end])
+                if current == compact_target:
+                    matches.append(selected)
+                    break
+                if len(current) > len(compact_target) + 4:
+                    break
+
+    # Convert groups to rectangles and deduplicate.
+    boxes = []
+    seen = set()
+    for group in matches:
+        if not group:
+            continue
+        left = min(int(w.get("left", 0)) for w in group)
+        top = min(int(w.get("top", 0)) for w in group)
+        right = max(int(w.get("left", 0)) + int(w.get("width", 0)) for w in group)
+        bottom = max(int(w.get("top", 0)) + int(w.get("height", 0)) for w in group)
+        key = (left, top, right, bottom)
+        if right <= left or bottom <= top or key in seen:
+            continue
+        seen.add(key)
+        boxes.append(key)
+    return boxes
+
+
+def build_highlighted_page_image(page, page_report):
+    """Return the complete artwork page with PASS/FAIL highlight overlays."""
+    image_bytes = page.get("image_bytes")
+    if not image_bytes:
+        return None
+
+    base = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    if page_report is not None and not page_report.empty:
+        for _, row in page_report.iterrows():
+            status = str(row.get("STATUS", ""))
+            if status not in {"PASS", "FAIL"}:
+                continue
+            target = row.get("PDF OUTPUT", "")
+            boxes = _find_word_boxes_for_target(page, target)
+            fill = (35, 134, 54, 75) if status == "PASS" else (218, 54, 51, 95)
+            outline = (35, 134, 54, 220) if status == "PASS" else (218, 54, 51, 240)
+            for left, top, right, bottom in boxes:
+                pad = max(3, int(min(base.size) * 0.004))
+                left = max(0, left - pad)
+                top = max(0, top - pad)
+                right = min(base.width - 1, right + pad)
+                bottom = min(base.height - 1, bottom + pad)
+                draw.rounded_rectangle(
+                    (left, top, right, bottom),
+                    radius=max(3, pad),
+                    fill=fill,
+                    outline=outline,
+                    width=max(2, pad // 2),
+                )
+
+    return Image.alpha_composite(base, overlay).convert("RGB")
+
+
+def _visual_image_bytes(image):
+    if image is None:
+        return None
+    return _image_to_png_bytes(image)
 
 def clean_pdf_line(line):
     if not line:
@@ -2388,15 +2590,12 @@ def style_status(value):
 
 
 
-def create_excel_report(report, product_type, comparison_method, selected_fields):
-    """Create a professional Excel QC report with Summary and Field Comparison sheets."""
+def create_excel_report(report, product_type, comparison_method, selected_fields, visual_pages=None):
+    """Create a professional Excel QC report, including full artwork pages with highlights."""
 
     output = BytesIO()
     wb = Workbook()
 
-    # ---------------------------------------------------------
-    # COLORS
-    # ---------------------------------------------------------
     NAVY = "1F4E78"
     LIGHT_BLUE = "D9EAF7"
     GREEN = "238636"
@@ -2406,28 +2605,14 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
     WHITE = "FFFFFF"
     LIGHT_BORDER = "D9E1F2"
 
-    # ---------------------------------------------------------
-    # COUNTS
-    # ---------------------------------------------------------
     pass_count = int((report["STATUS"] == "PASS").sum()) if not report.empty else 0
     fail_count = int((report["STATUS"] == "FAIL").sum()) if not report.empty else 0
     not_found_count = int((report["STATUS"] == "NOT FOUND").sum()) if not report.empty else 0
     skip_count = int((report["STATUS"] == "SKIP").sum()) if not report.empty else 0
     total_checks = len(report)
 
-    if fail_count > 0:
-        overall = "FAIL"
-    elif not_found_count > 0:
-        overall = "REVIEW"
-    else:
-        overall = "PASS"
-
-    # =========================================================
-    # SUMMARY
-    # =========================================================
     ws = wb.active
     ws.title = "Summary"
-
     ws.merge_cells("A1:F2")
     ws["A1"] = "PDF PROOFREADING QC REPORT"
     ws["A1"].font = Font(bold=True, size=20, color=WHITE)
@@ -2443,7 +2628,6 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         ("FAIL", fail_count),
         ("NOT FOUND", not_found_count),
         ("IGNORED / SKIP", skip_count),
-        ("Overall Result", overall),
     ]
 
     for r, (label, value) in enumerate(summary, start=4):
@@ -2454,18 +2638,11 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         ws.cell(r, 1).alignment = Alignment(vertical="center")
         ws.cell(r, 2).alignment = Alignment(vertical="center", wrap_text=True)
 
-    result_cell = ws["B12"]
-    result_color = GREEN if overall == "PASS" else RED if overall == "FAIL" else AMBER
-    result_cell.fill = PatternFill("solid", fgColor=result_color)
-    result_cell.font = Font(bold=True, color=WHITE)
-    result_cell.alignment = Alignment(horizontal="center", vertical="center")
-
     ws.column_dimensions["A"].width = 32
     ws.column_dimensions["B"].width = 28
     ws.freeze_panes = "A4"
 
-    # Small finding section
-    finding_row = 15
+    finding_row = 14
     ws.merge_cells(start_row=finding_row, start_column=1, end_row=finding_row, end_column=6)
     ws.cell(finding_row, 1, "QC NOTES")
     ws.cell(finding_row, 1).font = Font(bold=True, color=WHITE)
@@ -2480,20 +2657,14 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         notes.append(f"{skip_count} blank/ignored field check(s) were skipped.")
     if not notes:
         notes.append("All checked fields passed.")
-
     for idx, note in enumerate(notes, start=finding_row + 1):
         ws.merge_cells(start_row=idx, start_column=1, end_row=idx, end_column=6)
         ws.cell(idx, 1, "• " + note)
         ws.cell(idx, 1).alignment = Alignment(wrap_text=True, vertical="top")
 
-    # =========================================================
-    # FIELD COMPARISON
-    # =========================================================
     comparison = wb.create_sheet("Field Comparison")
-
     headers = list(report.columns)
     header_fill = PatternFill("solid", fgColor=NAVY)
-
     for col_idx, header in enumerate(headers, start=1):
         cell = comparison.cell(1, col_idx, header)
         cell.font = Font(bold=True, color=WHITE)
@@ -2505,18 +2676,15 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
             cell = comparison.cell(row_idx, col_idx, value)
             cell.alignment = Alignment(vertical="top", wrap_text=True)
 
-    # Status colors
     status_col = None
     for idx, header in enumerate(headers, start=1):
         if header == "STATUS":
             status_col = idx
             break
-
     if status_col:
         for row_idx in range(2, comparison.max_row + 1):
             cell = comparison.cell(row_idx, status_col)
             status = str(cell.value or "")
-
             if status == "PASS":
                 cell.fill = PatternFill("solid", fgColor=GREEN)
                 cell.font = Font(color=WHITE, bold=True)
@@ -2530,7 +2698,6 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
                 cell.fill = PatternFill("solid", fgColor=GREY)
                 cell.font = Font(color=WHITE, bold=True)
 
-    # Widths
     width_map = {
         "FIELD NO": 12,
         "PDF PAGE": 12,
@@ -2542,24 +2709,55 @@ def create_excel_report(report, product_type, comparison_method, selected_fields
         "DIFFERENCE": 58,
         "MATCH TYPE": 22,
     }
-
     for col_idx, header in enumerate(headers, start=1):
-        letter = get_column_letter(col_idx)
-        comparison.column_dimensions[letter].width = width_map.get(header, 20)
-
+        comparison.column_dimensions[get_column_letter(col_idx)].width = width_map.get(header, 20)
     comparison.row_dimensions[1].height = 32
     for row_idx in range(2, comparison.max_row + 1):
         comparison.row_dimensions[row_idx].height = 55
-
     comparison.freeze_panes = "A2"
     comparison.auto_filter.ref = comparison.dimensions
 
     thin = Side(style="thin", color=LIGHT_BORDER)
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
     for row in comparison.iter_rows():
         for cell in row:
             cell.border = border
+
+    if visual_pages:
+        visual = wb.create_sheet("Artwork Visual Validation")
+        visual.column_dimensions["A"].width = 22
+        visual.column_dimensions["B"].width = 24
+        visual.column_dimensions["C"].width = 24
+        visual["A1"] = "ARTWORK VISUAL VALIDATION"
+        visual["A1"].font = Font(bold=True, size=16, color=WHITE)
+        visual["A1"].fill = PatternFill("solid", fgColor=NAVY)
+        visual.merge_cells("A1:C2")
+        visual["A1"].alignment = Alignment(horizontal="center", vertical="center")
+
+        row_cursor = 4
+        for page in visual_pages:
+            page_num = page.get("page")
+            page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
+            highlighted = build_highlighted_page_image(page, page_report)
+            if highlighted is None:
+                continue
+            visual.cell(row_cursor, 1, f"Artwork Page {page_num}")
+            visual.cell(row_cursor, 1).font = Font(bold=True, size=13, color=WHITE)
+            visual.cell(row_cursor, 1).fill = PatternFill("solid", fgColor=NAVY)
+            visual.merge_cells(start_row=row_cursor, start_column=1, end_row=row_cursor, end_column=3)
+            row_cursor += 1
+            image_data = _visual_image_bytes(highlighted)
+            if image_data:
+                img = XLImage(BytesIO(image_data))
+                img.width = min(900, highlighted.width)
+                img.height = int(highlighted.height * (img.width / highlighted.width))
+                anchor = f"A{row_cursor}"
+                visual.add_image(img, anchor)
+                row_height_count = max(20, int(img.height / 1.35))
+                for r in range(row_cursor, row_cursor + max(1, int(row_height_count / 15))):
+                    visual.row_dimensions[r].height = 15
+                row_cursor += max(35, int(img.height / 14))
+            row_cursor += 2
 
     wb.save(output)
     output.seek(0)
@@ -2579,6 +2777,18 @@ def main():
 
     if "of_report" not in st.session_state:
         st.session_state["of_report"] = None
+
+    if "of_visual_pages" not in st.session_state:
+        st.session_state["of_visual_pages"] = None
+
+    if "of_auto_detected_fields" not in st.session_state:
+        st.session_state["of_auto_detected_fields"] = []
+
+    if "of_auto_detect_key" not in st.session_state:
+        st.session_state["of_auto_detect_key"] = None
+
+    if "of_auto_output_pages" not in st.session_state:
+        st.session_state["of_auto_output_pages"] = None
 
     # =========================================================
     # TITLE
@@ -2604,6 +2814,10 @@ def main():
         if st.button("← HOME", key="of_back_home", width="stretch"):
             st.session_state["selected_tool"] = None
             st.session_state["of_report"] = None
+            st.session_state["of_visual_pages"] = None
+            st.session_state["of_auto_detected_fields"] = []
+            st.session_state["of_auto_detect_key"] = None
+            st.session_state["of_auto_output_pages"] = None
             st.rerun()
 
     with nav_right:
@@ -2614,6 +2828,10 @@ def main():
         ):
             st.session_state["of_reset_id"] += 1
             st.session_state["of_report"] = None
+            st.session_state["of_visual_pages"] = None
+            st.session_state["of_auto_detected_fields"] = []
+            st.session_state["of_auto_detect_key"] = None
+            st.session_state["of_auto_output_pages"] = None
             st.rerun()
 
     # =========================================================
@@ -2710,43 +2928,117 @@ def main():
             key=f"comparison_method_{st.session_state['of_reset_id']}"
         )
 
-        if comparison_method == "Select Fields":
+        # =========================================================
+        # AUTO DETECT / MANUAL FIELD SELECTION
+        # =========================================================
+        available_fields = get_available_fields(df)
+
+        if comparison_method == "Auto Detect":
+            auto_key = (
+                str(getattr(excel_file, "name", "")),
+                int(getattr(excel_file, "size", 0)),
+                str(getattr(output_file, "name", "")),
+                int(getattr(output_file, "size", 0)),
+                product_type,
+            )
+
+            if st.session_state.get("of_auto_detect_key") != auto_key:
+                try:
+                    with st.spinner("Auto Detect is reading the artwork with OCR..."):
+                        auto_pages = extract_output_pages(output_file)
+                        detected_fields = auto_detect_fields(
+                            df,
+                            auto_pages,
+                            product_type
+                        )
+                    st.session_state["of_auto_detected_fields"] = detected_fields
+                    st.session_state["of_auto_output_pages"] = auto_pages
+                    st.session_state["of_auto_detect_key"] = auto_key
+                except Exception as error:
+                    st.error(
+                        f"Unable to run Auto Detect: {type(error).__name__}: {error}"
+                    )
+                    with st.expander("Technical error details", expanded=False):
+                        import traceback
+                        st.code(traceback.format_exc())
+
+            detected_fields = st.session_state.get("of_auto_detected_fields", [])
+
             st.markdown(
-                '<div class="section-title">'
-                'Select Variable Fields to Validate'
-                '</div>',
+                '<div class="section-title">🤖 Auto Detected Fields</div>',
                 unsafe_allow_html=True
             )
-
             st.caption(
-                "Only populated Order Form fields are shown. Only the fields selected below will participate in the comparison."
+                "Auto Detect proposes populated fields that can be associated with the artwork. "
+                "Review the list, remove fields, or add another populated field before comparison."
             )
 
-            available_fields = get_available_fields(df)
+            default_auto = [field for field in detected_fields if field in available_fields]
+            selected_fields = st.multiselect(
+                "Review detected fields",
+                options=available_fields,
+                default=default_auto,
+                label_visibility="collapsed",
+                key=f"auto_selected_fields_{st.session_state['of_reset_id']}"
+            )
+
+            if selected_fields:
+                st.caption("Selected fields: " + ", ".join(selected_fields))
+            else:
+                st.info("Auto Detect did not select any populated fields. Add fields manually from the list above.")
+
+        else:
+            st.markdown(
+                '<div class="section-title">Select Variable Fields to Validate</div>',
+                unsafe_allow_html=True
+            )
+            st.caption(
+                "Only populated Order Form fields are shown. Search by Excel column name or field terminology."
+            )
+
+            search_text = st.text_input(
+                "Search Fields",
+                placeholder="Type field name or alias...",
+                key=f"field_search_{st.session_state['of_reset_id']}"
+            )
+
+            if search_text.strip():
+                needle = normalize_text(search_text)
+                filtered_fields = [
+                    field for field in available_fields
+                    if needle in normalize_text(field)
+                    or any(token in normalize_text(field) for token in needle.split())
+                ]
+            else:
+                filtered_fields = available_fields
+
+            previous = st.session_state.get(
+                f"selected_fields_{st.session_state['of_reset_id']}", []
+            )
+            previous = [field for field in previous if field in available_fields]
+            # Keep previously selected fields available while the user searches,
+            # so a search never silently unselects an existing choice.
+            display_options = list(filtered_fields)
+            for field in previous:
+                if field not in display_options:
+                    display_options.append(field)
 
             selected_fields = st.multiselect(
                 "Select the fields from your Order Form",
-                options=available_fields,
-                default=[],
+                options=display_options,
+                default=previous,
                 label_visibility="collapsed",
                 key=f"selected_fields_{st.session_state['of_reset_id']}"
             )
 
             if selected_fields:
                 preview_rows = []
-
                 for field in selected_fields:
                     values = []
-
                     for value in df[field].tolist():
-                        if pd.isna(value):
+                        if is_blank_value(value):
                             continue
-
-                        value = str(value).strip()
-
-                        if value:
-                            values.append(value)
-
+                        values.append(str(value).strip())
                     preview_rows.append({
                         "Excel Field": field,
                         "Values": len(values),
@@ -2760,9 +3052,7 @@ def main():
                         hide_index=True
                     )
             else:
-                st.info(
-                    "Select at least one Order Form field to continue."
-                )
+                st.info("Select at least one Order Form field to continue.")
 
     # =========================================================
     # FILE INFORMATION
@@ -2829,79 +3119,42 @@ def main():
                 with st.spinner(
                     "Reading output and preparing comparison..."
                 ):
-                    # =====================================================
-                    # EXTRACTION LAYER
-                    # =====================================================
-                    output_pages = extract_output_pages(output_file)
+                    # Reuse the OCR pages already prepared for Auto Detect.
+                    if (
+                        comparison_method == "Auto Detect"
+                        and st.session_state.get("of_auto_output_pages")
+                    ):
+                        output_pages = st.session_state["of_auto_output_pages"]
+                    else:
+                        output_pages = extract_output_pages(output_file)
 
                     if not output_pages:
                         raise ValueError(
                             "No readable output pages were detected."
                         )
 
-                    # =====================================================
-                    # COMPARISON LAYER
-                    # =====================================================
-                    if comparison_method == "Auto Detect":
-                        detected_fields = auto_detect_fields(
-                            df,
-                            output_pages,
-                            product_type
+                    if not selected_fields:
+                        raise ValueError(
+                            "No fields are selected for comparison."
                         )
 
-                        if not detected_fields:
-                            st.session_state["of_report"] = pd.DataFrame([
-                                {
-                                    "FIELD NO": 1,
-                                    "PDF PAGE": "—",
-                                    "EXCEL ROW": "—",
-                                    "FIELD": "Auto Detect",
-                                    "ORDER FORM DATA": "—",
-                                    "PDF OUTPUT": "—",
-                                    "STATUS": "NOT FOUND",
-                                    "DIFFERENCE": (
-                                        "No relevant Order Form fields could be "
-                                        "reliably associated with the output."
-                                    )
-                                }
-                            ])
-                        else:
-                            st.session_state["of_report"] = build_report(
-                                df,
-                                output_pages,
-                                detected_fields,
-                                product_type
-                            )
-
-                        st.session_state["of_report_selected_fields"] = (
-                            detected_fields
-                        )
-
-                    else:
-                        st.session_state["of_report"] = build_report(
-                            df,
-                            output_pages,
-                            selected_fields,
-                            product_type
-                        )
-
-                        st.session_state["of_report_selected_fields"] = (
-                            selected_fields
-                        )
-
-                    st.session_state["of_report_product_type"] = product_type
-                    st.session_state["of_report_comparison_method"] = (
-                        comparison_method
+                    st.session_state["of_report"] = build_report(
+                        df,
+                        output_pages,
+                        selected_fields,
+                        product_type
                     )
+                    st.session_state["of_report_selected_fields"] = selected_fields
+                    st.session_state["of_report_product_type"] = product_type
+                    st.session_state["of_report_comparison_method"] = comparison_method
+                    st.session_state["of_visual_pages"] = output_pages
 
             except Exception as error:
                 import traceback
                 st.error(
                     f"Unable to process the Output Artwork: {type(error).__name__}: {error}"
                 )
-                # Keep the exact failing line visible during debugging. This
-                # can be removed later once the deployment is stable.
-                with st.expander("Technical error details", expanded=False):
+                with st.expander("Technical error details", expanded=True):
                     st.code(traceback.format_exc())
 
     # =========================================================
@@ -2989,33 +3242,40 @@ def main():
 
         st.divider()
 
-        if fail_count > 0:
-            st.error(
-                f"❌ FAIL — {fail_count} variable-data mismatch(es) detected."
+        # =========================================================
+        # VISUAL ARTWORK COMPARISON
+        # =========================================================
+        visual_pages = st.session_state.get("of_visual_pages") or []
+        if visual_pages:
+            st.markdown(
+                '<div class="section-title">🖼️ Visual Artwork Comparison</div>',
+                unsafe_allow_html=True
             )
-        elif not_found_count > 0:
-            st.warning(
-                f"⚠️ REVIEW — {not_found_count} selected variable "
-                f"field(s) could not be located."
+            st.caption(
+                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
             )
-        else:
-            st.success(
-                "✅ PASS — All selected variable fields matched the PDF artwork."
-            )
+            for page in visual_pages:
+                page_num = page.get("page")
+                page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
+                highlighted = build_highlighted_page_image(page, page_report)
+                if highlighted is not None:
+                    st.markdown(f"**Artwork Page {page_num}**")
+                    st.image(highlighted, width="stretch")
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
                 """
                 **Variable-data validation**
 
-                Only the fields selected from the Order Form are treated as
-                variable artwork data.
+                Only the fields selected from the Order Form are treated as variable artwork data.
 
-                **Static PDF content is ignored.**
+                **OCR validation**
 
-                PDF bullets/keystrokes such as `n`, regional prefixes,
-                addresses, phone numbers and other unselected static artwork
-                content do not create failures.
+                Artwork pages are rendered as images and OCR is used as the primary extraction source for non-editable artwork.
+
+                **Combined output lines**
+
+                Multiple Order Form fields can be matched independently when the artwork prints them on one line.
 
                 **Page mapping**
 
@@ -3029,19 +3289,15 @@ def main():
 
                 **PFL mode**
 
-                Panel-numbered artwork is treated as a continuous stream so
-                selected variable data can continue from one panel into the
-                next panel.
+                Panel-numbered artwork is treated as a continuous stream so selected variable data can continue from one panel into the next panel.
 
                 **Mismatch detection**
 
                 If the selected Order Form value is present in the PDF → PASS.
 
-                If the expected value is absent but a relevant alternative
-                value is detected → FAIL.
+                If the expected value is absent but a relevant alternative value is detected → FAIL.
 
-                If an Order Form field is blank, that field is not required
-                and is ignored.
+                If an Order Form field is blank, that field is not required and is ignored.
                 """
             )
 
@@ -3049,7 +3305,8 @@ def main():
             report=report,
             product_type=report_product_type,
             comparison_method=report_method,
-            selected_fields=report_fields
+            selected_fields=report_fields,
+            visual_pages=visual_pages
         )
 
         st.download_button(
