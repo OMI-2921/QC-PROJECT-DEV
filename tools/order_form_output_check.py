@@ -1182,12 +1182,138 @@ def _place_label_above_or_below(box, label_w, label_h, image_w, image_h, occupie
     )
 
 
-def build_highlighted_page_image(page, page_report, field_colors=None):
-    """
-    Full-page visual mapping layer.
+def _visual_osz_candidates(page):
+    """Build visual-only OSZ sequence candidates from scaled OCR coordinates.
 
-    The underlying comparison result is read-only here.  This function only
-    draws where the comparison's PDF OUTPUT was found in the OCR word boxes.
+    This function is presentation-only. It never participates in PASS/FAIL
+    comparison decisions. It exists so an OSZ field can point to the correct
+    sequence position even when the comparison result is FAIL.
+    """
+    numeric_words = []
+    for group in _visual_group_words(page):
+        for word in group:
+            raw = str(word.get("text", "")).strip()
+            if not re.fullmatch(r"\d+", raw):
+                continue
+            width = int(word.get("width", 0) or 0)
+            height = int(word.get("height", 0) or 0)
+            if width <= 0 or height <= 0:
+                continue
+            numeric_words.append({
+                **word,
+                "value": raw,
+                "cx": float(word.get("left", 0)) + width / 2.0,
+                "cy": float(word.get("top", 0)) + height / 2.0,
+            })
+
+    if len(numeric_words) < 3:
+        return []
+
+    candidates = []
+    for orientation in ("vertical", "horizontal"):
+        # A vertical OSZ list progresses on Y while its items share a common X.
+        # A horizontal list progresses on X while its items share a common Y.
+        axis = "cy" if orientation == "vertical" else "cx"
+        cross = "cx" if orientation == "vertical" else "cy"
+        ordered = sorted(numeric_words, key=lambda item: (item[cross], item[axis]))
+
+        groups = []
+        for word in ordered:
+            added = False
+            for group in groups:
+                ref = sum(item[cross] for item in group) / len(group)
+                tolerance = max(
+                    14.0,
+                    min(90.0, max(word.get("width", 1), word.get("height", 1)) * 1.7)
+                )
+                if abs(word[cross] - ref) <= tolerance:
+                    group.append(word)
+                    added = True
+                    break
+            if not added:
+                groups.append([word])
+
+        for group in groups:
+            if len(group) < 3:
+                continue
+            seq = sorted(group, key=lambda item: (item["cy"], item["cx"])) if orientation == "vertical" else sorted(group, key=lambda item: (item["cx"], item["cy"]))
+            gaps = [
+                (seq[i + 1][axis] - seq[i][axis])
+                for i in range(len(seq) - 1)
+            ]
+            gaps = [gap for gap in gaps if gap > 0]
+            if not gaps:
+                continue
+            median_gap = sorted(gaps)[len(gaps) // 2]
+            if median_gap <= 0:
+                continue
+            regularity = sum(
+                0.45 * median_gap <= gap <= 1.85 * median_gap
+                for gap in gaps
+            ) / len(gaps)
+            cross_spread = max(item[cross] for item in seq) - min(item[cross] for item in seq)
+            alignment_ratio = cross_spread / max(1.0, median_gap)
+            if regularity < 0.55 or alignment_ratio > 0.75:
+                continue
+            score = len(seq) * 10.0 + regularity * 12.0 - alignment_ratio * 8.0
+            signature = tuple((item["value"], round(item["cx"] / 5), round(item["cy"] / 5)) for item in seq)
+            if any(existing["signature"] == signature for existing in candidates):
+                continue
+            candidates.append({
+                "orientation": orientation,
+                "items": seq,
+                "score": score,
+                "signature": signature,
+            })
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:20]
+
+
+def _find_visual_osz_box(page, field_name, actual_value=""):
+    """Find the artwork box for an OSZ field by sequence position."""
+    field_type = get_field_type(field_name)
+    if field_type != "OSZ":
+        return []
+
+    compact = normalize_text(field_name).replace(" ", "")
+    match = re.fullmatch(r"osz(\d+)", compact)
+    if not match:
+        return []
+    index = int(match.group(1))
+    if index <= 0:
+        return []
+
+    candidates = [c for c in _visual_osz_candidates(page) if len(c.get("items", [])) >= index]
+    if not candidates:
+        return []
+
+    actual_num = normalize_numeric(actual_value)
+    if actual_num is not None:
+        matching = [
+            c for c in candidates
+            if normalize_numeric(c["items"][index - 1].get("value")) == actual_num
+        ]
+        if matching:
+            candidates = matching
+
+    chosen = max(candidates, key=lambda item: item.get("score", 0.0))
+    item = chosen["items"][index - 1]
+    return _boxes_from_words([item])
+
+
+def _truncate_visual_value(value, limit=42):
+    value = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(value) <= limit:
+        return value
+    return value[: max(1, limit - 1)] + "…"
+
+
+def build_highlighted_page_image(page, page_report, field_colors=None):
+    """Return the full original artwork with field-specific mapped annotations.
+
+    This is a read-only presentation layer. It consumes the already-produced
+    comparison report and never changes comparison decisions.
     """
     image_bytes = page.get("image_bytes")
     if not image_bytes:
@@ -1202,8 +1328,6 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
     if page_report is None or page_report.empty:
         return base.convert("RGB")
 
-    # Draw exact target boxes first.  Very light fill keeps the original artwork
-    # readable; the colored outline is the primary visual cue.
     annotations = []
     field_order = []
     for _, row in page_report.iterrows():
@@ -1212,22 +1336,33 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             field_order.append(field)
 
     number_by_field = {field: index + 1 for index, field in enumerate(field_order)}
-    used_label_rects = []
+    annotated_fields = set()
 
     for _, row in page_report.iterrows():
-        status = str(row.get("STATUS", ""))
+        status = str(row.get("STATUS", "")).strip()
         if status not in {"PASS", "FAIL"}:
             continue
 
-        field_name = str(row.get("FIELD", ""))
-        target = row.get("PDF OUTPUT", "")
-        boxes = _find_visual_boxes(page, target, field_name)
+        field_name = str(row.get("FIELD", "")).strip()
+        pdf_output = str(row.get("PDF OUTPUT", "")).strip()
+        expected_value = str(row.get("ORDER FORM DATA", "")).strip()
+
+        # No visual target exists for NOT FOUND, and FAIL must never invent one.
+        if not pdf_output or pdf_output.casefold() in {"not found", "—", "-"}:
+            continue
+
+        if get_field_type(field_name) == "OSZ":
+            boxes = _find_visual_osz_box(page, field_name, pdf_output)
+        else:
+            boxes = _find_visual_boxes(page, pdf_output, field_name)
+
         if not boxes:
             continue
 
         color = field_colors.get(field_name, FIELD_VISUAL_COLORS[0])
         rgb = _hex_rgb(color)
 
+        # Highlight every located occurrence, but annotate a field only once.
         for box in boxes:
             left, top, right, bottom = box
             pad = max(2, int(min(base.size) * 0.0018))
@@ -1236,40 +1371,56 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             right = min(base.width - 1, right + pad)
             bottom = min(base.height - 1, bottom + pad)
 
+            # Strong field color, still translucent enough to read the original artwork.
             draw.rounded_rectangle(
                 (left, top, right, bottom),
                 radius=max(3, pad),
-                fill=rgb + (68,),
+                fill=rgb + (82,),
                 outline=rgb + (255,),
                 width=max(2, pad),
             )
 
-            annotations.append({
-                "field": field_name,
-                "status": status,
-                "color": color,
-                "rgb": rgb,
-                "box": (left, top, right, bottom),
-                "number": number_by_field.get(field_name, 0),
-            })
+            if field_name not in annotated_fields:
+                annotations.append({
+                    "field": field_name,
+                    "status": status,
+                    "color": color,
+                    "rgb": rgb,
+                    "box": (left, top, right, bottom),
+                    "number": number_by_field.get(field_name, 0),
+                    "expected": expected_value,
+                    "actual": pdf_output,
+                })
+                annotated_fields.add(field_name)
 
-    # Add compact numbered labels with connectors.  Labels do not sit on top of
-    # artwork text unless the page is extremely crowded.
+    # Place one annotation per field. PASS is a compact single-line label;
+    # FAIL adds the expected-vs-actual detail so the reviewer knows what failed.
+    used_label_rects = []
     for item in annotations:
         box = item["box"]
         field_name = item["field"]
         status = item["status"]
         rgb = item["rgb"]
         number = item["number"]
+        expected_value = item.get("expected", "")
+        actual_value = item.get("actual", "")
 
-        label_text = f"{number}. {field_name} • {status}"
+        title_text = f"{number}. {field_name} • {status}"
+        detail_text = ""
+        if status == "FAIL":
+            detail_text = (
+                f"OF: {_truncate_visual_value(expected_value)}  |  "
+                f"PDF: {_truncate_visual_value(actual_value)}"
+            )
+
         font = bold_font or regular_font
-        tw, th = _text_size(draw, label_text, font)
+        detail_font = regular_font
+        tw, th = _text_size(draw, title_text, font)
+        dtw, dth = _text_size(draw, detail_text, detail_font) if detail_text else (0, 0)
 
-        # Keep annotation pills compact and within 42% of page width.
-        max_label_w = max(170, int(base.width * 0.42))
-        label_w = min(tw + 18, max_label_w)
-        label_h = th + 12
+        max_label_w = max(210, int(base.width * 0.38))
+        label_w = min(max(tw, dtw) + 26, max_label_w)
+        label_h = th + (dth + 7 if detail_text else 0) + 16
 
         label_x, label_y = _place_label_above_or_below(
             box,
@@ -1281,33 +1432,7 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         )
         used_label_rects.append((label_x, label_y, label_x + label_w, label_y + label_h))
 
-        # Marker circle sits beside the actual target, never across its text.
-        marker_r = max(8, int(min(base.size) * 0.0055))
-        marker_cx = max(marker_r + 3, box[0] - marker_r - 4)
-        marker_cy = max(marker_r + 3, box[1] + marker_r + 1)
-        draw.ellipse(
-            (
-                marker_cx - marker_r,
-                marker_cy - marker_r,
-                marker_cx + marker_r,
-                marker_cy + marker_r,
-            ),
-            fill=rgb + (245,),
-            outline=(255, 255, 255, 235),
-            width=max(2, marker_r // 4),
-        )
-
-        if font is not None:
-            marker_text = str(number)
-            mtw, mth = _text_size(draw, marker_text, font)
-            draw.text(
-                (marker_cx - mtw / 2, marker_cy - mth / 2 - 1),
-                marker_text,
-                fill="white",
-                font=font,
-            )
-
-        # Connector: label edge -> target edge.
+        # Connector from label edge to actual artwork box.
         box_cx = int((box[0] + box[2]) / 2)
         if label_y + label_h <= box[1]:
             label_anchor = (int(label_x + label_w / 2), int(label_y + label_h))
@@ -1324,30 +1449,39 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
 
         draw.line(
             (label_anchor[0], label_anchor[1], target_anchor[0], target_anchor[1]),
-            fill=rgb + (225,),
-            width=max(1, int(min(base.size) * 0.0009)),
+            fill=rgb + (235,),
+            width=max(2, int(min(base.size) * 0.00095)),
         )
 
         draw.rounded_rectangle(
             (label_x, label_y, label_x + label_w, label_y + label_h),
-            radius=max(4, int(min(base.size) * 0.0025)),
-            fill=(255, 255, 255, 242),
-            outline=rgb + (245,),
-            width=max(2, int(min(base.size) * 0.0011)),
+            radius=max(5, int(min(base.size) * 0.0025)),
+            fill=(255, 255, 255, 246),
+            outline=rgb + (255,),
+            width=max(2, int(min(base.size) * 0.0012)),
         )
 
-        bar_w = max(4, int(label_w * 0.018))
-        draw.rectangle(
+        bar_w = max(5, int(label_w * 0.02))
+        draw.rounded_rectangle(
             (label_x, label_y, label_x + bar_w, label_y + label_h),
+            radius=max(2, int(bar_w * 0.35)),
             fill=rgb + (255,),
         )
 
         draw.text(
-            (label_x + bar_w + 6, label_y + 5),
-            label_text,
+            (label_x + bar_w + 8, label_y + 6),
+            title_text,
             fill=(20, 28, 40, 255),
             font=font,
         )
+
+        if detail_text:
+            draw.text(
+                (label_x + bar_w + 8, label_y + 8 + th),
+                detail_text,
+                fill=(170, 40, 40, 255),
+                font=detail_font,
+            )
 
     return Image.alpha_composite(base, overlay).convert("RGB")
 
@@ -1437,7 +1571,11 @@ def build_page_state(page, product_type):
         "lines": lines,
         "consumed": set(),
         "consumed_spans": {},
+        # Keep the existing line-based OSZ runs intact.  The additional
+        # coordinate-aware candidates are used only as a fallback when OCR
+        # formatting has mixed multiple standalone numbers into one line.
         "osz_runs": extract_standalone_numeric_runs_from_lines(lines),
+        "osz_sequence_candidates": extract_osz_sequence_candidates(page),
     }
 
 
@@ -1457,6 +1595,130 @@ def extract_standalone_numeric_runs_from_lines(lines):
         runs.append(current)
 
     return [run for run in runs if run]
+
+
+def _osz_numeric_words(page):
+    """Return standalone OCR integer tokens with their physical coordinates."""
+    result = []
+    for word in page.get("ocr_words", []) or []:
+        if not isinstance(word, dict):
+            continue
+        raw = str(word.get("text", "")).strip()
+        if not re.fullmatch(r"\d+", raw):
+            continue
+        # Ignore implausibly tiny OCR fragments.
+        if int(word.get("width", 0) or 0) <= 0 or int(word.get("height", 0) or 0) <= 0:
+            continue
+        result.append({
+            "value": raw,
+            "left": int(word.get("left", 0) or 0),
+            "top": int(word.get("top", 0) or 0),
+            "width": int(word.get("width", 0) or 0),
+            "height": int(word.get("height", 0) or 0),
+            "center_x": float(word.get("left", 0) or 0) + float(word.get("width", 0) or 0) / 2.0,
+            "center_y": float(word.get("top", 0) or 0) + float(word.get("height", 0) or 0) / 2.0,
+        })
+    return result
+
+
+def _score_osz_sequence(items, orientation):
+    if len(items) < 3:
+        return -1.0
+
+    if orientation == "vertical":
+        ordered = sorted(items, key=lambda x: (x["center_y"], x["center_x"]))
+        axis = [item["center_y"] for item in ordered]
+        cross = [item["center_x"] for item in ordered]
+    else:
+        ordered = sorted(items, key=lambda x: (x["center_x"], x["center_y"]))
+        axis = [item["center_x"] for item in ordered]
+        cross = [item["center_y"] for item in ordered]
+
+    gaps = [axis[i + 1] - axis[i] for i in range(len(axis) - 1)]
+    positive_gaps = [g for g in gaps if g > 0]
+    if not positive_gaps:
+        return -1.0
+
+    median_gap = sorted(positive_gaps)[len(positive_gaps) // 2]
+    if median_gap <= 0:
+        return -1.0
+
+    cross_spread = max(cross) - min(cross)
+    # OSZ lists can have some OCR jitter, but should remain visually aligned.
+    alignment_penalty = cross_spread / max(1.0, median_gap)
+
+    regularity = sum(
+        1.0
+        for gap in positive_gaps
+        if 0.45 * median_gap <= gap <= 1.80 * median_gap
+    ) / len(positive_gaps)
+
+    # Prefer longer, well-aligned runs.  A minimum regularity prevents random
+    # page numbers or price fragments from becoming an OSZ sequence.
+    if regularity < 0.60 or alignment_penalty > 0.55:
+        return -1.0
+
+    return len(ordered) * 10.0 + regularity * 10.0 - alignment_penalty * 5.0
+
+
+def extract_osz_sequence_candidates(page):
+    """Build dynamic OSZ candidates from artwork geometry, independent of field count."""
+    words = _osz_numeric_words(page)
+    if len(words) < 3:
+        return []
+
+    candidates = []
+    for orientation in ("vertical", "horizontal"):
+        # Build loose spatial groups around a common axis.
+        if orientation == "vertical":
+            words_sorted = sorted(words, key=lambda x: x["center_x"])
+            axis_key = "center_x"
+        else:
+            words_sorted = sorted(words, key=lambda x: x["center_y"])
+            axis_key = "center_y"
+
+        groups = []
+        for word in words_sorted:
+            added = False
+            for group in groups:
+                reference = sum(item[axis_key] for item in group) / len(group)
+                tolerance = max(18.0, min(90.0, max(word["width"], word["height"]) * 1.6))
+                if abs(word[axis_key] - reference) <= tolerance:
+                    group.append(word)
+                    added = True
+                    break
+            if not added:
+                groups.append([word])
+
+        for group in groups:
+            score = _score_osz_sequence(group, orientation)
+            if score < 0:
+                continue
+            ordered = (
+                sorted(group, key=lambda x: (x["center_y"], x["center_x"]))
+                if orientation == "vertical"
+                else sorted(group, key=lambda x: (x["center_x"], x["center_y"]))
+            )
+            # Deduplicate identical sequences.
+            signature = tuple((item["value"], round(item["center_x"] / 5), round(item["center_y"] / 5)) for item in ordered)
+            if any(existing["signature"] == signature for existing in candidates):
+                continue
+            candidates.append({
+                "orientation": orientation,
+                "items": ordered,
+                "score": score,
+                "signature": signature,
+            })
+
+    candidates.sort(key=lambda item: item["score"], reverse=True)
+    return candidates[:12]
+
+
+def _osz_candidate_matches_expected(candidate, index, expected_num):
+    items = candidate.get("items", [])
+    if len(items) < index:
+        return False
+    return normalize_numeric(items[index - 1].get("value")) == expected_num
 
 
 def line_is_available(line, state):
@@ -2256,8 +2518,52 @@ def find_osz_value(
             "match_type": "OSZ_LABEL_MISMATCH"
         }
 
-    # Stable sequence mapping. The run is captured before any OSZ field is
-    # consumed, so OSZ2 always remains the second original sequence value.
+    # Coordinate-aware OSZ mapping is preferred because OCR can merge a
+    # standalone number with an unrelated neighbouring line (for example
+    # turning a clean sequence 6 / 8 into a line such as "0 8").
+    candidates = [
+        candidate
+        for candidate in state.get("osz_sequence_candidates", [])
+        if len(candidate.get("items", [])) >= index
+    ]
+
+    if candidates:
+        # First choose a candidate whose index already agrees with the Excel
+        # value. This prevents an unrelated numeric run elsewhere on the page
+        # from being selected merely because it is long.
+        matching_candidates = [
+            candidate
+            for candidate in candidates
+            if _osz_candidate_matches_expected(candidate, index, expected_num)
+        ]
+        chosen = max(
+            matching_candidates or candidates,
+            key=lambda candidate: candidate.get("score", 0.0)
+        )
+
+        item = chosen["items"][index - 1]
+        actual = normalize_numeric(item.get("value"))
+        actual_text = str(item.get("value", "")).strip() or "Not found"
+
+        if actual == expected_num:
+            return {
+                "status": "PASS",
+                "pdf": actual_text,
+                "difference": "—",
+                "match_type": "OSZ_SEQUENCE_GEOMETRY"
+            }
+
+        if actual is not None:
+            return {
+                "status": "FAIL",
+                "pdf": actual_text,
+                "difference": f"Expected: {expected} | Found: {actual_text}",
+                "match_type": "OSZ_SEQUENCE_GEOMETRY_MISMATCH"
+            }
+
+    # Original line-based sequence logic remains as the final fallback.
+    # This preserves the behaviour for PDFs whose text layer already exposes
+    # one clean standalone number per line.
     runs = [run for run in state.get("osz_runs", []) if len(run) >= index]
     if not runs:
         return None
