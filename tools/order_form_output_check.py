@@ -422,6 +422,8 @@ def get_field_type(field_name):
         or "fabric" in compact
         or "content" in compact
         or "composition" in compact
+        or "compodsc" in compact
+        or "lhcompodsc" in compact
         or "fabrication" in compact
         or "material" in compact
     ):
@@ -494,12 +496,17 @@ def _text_quality_score(text):
 
 def _ocr_image_with_data(image):
     """
-    Fast multi-pass OCR for small artwork text.
+    Multi-pass OCR for small artwork text.
 
-    PSM 11 is the primary pass for separated artwork text and PSM 6 is kept as
-    a compact-layout fallback. Text from both passes is merged, while the
-    strongest pass supplies the word boxes used for visual highlighting.
+    Returns:
+        primary_text, primary_word_boxes, language, supplemental_text
+
+    primary_text is reconstructed from the strongest OCR pass using physical
+    word coordinates so the visual reading order is preserved. supplemental_text
+    contains additional unique lines from weaker passes and is used only as
+    secondary evidence for Auto Detect.
     """
+
     try:
         import pytesseract
         from pytesseract import Output
@@ -531,7 +538,7 @@ def _ocr_image_with_data(image):
             gray = gray.filter(ImageFilter.SHARPEN)
         variants.append(("gray", gray))
 
-    # Keep the OCR workload controlled: 4 primary passes max.
+    # Keep the OCR workload controlled: 3 primary passes.
     requested_passes = [
         ("color", 11, "eng"),
         ("gray", 11, "eng"),
@@ -597,7 +604,22 @@ def _ocr_image_with_data(image):
                 continue
 
             avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
-            quality = _text_quality_score(text) + (avg_conf * 0.20)
+
+            # Prefer a clean reading order over a noisy OCR pass that happens
+            # to contain more total characters. Artwork often contains logos,
+            # barcode fragments and isolated symbols that inflate raw length.
+            non_empty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+            junk_lines = sum(
+                1
+                for line in non_empty_lines
+                if len(re.sub(r"[^A-Za-z0-9%#]", "", line)) <= 1
+            )
+            quality = (
+                _text_quality_score(text)
+                + (avg_conf * 0.20)
+                - (junk_lines * 18)
+            )
+
             results.append({
                 "text": text,
                 "words": words,
@@ -613,27 +635,106 @@ def _ocr_image_with_data(image):
                 "OCR could not run. Tesseract may be missing. Details: "
                 + " | ".join(errors[:4])
             )
-        return "", [], ""
+        return "", [], "", ""
 
     best = max(results, key=lambda item: item["quality"])
 
-    merged_lines = []
-    seen = set()
+    # Rebuild the strongest OCR pass from physical coordinates. Tesseract's
+    # block/line numbering can occasionally reverse adjacent words on artwork;
+    # geometry is a safer source of visual reading order.
+    ordered_words = [
+        word for word in best["words"]
+        if str(word.get("text", "")).strip()
+    ]
+
+    primary_lines = []
+    if ordered_words:
+        heights = [max(1, int(word.get("height", 1))) for word in ordered_words]
+        median_height = float(sorted(heights)[len(heights) // 2]) if heights else 20.0
+        line_tolerance = max(10.0, median_height * 0.65)
+
+        line_groups = []
+        for word in sorted(
+            ordered_words,
+            key=lambda item: (
+                float(item.get("top", 0)) + float(item.get("height", 0)) / 2.0,
+                float(item.get("left", 0)),
+            )
+        ):
+            center_y = (
+                float(word.get("top", 0))
+                + float(word.get("height", 0)) / 2.0
+            )
+
+            best_group = None
+            best_distance = None
+            for group in line_groups:
+                distance = abs(center_y - group["center_y"])
+                if distance <= line_tolerance and (
+                    best_distance is None or distance < best_distance
+                ):
+                    best_group = group
+                    best_distance = distance
+
+            if best_group is None:
+                line_groups.append({
+                    "center_y": center_y,
+                    "words": [word],
+                })
+            else:
+                best_group["words"].append(word)
+                best_group["center_y"] = sum(
+                    float(w.get("top", 0)) + float(w.get("height", 0)) / 2.0
+                    for w in best_group["words"]
+                ) / len(best_group["words"])
+
+        line_groups.sort(key=lambda group: group["center_y"])
+
+        for group in line_groups:
+            group["words"].sort(key=lambda item: float(item.get("left", 0)))
+            line = " ".join(
+                str(word.get("text", "")).strip()
+                for word in group["words"]
+                if str(word.get("text", "")).strip()
+            )
+            line = re.sub(r"\s+", " ", line).strip()
+            if line:
+                primary_lines.append(line)
+
+    if not primary_lines:
+        primary_lines = [
+            re.sub(r"\s+", " ", line).strip()
+            for line in best["text"].splitlines()
+            if line.strip()
+        ]
+
+    seen = {normalize_text(line) for line in primary_lines if normalize_text(line)}
+
+    # We do not append weaker OCR lines to the primary comparison text because
+    # that can introduce incorrect duplicate/alternate readings. Instead,
+    # return them separately for Auto Detect's secondary evidence.
+    supplemental_lines = []
     for result in sorted(results, key=lambda item: item["quality"], reverse=True):
+        if result is best:
+            continue
         for line in result["text"].splitlines():
             clean = re.sub(r"\s+", " ", line).strip()
-            if not clean:
-                continue
             key = normalize_text(clean)
-            if key and key not in seen:
-                seen.add(key)
-                merged_lines.append(clean)
+            if key and key not in seen and key not in {
+                normalize_text(existing) for existing in supplemental_lines
+            }:
+                supplemental_lines.append(clean)
 
-    return "\n".join(merged_lines), best["words"], best["lang"]
+    return (
+        "\n".join(primary_lines),
+        best["words"],
+        best["lang"],
+        "\n".join(supplemental_lines),
+    )
 
 
 def _ocr_image(image):
-    text, _words, _lang = _ocr_image_with_data(image)
+    text, _words, _lang, _supplemental = _ocr_image_with_data(image)
     return text
 
 
@@ -699,7 +800,12 @@ def extract_output_pages(file):
                 ocr_lang = ""
 
                 try:
-                    ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
+                    (
+                        ocr_text,
+                        ocr_words,
+                        ocr_lang,
+                        ocr_alt_text,
+                    ) = _ocr_image_with_data(image)
                 except Exception as exc:
                     ocr_error = exc
 
@@ -721,6 +827,7 @@ def extract_output_pages(file):
                     "source_type": source_type,
                     "direct_text": str(direct_text or ""),
                     "ocr_text": str(ocr_text or ""),
+                    "ocr_alt_text": str(ocr_alt_text or ""),
                     "ocr_words": ocr_words,
                     "ocr_lang": ocr_lang,
                     "image_bytes": _image_to_png_bytes(image),
@@ -736,7 +843,12 @@ def extract_output_pages(file):
     if name.endswith((".jpg", ".jpeg", ".png")):
         file.seek(0)
         image = Image.open(file).convert("RGB")
-        ocr_text, ocr_words, ocr_lang = _ocr_image_with_data(image)
+        (
+            ocr_text,
+            ocr_words,
+            ocr_lang,
+            ocr_alt_text,
+        ) = _ocr_image_with_data(image)
         if not _usable_text(ocr_text):
             raise RuntimeError("No readable artwork text was detected in the image.")
         file.seek(0)
@@ -746,6 +858,7 @@ def extract_output_pages(file):
             "source_type": "ocr",
             "direct_text": "",
             "ocr_text": str(ocr_text),
+            "ocr_alt_text": str(ocr_alt_text),
             "ocr_words": ocr_words,
             "ocr_lang": ocr_lang,
             "image_bytes": _image_to_png_bytes(image),
@@ -2591,111 +2704,170 @@ def _auto_detect_page_text(page):
         return ""
 
     values = []
-    for key in ("ocr_text", "text", "direct_text"):
+    # Prefer OCR because the artwork may be a scanned/non-editable PDF.
+    for key in ("ocr_text", "ocr_alt_text", "text", "direct_text"):
         value = page.get(key, "")
         if value and str(value).strip():
             values.append(str(value))
 
-    return normalize_text("\n".join(values))
+    return "\n".join(values)
 
 
 def _auto_detect_lines(page):
     text = _auto_detect_page_text(page)
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    return [line for line in (normalize_text(x) for x in str(text).splitlines()) if line]
 
 
 def _auto_number_evidence(expected, text):
-    """Exact numeric evidence with boundaries; never accepts a substring of a larger number."""
+    """Exact numeric evidence with boundaries; never accepts a substring."""
     numeric = normalize_numeric(expected)
     if numeric is None:
         return False
     return bool(
         re.search(
             rf"(?<![A-Za-z0-9]){re.escape(numeric)}(?![A-Za-z0-9])",
-            text
+            normalize_text(text)
         )
     )
 
 
-def _auto_identifier_evidence(expected, text):
-    """High-confidence asymmetric identifier evidence."""
+def _auto_identifier_evidence(expected, field_name, text):
+    """Asymmetric identifier evidence used for item/style/supplier codes."""
     expected_compact = re.sub(r"[^a-z0-9]", "", normalize_text(expected))
-    if not expected_compact or len(expected_compact) < 4:
+    field_compact = (
+        normalize_text(field_name)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    # Supplier/vendor IDs such as USX are intentionally allowed at 3 chars
+    # because the artwork may contain an appended static suffix (USX609).
+    minimum_length = 3 if any(
+        key in field_compact
+        for key in ("supwsp", "supplier", "vendorid", "vendorcode")
+    ) else 4
+
+    if not expected_compact or len(expected_compact) < minimum_length:
         return False
 
     tokens = re.findall(r"[a-z0-9]+", normalize_text(text))
     for token in tokens:
         if token == expected_compact:
             return True
-        # Expected code may have an OCR-added suffix/prefix, but only when the
-        # expected identifier is reasonably distinctive.
-        if expected_compact in token and len(expected_compact) >= 5:
+        if len(expected_compact) >= 5 and token.startswith(expected_compact):
             return True
+        if len(expected_compact) == 3 and token.startswith(expected_compact):
+            return True
+
     return False
 
 
 def _auto_material_evidence(expected, text):
-    """Detect composition values without turning common words/numbers into matches."""
+    """Strong evidence for canonical visible composition-description fields."""
     expected_parts = extract_content_values(expected)
     if not expected_parts:
         return False
 
-    compact_text_value = re.sub(r"[^a-z0-9%]", "", normalize_text(text))
-    matches = 0
+    norm_text = normalize_text(text)
+    compact_text_value = re.sub(r"[^a-z0-9%]", "", norm_text)
 
+    matches = 0
     for part in expected_parts:
         part_norm = normalize_text(part)
         material = re.sub(r"[^a-z]", "", part_norm.casefold())
-        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%", part_norm)
+        pct_match = re.search(r"(\d+(?:\.\d+)?)\s*%?", part_norm)
 
-        if material and len(material) >= 3:
-            # Accept exact material and the common OCR collapse with its percentage.
-            if material in compact_text_value:
-                matches += 1
-                continue
+        if not material or len(material) < 3:
+            continue
+
+        if material in compact_text_value:
             if pct_match and re.search(
                 rf"{re.escape(pct_match.group(1))}\s*%?\s*{re.escape(material)}",
-                normalize_text(text),
+                norm_text,
             ):
                 matches += 1
-                continue
+            elif re.search(rf"\b{re.escape(material)}\b", norm_text):
+                matches += 1
 
-    # A real composition field should have at least one material + strong
-    # composition signal (% or another material). This prevents random words
-    # from selecting thousands of translated columns.
-    has_percent = bool(re.search(r"\d+(?:\.\d+)?\s*%|\d+\s*[a-z]{3,}", normalize_text(text)))
-    return matches >= max(1, min(2, len(expected_parts))) and has_percent
+    required = 2 if len(expected_parts) >= 2 else 1
+    has_composition_shape = bool(
+        re.search(r"\d+(?:\.\d+)?\s*%?", norm_text)
+        and re.search(r"[a-z]{3,}", norm_text)
+    )
+    return matches >= required and has_composition_shape
 
 
 def _auto_coo_evidence(expected, field_name, text):
-    """High-confidence COO evidence for Auto Detect."""
+    """High-confidence COO evidence; codes like MADE_IN=F are not artwork text."""
     from rapidfuzz import fuzz
 
     expected_coo = extract_coo_value(expected)
     target = normalize_text(expected_coo if expected_coo else expected)
-    norm = normalize_text(text)
 
-    # First try a compact exact comparison so OCR spacing such as
-    # "Made Inindia" still matches "MADE IN INDIA".
+    # One/two-letter language/origin codes are internal codes, not visible COO.
+    if re.fullmatch(r"[a-z]{1,2}", target):
+        return False
+
     target_compact = re.sub(r"[^a-z0-9]", "", target)
-    text_compact = re.sub(r"[^a-z0-9]", "", norm)
-    if target_compact and target_compact in text_compact:
-        return True
+    if len(target_compact) < 4:
+        return False
 
-    # Otherwise compare the complete expected COO against individual OCR lines.
-    # Do not match merely on the country name: that caused translated COO
-    # columns such as German/Turkish to be falsely auto-selected.
-    lines = _auto_detect_lines({"ocr_text": text})
-    for line in lines:
+    for line in _auto_detect_lines({"ocr_text": text}):
         line_compact = re.sub(r"[^a-z0-9]", "", line)
-        if target_compact and fuzz.ratio(target_compact, line_compact) >= 92:
+        if target_compact == line_compact:
+            return True
+        if target_compact and target_compact in line_compact:
+            return True
+        if fuzz.ratio(target_compact, line_compact) >= 92:
             return True
 
     return False
 
 
+def _auto_generic_field_allowed(field_name):
+    """
+    Allow only known artwork-variable semantics among GENERAL technical fields.
+    This prevents operational/database columns from being auto-selected just
+    because they are populated.
+    """
+    compact = (
+        normalize_text(field_name)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    patterns = (
+        "stylewofinish",
+        "cdstyle",
+        "cdfinishing",
+        "finishing",
+        "cdimport",
+        "import",
+        "designstyle",
+        "lblstyle",
+        "antfamily",
+        "family",
+        "compodsc",
+        "lhcompodsc",
+    )
+    return any(token in compact for token in patterns)
+
+
+def _auto_content_field_allowed(field_name):
+    """Only canonical composition-description fields are auto-detected."""
+    compact = (
+        normalize_text(field_name)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+    return compact.startswith("compodsc") or compact.startswith("lhcompodsc")
+
+
 def _auto_text_evidence(expected, field_name, text):
-    """Conservative text matching for Auto Detect only."""
+    """Conservative Auto Detect evidence check."""
     from rapidfuzz import fuzz
 
     expected_norm = normalize_text(expected)
@@ -2707,14 +2879,12 @@ def _auto_text_evidence(expected, field_name, text):
     norm_text = normalize_text(text)
 
     if field_type == "IDENTIFIER":
-        return _auto_identifier_evidence(expected, norm_text)
+        return _auto_identifier_evidence(expected, field_name, norm_text)
 
     if field_type == "RN":
         digits = re.sub(r"\D", "", expected_norm)
         if not digits or len(digits) < 4:
             return False
-        # Require RN/CA context, or an exact standalone digit sequence on a
-        # short line. This prevents a number like 2 from selecting RN fields.
         if re.search(r"\b(?:rn|ca)\s*[#:\-./ ]*\d+", norm_text):
             return digits in re.sub(r"\D", "", norm_text)
         return bool(re.search(rf"(?<!\d){re.escape(digits)}(?!\d)", norm_text))
@@ -2723,10 +2893,9 @@ def _auto_text_evidence(expected, field_name, text):
         return _auto_coo_evidence(expected, field_name, norm_text)
 
     if field_type == "CONTENT":
-        return _auto_material_evidence(expected, norm_text)
+        return _auto_content_field_allowed(field_name) and _auto_material_evidence(expected, norm_text)
 
     if field_type == "CARE":
-        # Care must match several distinctive words, not one common token.
         tokens = [t for t in re.findall(r"[a-z]+", expected_norm) if len(t) >= 4]
         if len(tokens) < 3:
             return False
@@ -2735,24 +2904,21 @@ def _auto_text_evidence(expected, field_name, text):
         return hits >= max(3, int(len(unique) * 0.35))
 
     if field_type == "SIZE":
-        # Sizes are high-confidence only when the complete size/range appears.
         compact_text = re.sub(r"[^a-z0-9./-]", "", norm_text)
-        return bool(
-            compact_expected
-            and compact_expected in compact_text
-        ) or _auto_number_evidence(expected_norm, norm_text)
+        if compact_expected and compact_expected in compact_text:
+            return True
+        return _auto_number_evidence(expected_norm, norm_text) and any(
+            key in normalize_text(field_name).replace(" ", "")
+            for key in ("size", "waist", "inseam", "alpha", "fit")
+        )
 
     if field_type == "COLOR":
-        # Full color phrase or strong fuzzy similarity to one OCR line.
         if expected_norm in norm_text:
             return True
         lines = _auto_detect_lines({"ocr_text": text})
-        if not lines:
+        if not lines or len(expected_norm) < 4:
             return False
-        return max(
-            fuzz.ratio(expected_norm, line)
-            for line in lines
-        ) >= 86
+        return max(fuzz.ratio(expected_norm, line) for line in lines) >= 86
 
     if field_type == "GENDER":
         aliases = {
@@ -2761,19 +2927,18 @@ def _auto_text_evidence(expected, field_name, text):
             "boys": ("boys", "boy", "boy's", "boys'"),
             "girls": ("girls", "girl", "girl's", "girls'"),
         }
-        key = expected_norm.replace("'", "").replace("s", "")
+        key = expected_norm.replace("'", "")
         for base, variants in aliases.items():
-            if base.startswith(key) or key.startswith(base.replace("s", "")):
-                return any(v in norm_text for v in variants)
+            if key == base or key.rstrip("s") == base.rstrip("s"):
+                return any(normalize_text(v) in norm_text for v in variants)
         return expected_norm in norm_text
 
     if field_type == "BRAND":
         if compact_expected and compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
             return True
         lines = _auto_detect_lines({"ocr_text": text})
-        return bool(lines) and max(
-            fuzz.ratio(expected_norm, line)
-            for line in lines
+        return bool(lines) and len(expected_norm) >= 4 and max(
+            fuzz.ratio(expected_norm, line) for line in lines
         ) >= 88
 
     if field_type == "ATTRIBUTE":
@@ -2787,29 +2952,79 @@ def _auto_text_evidence(expected, field_name, text):
             best = max(best, overlap)
         return best >= 0.60
 
-    if field_type == "QUANTITY":
-        # Quantity is intentionally not auto-selected. Artwork often contains
-        # many unrelated numbers (sizes, dimensions, panel counts, etc.). The
-        # designer can explicitly select Qty in the editable dropdown.
-        return False
-
-    if field_type == "BATCH":
+    if field_type in {"QUANTITY", "BATCH"}:
+        # Quantities/lots are deliberately manual because artwork contains
+        # many unrelated numbers and barcode data.
         return False
 
     if field_type == "OSZ":
-        # OSZ is sequence-based in the final engine. Auto Detect only proposes
-        # it when the exact value is a standalone number.
         return _auto_number_evidence(expected, norm_text)
 
-    # GENERAL: deliberately conservative. Auto Detect should not turn every
-    # populated technical/configuration column into a selected field.
-    if len(compact_expected) < 5:
+    # GENERAL: only selected semantic technical fields are eligible.
+    if not _auto_generic_field_allowed(field_name):
         return False
+
+    # Never auto-detect a one-letter technical code such as MADE_IN=F.
+    if re.fullmatch(r"[a-z]{1,2}", expected_norm):
+        return False
+
     if normalize_numeric(expected) is not None:
+        return _auto_number_evidence(expected_norm, norm_text)
+
+    lines = _auto_detect_lines({"ocr_text": text})
+    if not lines:
         return False
-    if compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
+
+    if compact_expected and compact_expected in re.sub(r"[^a-z0-9]", "", norm_text):
         return True
+
+    if len(expected_norm) >= 6:
+        return max(fuzz.ratio(expected_norm, line) for line in lines) >= 90
+
     return False
+
+
+def _auto_candidate_priority(field_name):
+    """Lower number = preferred canonical source column when duplicate values exist."""
+    compact = (
+        normalize_text(field_name)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+    if compact.startswith("compodsc"):
+        return 0
+    if compact.startswith("lhcompodsc"):
+        return 10
+    return 20
+
+
+def _auto_field_signature(field_name, value):
+    """Semantic duplicate signature so equivalent columns do not flood Auto Detect."""
+    field_type = get_field_type(field_name)
+
+    if field_type == "CONTENT":
+        parts = extract_content_values(value)
+        if parts:
+            parsed = []
+            for part in parts:
+                match = re.match(
+                    r"(\d+(?:\.\d+)?)%?\s*(.+)",
+                    normalize_text(part)
+                )
+                if match:
+                    parsed.append(
+                        (
+                            match.group(1),
+                            normalize_text(match.group(2))
+                        )
+                    )
+                else:
+                    parsed.append(("", normalize_text(part)))
+            return (field_type, tuple(parsed))
+
+    return (field_type, normalize_text(value))
 
 
 def auto_detect_fields(
@@ -2819,14 +3034,17 @@ def auto_detect_fields(
     page_row_mapping=None
 ):
     """
-    Conservative Auto Detect.
+    Controlled Auto Detect.
 
-    It proposes only fields for which the selected Order Form row has
-    high-confidence evidence in its mapped artwork page. Populated Excel cells
-    alone are never enough to select a field.
+    A field is selected only when:
+      1. it is populated in the mapped Order Form row,
+      2. its column belongs to an allowed artwork-variable family, and
+      3. its actual value has strong evidence in the mapped artwork.
+
+    Population alone is never enough.
     """
     available_fields = get_available_fields(df)
-    allowed_auto_types = {
+    allowed_types = {
         "IDENTIFIER",
         "BRAND",
         "GENDER",
@@ -2838,68 +3056,111 @@ def auto_detect_fields(
         "ATTRIBUTE",
         "RN",
         "OSZ",
+        "GENERAL",
     }
 
-    candidates = [
-        field for field in available_fields
-        if not is_admin_field(field)
-        and get_field_type(field) in allowed_auto_types
-    ]
+    candidates = []
+    for field in available_fields:
+        if is_admin_field(field):
+            continue
+
+        field_type = get_field_type(field)
+
+        if field_type == "GENERAL" and not _auto_generic_field_allowed(field):
+            continue
+
+        if field_type == "CONTENT" and not _auto_content_field_allowed(field):
+            continue
+
+        if field_type not in allowed_types:
+            continue
+
+        compact = (
+            normalize_text(field)
+            .replace(" ", "")
+            .replace("_", "")
+            .replace("-", "")
+        )
+
+        # Never auto-select translated/internal material columns.
+        if any(token in compact for token in (
+            "p1mat",
+            "multi",
+            "translation",
+            "greek",
+            "arabic",
+            "turkish",
+            "indonesia",
+            "matfull",
+        )):
+            if not compact.startswith("compodsc"):
+                continue
+
+        candidates.append(field)
 
     if not candidates or not output_pages:
         return []
 
-    # Build explicit Page -> Data Row mappings.
     rows_to_check = []
-    if page_row_mapping:
-        for page in output_pages:
-            page_number = int(page.get("page", 1))
+    for page in output_pages:
+        page_number = int(page.get("page", 1))
+
+        if page_row_mapping is not None:
             if page_number not in page_row_mapping:
                 continue
             row_index = int(page_row_mapping[page_number])
-            if 0 <= row_index < len(df):
-                rows_to_check.append((page, df.iloc[row_index]))
-    elif len(df) == 1:
-        rows_to_check = [(page, df.iloc[0]) for page in output_pages]
-    else:
-        for page_index, page in enumerate(output_pages):
-            if page_index < len(df):
-                rows_to_check.append((page, df.iloc[page_index]))
+        elif len(df) == 1:
+            row_index = 0
+        else:
+            row_index = page_number - 1
+
+        if 0 <= row_index < len(df):
+            rows_to_check.append((page, df.iloc[row_index]))
 
     if not rows_to_check:
         return []
 
+    # Prefer canonical composition descriptions before equivalent helper columns.
+    candidates = sorted(
+        enumerate(candidates),
+        key=lambda item: (_auto_candidate_priority(item[1]), item[0])
+    )
+    candidates = [field for _idx, field in candidates]
+
     detected = []
     detected_signatures = set()
 
-    # Process in field order so duplicate columns sharing exactly the same
-    # value do not flood Auto Detect. The first high-confidence field is kept;
-    # the user can still add the other populated columns from the editable
-    # dropdown. This is especially useful for duplicated language/size columns.
     for field in candidates:
-        evidence_count = 0
+        found = False
         representative_value = None
+
         for page, row in rows_to_check:
             value = row.get(field, "")
             if is_blank_value(value):
                 continue
-            representative_value = str(value).strip()
-            if _auto_text_evidence(value, field, _auto_detect_page_text(page)):
-                evidence_count += 1
 
-        if evidence_count < 1 or representative_value is None:
+            representative_value = str(value).strip()
+            if _auto_text_evidence(
+                value,
+                field,
+                _auto_detect_page_text(page)
+            ):
+                found = True
+                break
+
+        if not found or representative_value is None:
             continue
 
-        signature = (
-            get_field_type(field),
-            normalize_text(representative_value),
-        )
+        signature = _auto_field_signature(field, representative_value)
         if signature in detected_signatures:
             continue
 
         detected_signatures.add(signature)
         detected.append(field)
 
+    # Return fields in their original Excel order.
+    original_order = {str(column): idx for idx, column in enumerate(df.columns)}
+    detected.sort(key=lambda field: original_order.get(field, 10**9))
     return detected
 
 
