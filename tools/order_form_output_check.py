@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-04-AUTODETECT-ROWMAP-FIX-03"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-FAIL-OSZ-DIRECT-FALLBACK-05"
 import pandas as pd
 import fitz
 import re
@@ -1309,6 +1309,86 @@ def _truncate_visual_value(value, limit=42):
     return value[: max(1, limit - 1)] + "…"
 
 
+def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, difference):
+    """Find the *incorrect* PDF text for a FAIL without changing comparison logic.
+
+    The normal visual lookup first searches the complete PDF OUTPUT value. For
+    long care/composition mismatches that can fail because the PDF OUTPUT may
+    contain extra OCR tokens. This fallback searches the actual replacement/
+    inserted tokens from the already-produced comparison difference.
+    """
+    actual_value = str(actual_value or "").strip()
+    expected_value = str(expected_value or "").strip()
+    difference = str(difference or "").strip()
+
+    # OSZ uses its sequence-position-aware visual resolver.
+    if get_field_type(field_name) == "OSZ":
+        boxes = _find_visual_osz_box(page, field_name, actual_value)
+        if boxes:
+            return boxes
+
+    # First try the complete actual PDF output.
+    boxes = _find_visual_boxes(page, actual_value, field_name)
+    if boxes:
+        return boxes
+
+    from difflib import SequenceMatcher
+
+    expected_tokens = tokenize(expected_value)
+    actual_tokens = tokenize(actual_value)
+    candidate_tokens = []
+
+    if expected_tokens and actual_tokens:
+        matcher = SequenceMatcher(None, expected_tokens, actual_tokens, autojunk=False)
+        for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
+            if tag in {"replace", "insert"}:
+                candidate_tokens.extend(actual_tokens[b1:b2])
+
+    # The stored difference may be even more specific, e.g.\n    # "Extra: only non; Extra: 16; Extra: hag".
+    for item in re.findall(r"(?:Extra|Found|PDF)\s*:\s*([^;]+)", difference, flags=re.IGNORECASE):
+        candidate_tokens.extend(tokenize(item))
+
+    # Keep order and remove weak one-character fragments unless the actual
+    # output itself is a single character/number.
+    seen = set()
+    cleaned = []
+    for token in candidate_tokens:
+        token_norm = normalize_text(token)
+        if not token_norm:
+            continue
+        if len(token_norm) <= 1 and len(actual_tokens) > 1:
+            continue
+        if token_norm not in seen:
+            seen.add(token_norm)
+            cleaned.append(token_norm)
+
+    found = []
+    for token in cleaned:
+        token_boxes = _find_visual_boxes(page, token, field_name)
+        for box in token_boxes:
+            if box not in found:
+                found.append(box)
+
+    if found:
+        return found
+
+    # Field-specific fallback for long care instructions: highlight the most
+    # distinctive actual words/phrases that differ from the Order Form.
+    if get_field_type(field_name) == "CARE":
+        actual_norm_tokens = [t for t in actual_tokens if len(t) >= 4]
+        expected_norm_tokens = set(t for t in expected_tokens if len(t) >= 4)
+        distinctive = [t for t in actual_norm_tokens if t not in expected_norm_tokens]
+        for token in distinctive:
+            token_boxes = _find_visual_boxes(page, token, field_name)
+            for box in token_boxes:
+                if box not in found:
+                    found.append(box)
+            if len(found) >= 6:
+                break
+
+    return found
+
+
 def build_highlighted_page_image(page, page_report, field_colors=None):
     """Return the full original artwork with field-specific mapped annotations.
 
@@ -1356,6 +1436,17 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         else:
             boxes = _find_visual_boxes(page, pdf_output, field_name)
 
+        # FAIL needs a visual target even when the full PDF OUTPUT is a long
+        # mismatch string that cannot be found as one contiguous OCR sequence.
+        if status == "FAIL" and not boxes:
+            boxes = _find_visual_failure_boxes(
+                page,
+                field_name,
+                expected_value,
+                pdf_output,
+                row.get("DIFFERENCE", ""),
+            )
+
         if not boxes:
             continue
 
@@ -1371,14 +1462,32 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             right = min(base.width - 1, right + pad)
             bottom = min(base.height - 1, bottom + pad)
 
-            # Strong field color, still translucent enough to read the original artwork.
-            draw.rounded_rectangle(
-                (left, top, right, bottom),
-                radius=max(3, pad),
-                fill=rgb + (82,),
-                outline=rgb + (255,),
-                width=max(2, pad),
-            )
+            if status == "FAIL":
+                # Field identity stays in the field-specific color; the actual
+                # incorrect artwork text is marked red so the defect is obvious.
+                draw.rounded_rectangle(
+                    (left, top, right, bottom),
+                    radius=max(3, pad),
+                    fill=(218, 54, 51, 105),
+                    outline=rgb + (255,),
+                    width=max(2, pad),
+                )
+                error_pad = max(2, pad + 1)
+                draw.rounded_rectangle(
+                    (max(0, left - error_pad), max(0, top - error_pad),
+                     min(base.width - 1, right + error_pad), min(base.height - 1, bottom + error_pad)),
+                    radius=max(3, error_pad),
+                    outline=(218, 54, 51, 255),
+                    width=max(2, pad // 2),
+                )
+            else:
+                draw.rounded_rectangle(
+                    (left, top, right, bottom),
+                    radius=max(3, pad),
+                    fill=rgb + (96,),
+                    outline=rgb + (255,),
+                    width=max(2, pad),
+                )
 
             if field_name not in annotated_fields:
                 annotations.append({
@@ -1453,11 +1562,12 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             width=max(2, int(min(base.size) * 0.00095)),
         )
 
+        label_outline = (218, 54, 51) if status == "FAIL" else rgb
         draw.rounded_rectangle(
             (label_x, label_y, label_x + label_w, label_y + label_h),
             radius=max(5, int(min(base.size) * 0.0025)),
             fill=(255, 255, 255, 246),
-            outline=rgb + (255,),
+            outline=label_outline + (255,),
             width=max(2, int(min(base.size) * 0.0012)),
         )
 
@@ -1575,6 +1685,13 @@ def build_page_state(page, product_type):
         # coordinate-aware candidates are used only as a fallback when OCR
         # formatting has mixed multiple standalone numbers into one line.
         "osz_runs": extract_standalone_numeric_runs_from_lines(lines),
+        # Keep a second, immutable numeric sequence from the PDF text layer.
+        # This is a targeted OSZ fallback only; it does not alter normal field
+        # matching or consumption. It protects clean PDF text when OCR has
+        # merged some sequence values into neighbouring lines.
+        "osz_direct_runs": extract_standalone_numeric_runs_from_lines(
+            build_page_lines(page.get("direct_text", ""), product_type)
+        ),
         "osz_sequence_candidates": extract_osz_sequence_candidates(page),
     }
 
@@ -4070,6 +4187,17 @@ def main():
     if "of_auto_output_pages" not in st.session_state:
         st.session_state["of_auto_output_pages"] = None
 
+    # A code update must never leave an old comparison report visible in the
+    # same Streamlit session. This is presentation/session hygiene only; it
+    # does not modify any comparison decision.
+    if st.session_state.get("of_report_build_version") != AUTO_DETECT_ENGINE_VERSION:
+        st.session_state["of_report"] = None
+        st.session_state["of_visual_pages"] = None
+        st.session_state["of_report_selected_fields"] = []
+        st.session_state["of_report_product_type"] = None
+        st.session_state["of_report_comparison_method"] = None
+        st.session_state["of_report_build_version"] = AUTO_DETECT_ENGINE_VERSION
+
     # =========================================================
     # TITLE
     # =========================================================
@@ -4098,6 +4226,7 @@ def main():
             st.session_state["of_auto_detected_fields"] = []
             st.session_state["of_auto_detect_key"] = None
             st.session_state["of_auto_output_pages"] = None
+            st.session_state["of_report_build_version"] = None
             st.rerun()
 
     with nav_right:
@@ -4112,6 +4241,7 @@ def main():
             st.session_state["of_auto_detected_fields"] = []
             st.session_state["of_auto_detect_key"] = None
             st.session_state["of_auto_output_pages"] = None
+            st.session_state["of_report_build_version"] = None
             st.rerun()
 
     # =========================================================
@@ -4493,6 +4623,7 @@ def main():
                     st.session_state["of_report_selected_fields"] = selected_fields
                     st.session_state["of_report_product_type"] = product_type
                     st.session_state["of_report_comparison_method"] = comparison_method
+                    st.session_state["of_report_build_version"] = AUTO_DETECT_ENGINE_VERSION
                     st.session_state["of_visual_pages"] = [
                         page for page in output_pages
                         if int(page.get("page", 0)) in selected_pdf_pages
