@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-NO-REASON-EXACT-10"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-NO-REASON-BARCODE-11"
 import pandas as pd
 import fitz
 import re
@@ -433,6 +433,17 @@ def get_field_type(field_name):
 
     if "symbol" in compact or compact in {"caremark", "caresymbol", "washsymbol"}:
         return "SYMBOL"
+
+    # Barcode / GTIN family fields.  Keep this ahead of IDENTIFIER so UPC/EAN/GTIN
+    # columns get the barcode-specific normalization rather than identifier-prefix
+    # logic.  This does not affect ordinary item/style/supplier identifiers.
+    if (
+        "barcode" in compact
+        or "barcodenumber" in compact
+        or compact in {"upc", "upca", "ean", "ean8", "ean13", "ean14", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "jan", "isbn", "itf"}
+        or re.search(r"(?:^|(?:_|-|\s))(?:upc|ean|gtin|jan|isbn|itf)(?:\d+)?(?:$|(?:_|-|\s))", str(field_name).casefold())
+    ):
+        return "BARCODE"
 
     if (
         compact == "rn"
@@ -1821,7 +1832,14 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
         field_type = get_field_type(field_name)
 
         # Long/block fields must NEVER fall back to a single differing token.
-        if field_type == "SYMBOL":
+        if field_type == "BARCODE":
+            boxes = _find_visual_boxes(page, pdf_output, field_name)
+            if not boxes and status == "FAIL":
+                boxes = _find_visual_failure_boxes(
+                    page, field_name, expected_value, pdf_output,
+                    row.get("DIFFERENCE", "")
+                )
+        elif field_type == "SYMBOL":
             boxes = _find_visual_symbol_boxes(page, pdf_output)
             if not boxes:
                 boxes = _find_visual_symbol_boxes(page, expected_value)
@@ -3221,6 +3239,246 @@ def find_care_region(state, field_name):
     return region_lines or None
 
 
+
+# =========================================================
+# BARCODE / UPC / EAN / GTIN SUPPORT
+# =========================================================
+
+BARCODE_CONFUSION_MAP = str.maketrans({
+    # Common OCR confusions in human-readable barcode digits.
+    "O": "0", "Q": "0", "D": "0",
+    "I": "1", "L": "1", "T": "1",
+    "Z": "2",
+    "S": "5",
+    "G": "6",
+    "B": "8",
+})
+
+
+def normalize_barcode_digits(value, allow_ocr_confusions=False):
+    """Return the digit sequence represented by a barcode value."""
+    if is_blank_value(value):
+        return ""
+
+    raw = str(value).strip().upper()
+    if allow_ocr_confusions:
+        raw = raw.translate(BARCODE_CONFUSION_MAP)
+    return re.sub(r"[^0-9]", "", raw)
+
+
+def barcode_family(digits):
+    """Return the common retail barcode family from digit length."""
+    length = len(str(digits or ""))
+    return {
+        8: "EAN-8",
+        12: "UPC-A",
+        13: "EAN-13",
+        14: "GTIN-14",
+    }.get(length, "BARCODE")
+
+
+def barcode_check_digit_valid(digits):
+    """Validate UPC/EAN/GTIN check digit when the length is supported."""
+    digits = normalize_barcode_digits(digits)
+    if len(digits) not in {8, 12, 13, 14}:
+        return False
+
+    body = digits[:-1]
+    provided = int(digits[-1])
+    total = 0
+
+    # GTIN checksum: weighting depends on parity from the right.
+    # Starting from the rightmost body digit, weights alternate 3, 1, 3, 1...
+    reversed_body = list(reversed(body))
+    for index, char in enumerate(reversed_body):
+        weight = 3 if index % 2 == 0 else 1
+        total += int(char) * weight
+
+    calculated = (10 - (total % 10)) % 10
+    return calculated == provided
+
+
+def barcode_gtin14(digits):
+    """Canonical GTIN-14 representation for 8/12/13/14-digit GTINs."""
+    digits = normalize_barcode_digits(digits)
+    if len(digits) in {8, 12, 13, 14}:
+        return digits.zfill(14)
+    return ""
+
+
+def barcode_equivalent(expected_digits, actual_digits):
+    """Exact barcode identity with UPC-A/EAN/GTIN zero-padding equivalence."""
+    expected_digits = normalize_barcode_digits(expected_digits)
+    actual_digits = normalize_barcode_digits(actual_digits)
+
+    if not expected_digits or not actual_digits:
+        return False
+
+    if expected_digits == actual_digits:
+        return True
+
+    # UPC-A is the 12-digit form of the same GTIN represented as EAN-13 with a
+    # leading zero. GTIN-14 normalization also safely handles leading-zero forms
+    # of EAN-8/UPC-A/EAN-13.
+    expected_gtin14 = barcode_gtin14(expected_digits)
+    actual_gtin14 = barcode_gtin14(actual_digits)
+    return bool(expected_gtin14 and actual_gtin14 and expected_gtin14 == actual_gtin14)
+
+
+def _barcode_chunks_from_line(line_text):
+    """Extract barcode-like numeric strings while preserving grouping."""
+    text = str(line_text or "")
+    candidates = []
+
+    # Plain numeric groups separated by spaces/hyphens/dots/slashes/parentheses.
+    # The total normalized length is checked later against the expected barcode.
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9])[0-9][0-9\s.\-_/()]*[0-9](?![A-Za-z0-9])",
+        text,
+    ):
+        raw = match.group(0)
+        digits = normalize_barcode_digits(raw)
+        if 8 <= len(digits) <= 14:
+            candidates.append({
+                "digits": digits,
+                "raw": raw.strip(),
+                "start": match.start(),
+                "end": match.end(),
+                "source": "digits",
+            })
+
+    # OCR-tolerant version: allow only a tightly controlled set of common
+    # digit/letter confusions, and only when the final normalized length is
+    # barcode-like. This is never used to create a fuzzy PASS against arbitrary
+    # text; it is simply a second candidate representation.
+    for match in re.finditer(
+        r"(?<![A-Za-z0-9])[0-9OQDILTZSBG][0-9OQDILTZSBG\s.\-_/()]*[0-9OQDILTZSBG](?![A-Za-z0-9])",
+        text.upper(),
+    ):
+        raw = match.group(0)
+        digits = normalize_barcode_digits(raw, allow_ocr_confusions=True)
+        if 8 <= len(digits) <= 14 and any(ch.isalpha() for ch in raw):
+            candidates.append({
+                "digits": digits,
+                "raw": raw.strip(),
+                "start": match.start(),
+                "end": match.end(),
+                "source": "ocr_confusion",
+            })
+
+    # Deduplicate identical digit candidates from the two extraction paths.
+    unique = []
+    seen = set()
+    for item in candidates:
+        key = (item["digits"], item["start"], item["end"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
+def _barcode_candidates_from_state(state):
+    """Collect barcode-like candidates from comparison text and raw PDF text."""
+    candidates = []
+    seen = set()
+
+    pools = []
+    for line in state.get("lines", []):
+        pools.append(("comparison", line.get("text", "")))
+    for line in state.get("direct_lines", []):
+        pools.append(("direct_pdf", line.get("text", "")))
+
+    for source_kind, text in pools:
+        for item in _barcode_chunks_from_line(text):
+            key = (item["digits"], item["raw"], source_kind)
+            if key in seen:
+                continue
+            seen.add(key)
+            copied = dict(item)
+            copied["source_kind"] = source_kind
+            copied["line_text"] = str(text or "").strip()
+            candidates.append(copied)
+
+    return candidates
+
+
+def find_barcode_match(expected, state):
+    """Robust retail barcode matching without fuzzy/partial acceptance."""
+    expected_digits = normalize_barcode_digits(expected)
+    if len(expected_digits) not in {8, 12, 13, 14}:
+        return None
+
+    candidates = _barcode_candidates_from_state(state)
+    if not candidates:
+        return None
+
+    # First, exact / GTIN-equivalent match. Prefer exact source text over OCR
+    # confusion candidates when both represent the same number.
+    exact = [
+        candidate for candidate in candidates
+        if barcode_equivalent(expected_digits, candidate["digits"])
+    ]
+    if exact:
+        exact.sort(
+            key=lambda c: (
+                c.get("source") == "ocr_confusion",
+                c.get("source_kind") != "direct_pdf",
+                len(c.get("raw", "")),
+            )
+        )
+        best = exact[0]
+        return {
+            "status": "PASS",
+            "pdf": best["raw"],
+            "difference": "—",
+            "match_type": f"BARCODE_{barcode_family(expected_digits)}",
+            "barcode_digits": best["digits"],
+        }
+
+    # If no exact match exists, look for a strong same-family candidate in a
+    # line that is explicitly barcode-labelled. This permits a genuine FAIL to
+    # be shown instead of falsely reporting NOT FOUND, while avoiding random
+    # page numbers/OSZ values becoming barcode failures.
+    labelled_candidates = []
+    for candidate in candidates:
+        line = normalize_text(candidate.get("line_text", ""))
+        if any(marker in line for marker in (
+            "barcode", "upc", "ean", "gtin", "jan", "isbn", "itf"
+        )):
+            if len(candidate["digits"]) in {8, 12, 13, 14}:
+                labelled_candidates.append(candidate)
+
+    if labelled_candidates:
+        # Prefer same length; otherwise prefer GTIN-compatible retail families.
+        same_length = [
+            candidate for candidate in labelled_candidates
+            if len(candidate["digits"]) == len(expected_digits)
+        ]
+        pool = same_length or labelled_candidates
+        pool.sort(
+            key=lambda c: (
+                abs(len(c["digits"]) - len(expected_digits)),
+                c.get("source") == "ocr_confusion",
+            )
+        )
+        best = pool[0]
+        return {
+            "status": "FAIL",
+            "pdf": best["raw"],
+            "difference": (
+                f"Barcode mismatch: Order Form has '{normalize_barcode_digits(expected)}' "
+                f"but PDF has '{best['digits']}'."
+            ),
+            "match_type": "BARCODE_MISMATCH",
+            "barcode_digits": best["digits"],
+        }
+
+    # Otherwise do not manufacture a FAIL merely because the page contains
+    # numbers. Return NOT FOUND until barcode-specific evidence exists.
+    return None
+
+
 def check_field(
     expected,
     field_name,
@@ -3239,6 +3497,31 @@ def check_field(
 
     expected = str(expected).strip()
     field_type = get_field_type(field_name)
+
+    # -----------------------------------------------------
+    # BARCODE / UPC / EAN / GTIN
+    # -----------------------------------------------------
+    if field_type == "BARCODE":
+        barcode_result = find_barcode_match(expected, state)
+        if barcode_result:
+            # BARCODE matching is independent of the normal line-consumption
+            # rules. We consume a matching line only when we have a concrete
+            # barcode candidate, while leaving other numbers on the page alone.
+            target_digits = barcode_result.get("barcode_digits", "")
+            for line in state["lines"]:
+                if not line_is_available(line, state):
+                    continue
+                if normalize_barcode_digits(line.get("text", "")) == target_digits:
+                    consume_lines(state, [line])
+                    break
+            return barcode_result
+
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Barcode/UPC/EAN value was not detected reliably.",
+            "match_type": "BARCODE_NOT_FOUND",
+        }
 
     # -----------------------------------------------------
     # OSZ sequence
@@ -3776,6 +4059,7 @@ def _generic_exact_field(expected, field_name, state):
 
 FIELD_PRIORITY = {
     "OSZ": 10,
+    "BARCODE": 15,
     "RN": 20,
     "IDENTIFIER": 20,
     "COO": 30,
@@ -4103,6 +4387,16 @@ def _auto_text_evidence(expected, field_name, text):
     compact_expected = re.sub(r"[^a-z0-9]", "", expected_norm)
     norm_text = normalize_text(text)
 
+    if field_type == "BARCODE":
+        expected_digits = normalize_barcode_digits(expected)
+        if len(expected_digits) not in {8, 12, 13, 14}:
+            return False
+        for line in str(text or "").splitlines():
+            for candidate in _barcode_chunks_from_line(line):
+                if barcode_equivalent(expected_digits, candidate["digits"]):
+                    return True
+        return False
+
     if field_type == "IDENTIFIER":
         return _auto_identifier_evidence(expected, field_name, norm_text)
 
@@ -4271,6 +4565,7 @@ def auto_detect_fields(
     available_fields = get_available_fields(df)
     allowed_types = {
         "IDENTIFIER",
+        "BARCODE",
         "BRAND",
         "GENDER",
         "SIZE",
