@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-05-VISUAL-BLOCK-FAIL-NO-REASON-BARCODE-11"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-13-DYNAMIC-AUTO-DETECT-SEMANTIC-FIELD-FAMILIES-12"
 import pandas as pd
 import fitz
 import re
@@ -482,6 +482,9 @@ def get_field_type(field_name):
     ):
         return "QUANTITY"
 
+    # Country of Origin / Made-In field families.
+    # Recognize semantic schema conventions (not individual job columns), so
+    # fields such as MIN_EN / MIN_SP are handled without a hardcoded list.
     if (
         "coo" in compact
         or "countryoforigin" in compact
@@ -491,6 +494,10 @@ def get_field_type(field_name):
     ):
         return "COO"
 
+    # Fiber / Fabric / Content field families.
+    # Common production schemas use FIB_* as shorthand for visible fiber
+    # composition. This is intentionally a semantic family rule, not a list of
+    # individual field names.
     if (
         "fiber" in compact
         or "fibre" in compact
@@ -504,6 +511,8 @@ def get_field_type(field_name):
     ):
         return "CONTENT"
 
+    # Care/wash instruction field families. WC_* is a common shorthand for
+    # wash-care text.
     if (
         "care" in compact
         or "wash" in compact
@@ -4307,31 +4316,276 @@ def _auto_material_evidence(expected, text):
     return matches >= required and has_composition_shape
 
 
+def _auto_strip_accents(text):
+    """Return a comparison-safe lowercase string with accents removed."""
+    value = unicodedata.normalize("NFKD", str(text or "")).casefold()
+    return "".join(char for char in value if not unicodedata.combining(char))
+
+
+def _auto_dynamic_composition_evidence(expected, field_name, text):
+    """
+    Detect visible fiber/composition data without depending on one Excel schema.
+
+    The Order Form column name identifies the semantic family, while this helper
+    proves the value is actually represented in the artwork. It handles
+    multilingual accents, split words such as POLY-ESTER, and multiple
+    percentage/material pairs.
+    """
+    expected_raw = str(expected or "").strip()
+    if not expected_raw:
+        return False
+
+    field_compact = (
+        normalize_text(field_name)
+        .replace(" ", "")
+        .replace("_", "")
+        .replace("-", "")
+    )
+    if not any(token in field_compact for token in (
+        "fib", "fiber", "fibre", "fabric", "content",
+        "composition", "compodsc", "lhcompodsc", "fabrication", "material"
+    )):
+        return False
+
+    expected_clean = _auto_strip_accents(expected_raw)
+    text_clean = _auto_strip_accents(text or "")
+
+    # Normalize separators but retain words/digits for pair matching.
+    expected_clean = re.sub(r"[^a-z0-9%]+", " ", expected_clean)
+    text_clean = re.sub(r"[^a-z0-9%]+", " ", text_clean)
+
+    # Capture percentage + material tokens. This is intentionally permissive
+    # about punctuation because artwork may render the same composition across
+    # different lines or with hyphenation.
+    pairs = re.findall(
+        r"(\d+(?:\.\d+)?)\s*%?\s*([a-z][a-z0-9]*(?:\s+[a-z][a-z0-9]*)?)",
+        expected_clean,
+        flags=re.IGNORECASE,
+    )
+
+    # Keep only plausible material words and de-duplicate while preserving order.
+    candidates = []
+    excluded = {
+        "shell", "liner", "lining", "body", "cuerpo", "forro",
+        "extrieur", "exterieur", "doublure", "made", "in", "hecho"
+    }
+    for pct, material_group in pairs:
+        material = re.sub(r"\s+", " ", material_group).strip()
+        material_words = material.split()
+        if material_words and material_words[-1] in excluded:
+            material_words = material_words[:-1]
+        if not material_words:
+            continue
+        material = " ".join(material_words)
+        if len(re.sub(r"[^a-z]", "", material)) < 3:
+            continue
+        item = (pct, material)
+        if item not in candidates:
+            candidates.append(item)
+
+    # If the field has composition-shaped data, require the key pairs to be
+    # present. With 2+ expected pairs, two independent matches are enough to
+    # establish high-confidence artwork evidence.
+    matched = 0
+    for pct, material in candidates:
+        material_compact = re.sub(r"[^a-z]", "", material)
+        pct_pattern = re.escape(pct)
+        # Permit spaces/hyphens between a material's letters (POLY-ESTER).
+        material_letters = [re.escape(ch) for ch in material_compact]
+        flexible_material = r"\s*[-–—]?\s*".join(material_letters)
+        if re.search(
+            rf"{pct_pattern}\s*%?\s*(?:[a-z0-9]+\s*)?{flexible_material}",
+            text_clean,
+            flags=re.IGNORECASE,
+        ):
+            matched += 1
+            continue
+
+        # Fall back to material-only evidence when OCR/PDF extraction breaks
+        # the percentage association but preserves the material itself.
+        if re.search(rf"\b{flexible_material}\b", text_clean, flags=re.IGNORECASE):
+            matched += 1
+
+    if candidates:
+        required = min(2, len(candidates))
+        if matched >= required:
+            return True
+
+        # Catch legitimate variable-field FAILs, such as POLYSTER in the Order
+        # Form versus POLYESTER in artwork. We require composition-shaped artwork
+        # and multiple material similarities rather than a generic fuzzy match.
+        from rapidfuzz import fuzz
+        material_expected = [
+            re.sub(r"[^a-z]", "", material)
+            for _pct, material in candidates
+        ]
+        actual_tokens = [
+            re.sub(r"[^a-z]", "", token)
+            for token in re.findall(r"[a-z]+", text_clean, flags=re.IGNORECASE)
+            if len(re.sub(r"[^a-z]", "", token)) >= 4
+        ]
+        fuzzy_hits = 0
+        for expected_material in material_expected:
+            if not expected_material:
+                continue
+            if any(
+                fuzz.ratio(expected_material, actual_material) >= 84
+                for actual_material in actual_tokens
+            ):
+                fuzzy_hits += 1
+        return fuzzy_hits >= min(2, len(material_expected))
+
+    # Non-percentage content/material fields can still auto-detect if their
+    # actual phrase is directly represented. This remains conservative.
+    target_compact = re.sub(r"[^a-z0-9]", "", expected_clean)
+    text_compact = re.sub(r"[^a-z0-9]", "", text_clean)
+    return bool(target_compact) and len(target_compact) >= 6 and target_compact in text_compact
+
+
+def _auto_multiline_size_evidence(expected, text):
+    """Detect a structured size block even when OCR line breaks differ."""
+    expected_raw = str(expected or "").strip()
+    if not expected_raw:
+        return False
+
+    # Strong exact/compact match first.
+    expected_norm = normalize_text(expected_raw)
+    actual_norm = normalize_text(text or "")
+    expected_compact = re.sub(r"[^a-z0-9]", "", expected_norm)
+    actual_compact = re.sub(r"[^a-z0-9]", "", actual_norm)
+    if expected_compact and expected_compact in actual_compact:
+        return True
+
+    # Compare meaningful size tokens from each line/block. Require multiple
+    # independent anchors so a random number on artwork cannot trigger a match.
+    expected_tokens = [
+        token for token in re.findall(r"[a-z]+|\d+(?:[-/]\d+)*", _auto_strip_accents(expected_raw))
+        if len(token) >= 1
+    ]
+    if not expected_tokens:
+        return False
+
+    actual_clean = _auto_strip_accents(text or "")
+    hits = 0
+    considered = []
+    for token in expected_tokens:
+        compact = re.sub(r"[^a-z0-9]", "", token)
+        if not compact:
+            continue
+        # Ignore very common single-letter multilingual size labels unless they
+        # appear with their neighboring numeric size range.
+        if len(compact) == 1 and compact.isalpha():
+            continue
+        considered.append(compact)
+        if compact in re.sub(r"[^a-z0-9]", "", actual_clean):
+            hits += 1
+
+    if len(considered) >= 4:
+        return hits >= max(3, int(len(considered) * 0.55))
+    if len(considered) >= 2:
+        return hits >= len(considered)
+    return False
+
+
 def _auto_coo_evidence(expected, field_name, text):
-    """High-confidence COO evidence; codes like MADE_IN=F are not artwork text."""
+    """
+    High-confidence COO Auto Detect evidence.
+
+    Auto Detect must find both PASS and FAIL cases. Therefore an exact value is
+    strong evidence, but for COO we also accept a matching language/COO marker
+    with a different country so a wrong country can still be detected as a field
+    that belongs in the artwork.
+    """
     from rapidfuzz import fuzz
 
     expected_coo = extract_coo_value(expected)
     target = normalize_text(expected_coo if expected_coo else expected)
+    region = get_field_region(field_name)
+    norm_text = normalize_text(text)
 
     # One/two-letter language/origin codes are internal codes, not visible COO.
     if re.fullmatch(r"[a-z]{1,2}", target):
-        return False
+        target = ""
 
     target_compact = re.sub(r"[^a-z0-9]", "", target)
-    if len(target_compact) < 4:
-        return False
+    if target_compact and len(target_compact) >= 4:
+        for line in _auto_detect_lines({"ocr_text": text}):
+            line_compact = re.sub(r"[^a-z0-9]", "", line)
+            if target_compact == line_compact:
+                return True
+            if target_compact and target_compact in line_compact:
+                return True
+            if fuzz.ratio(target_compact, line_compact) >= 92:
+                return True
 
-    for line in _auto_detect_lines({"ocr_text": text}):
-        line_compact = re.sub(r"[^a-z0-9]", "", line)
-        if target_compact == line_compact:
-            return True
-        if target_compact and target_compact in line_compact:
-            return True
-        if fuzz.ratio(target_compact, line_compact) >= 92:
-            return True
+    # Region-specific structural evidence lets Auto Detect catch a wrong COO
+    # value rather than dropping the field simply because its expected country
+    # was not found.
+    markers = {
+        "EN": ("made in", "country of origin"),
+        "FR": ("fabrique en", "fabriqué en", "made in"),
+        "SP": ("hecho en",),
+        "": ("made in", "fabrique en", "fabriqué en", "hecho en"),
+    }
+    for marker in markers.get(region, markers[""]):
+        if marker in norm_text:
+            # Require at least one alphabetic/numeric location token after the
+            # marker so a stray heading does not count as COO evidence.
+            after = norm_text.split(marker, 1)[1].strip()
+            if re.search(r"[a-z]{3,}", after):
+                return True
 
     return False
+
+
+def _auto_semantic_type(field_name):
+    """
+    Auto Detect-only semantic classifier.
+
+    This is deliberately separate from get_field_type() so expanding Auto Detect
+    does not alter the established manual comparison engine or its matching rules.
+    It recognizes schema families such as MIN_*, FIB_* and WC_* rather than
+    hardcoding individual job columns.
+    """
+    raw = str(field_name or "").casefold().strip()
+    compact = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
+
+    if (
+        "coo" in compact
+        or "countryoforigin" in compact
+        or "countryorigin" in compact
+        or "madein" in compact
+        or compact == "origin"
+        or re.match(r"^min(?:_|$)", raw)
+        or compact in {"minen", "minsp", "minfr", "minenglish", "minspanish", "minfrench"}
+    ):
+        return "COO"
+
+    if (
+        "fiber" in compact
+        or "fibre" in compact
+        or "fabric" in compact
+        or "content" in compact
+        or "composition" in compact
+        or "compodsc" in compact
+        or "lhcompodsc" in compact
+        or "fabrication" in compact
+        or "material" in compact
+        or compact.startswith("fib")
+    ):
+        return "CONTENT"
+
+    if (
+        "care" in compact
+        or "wash" in compact
+        or "washing" in compact
+        or "laundry" in compact
+        or "instruction" in compact
+        or compact.startswith("wc")
+    ):
+        return "CARE"
+
+    return None
 
 
 def _auto_generic_field_allowed(field_name):
@@ -4365,14 +4619,25 @@ def _auto_generic_field_allowed(field_name):
 
 
 def _auto_content_field_allowed(field_name):
-    """Only canonical composition-description fields are auto-detected."""
+    """
+    Allow semantic CONTENT families through Auto Detect.
+
+    The actual artwork-evidence test remains responsible for deciding whether
+    the populated value is really present in the PDF. This function therefore
+    must not whitelist individual customer/job column names.
+    """
     compact = (
         normalize_text(field_name)
         .replace(" ", "")
         .replace("_", "")
         .replace("-", "")
     )
-    return compact.startswith("compodsc") or compact.startswith("lhcompodsc")
+
+    semantic_tokens = (
+        "fiber", "fibre", "fabric", "content", "composition",
+        "compodsc", "lhcompodsc", "fabrication", "material", "fib"
+    )
+    return any(token in compact for token in semantic_tokens)
 
 
 def _auto_text_evidence(expected, field_name, text):
@@ -4384,6 +4649,8 @@ def _auto_text_evidence(expected, field_name, text):
         return False
 
     field_type = get_field_type(field_name)
+    if field_type == "GENERAL":
+        field_type = _auto_semantic_type(field_name) or field_type
     compact_expected = re.sub(r"[^a-z0-9]", "", expected_norm)
     norm_text = normalize_text(text)
 
@@ -4412,24 +4679,41 @@ def _auto_text_evidence(expected, field_name, text):
         return _auto_coo_evidence(expected, field_name, norm_text)
 
     if field_type == "CONTENT":
-        return _auto_content_field_allowed(field_name) and _auto_material_evidence(expected, norm_text)
+        return _auto_content_field_allowed(field_name) and _auto_dynamic_composition_evidence(
+            expected, field_name, text
+        )
 
     if field_type == "CARE":
         tokens = [t for t in re.findall(r"[a-z]+", expected_norm) if len(t) >= 4]
-        if len(tokens) < 3:
-            return False
-        unique = set(tokens)
-        hits = sum(1 for token in unique if token in norm_text)
-        return hits >= max(3, int(len(unique) * 0.35))
+        if len(tokens) >= 3:
+            unique = set(tokens)
+            hits = sum(1 for token in unique if token in norm_text)
+            if hits >= max(3, int(len(unique) * 0.35)):
+                return True
+
+        # If wording is wrong, Auto Detect still needs to recognize the relevant
+        # language care block so the field can be selected and subsequently FAIL.
+        region = get_field_region(field_name)
+        care_markers = {
+            "EN": ("machine wash", "wash", "bleach", "tumble dry", "cool iron", "dry clean"),
+            "FR": ("laver", "blanchiment", "secher", "secher", "repasser", "nettoyer a sec"),
+            "SP": ("lavar", "blanqueador", "cloro", "secar", "planchar", "limpiar en seco"),
+            "": ("machine wash", "laver", "lavar", "bleach", "blanchiment", "blanqueador"),
+        }
+        marker_set = care_markers.get(region, care_markers[""])
+        marker_hits = sum(1 for marker in marker_set if marker in norm_text)
+        return marker_hits >= 1
 
     if field_type == "SIZE":
-        compact_text = re.sub(r"[^a-z0-9./-]", "", norm_text)
-        if compact_expected and compact_expected in compact_text:
-            return True
-        return _auto_number_evidence(expected_norm, norm_text) and any(
-            key in normalize_text(field_name).replace(" ", "")
-            for key in ("size", "waist", "inseam", "alpha", "fit")
-        )
+        return _auto_multiline_size_evidence(expected, text)
+
+    if field_type == "SYMBOL":
+        # Exact custom-font keystroke matching. This deliberately avoids fuzzy
+        # matching because the symbol/codepoint itself is the data.
+        for line in str(text or "").splitlines():
+            if _symbol_text_matches(expected_norm, line):
+                return True
+        return False
 
     if field_type == "COLOR":
         if expected_norm in norm_text:
@@ -4576,6 +4860,7 @@ def auto_detect_fields(
         "ATTRIBUTE",
         "RN",
         "OSZ",
+        "SYMBOL",
         "GENERAL",
     }
 
@@ -4585,14 +4870,15 @@ def auto_detect_fields(
             continue
 
         field_type = get_field_type(field)
+        auto_type = _auto_semantic_type(field)
 
-        if field_type == "GENERAL" and not _auto_generic_field_allowed(field):
+        if field_type not in allowed_types and not auto_type:
             continue
 
-        if field_type == "CONTENT" and not _auto_content_field_allowed(field):
-            continue
-
-        if field_type not in allowed_types:
+        # GENERAL operational/database columns remain protected. A GENERAL field
+        # is allowed through Auto Detect only when the separate semantic family
+        # classifier recognizes it or the legacy generic whitelist recognizes it.
+        if field_type == "GENERAL" and not auto_type and not _auto_generic_field_allowed(field):
             continue
 
         compact = (
@@ -4601,6 +4887,12 @@ def auto_detect_fields(
             .replace("_", "")
             .replace("-", "")
         )
+
+        # Internal/support codes are useful metadata but are not normally visible
+        # artwork fields. Keep them out of Auto Detect without changing manual
+        # field selection or the underlying comparison engine.
+        if compact in {"carecode", "caresuffixcode"}:
+            continue
 
         # Never auto-select translated/internal material columns.
         if any(token in compact for token in (
@@ -4648,18 +4940,15 @@ def auto_detect_fields(
     candidates = [field for _idx, field in candidates]
 
     detected = []
-    detected_signatures = set()
 
     for field in candidates:
         found = False
-        representative_value = None
 
         for page, row in rows_to_check:
             value = row.get(field, "")
             if is_blank_value(value):
                 continue
 
-            representative_value = str(value).strip()
             if _auto_text_evidence(
                 value,
                 field,
@@ -4668,14 +4957,13 @@ def auto_detect_fields(
                 found = True
                 break
 
-        if not found or representative_value is None:
+        if not found:
             continue
 
-        signature = _auto_field_signature(field, representative_value)
-        if signature in detected_signatures:
-            continue
-
-        detected_signatures.add(signature)
+        # IMPORTANT: do not collapse different Order Form columns just because
+        # their values happen to be identical. Regional/language fields such as
+        # FIB_SP, FIB_Mexico and FIB_SP_Mexico may intentionally carry the same
+        # text today while still being separate selectable artwork fields.
         detected.append(field)
 
     # Return fields in their original Excel order.
