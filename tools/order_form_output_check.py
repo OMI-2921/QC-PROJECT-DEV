@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-13-DYNAMIC-AUTO-DETECT-SEMANTIC-FIELD-FAMILIES-12"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-13-COMPARISON-ENGINE-STRUCTURED-TEXT-13"
 import pandas as pd
 import fitz
 import re
@@ -395,30 +395,30 @@ ADMIN_FIELD_PATTERNS = (
 
 def get_field_region(field_name):
     original = str(field_name).casefold()
-    normalized = normalize_text(field_name).replace(" ", "")
+    normalized = normalize_text(field_name)
+    compact = re.sub(r"[^a-z0-9]", "", original)
 
-    if (
-        "_en" in original
-        or normalized.endswith("en")
-        or "english" in normalized
-    ):
+    if "_en" in original or compact.endswith("en") or "english" in normalized:
         return "EN"
-
-    if (
-        "_fr" in original
-        or normalized.endswith("fr")
-        or "french" in normalized
-        or "canada" in normalized
-    ):
+    if "_fr" in original or compact.endswith("fr") or "french" in normalized or "canada" in normalized:
         return "FR"
-
-    if (
-        "_sp" in original
-        or normalized.endswith("sp")
-        or "spanish" in normalized
-        or "espanol" in normalized
-    ):
+    if "_sp" in original or compact.endswith("sp") or "spanish" in normalized or "espanol" in normalized:
         return "SP"
+
+    if "_ca" in original or compact.endswith("ca"):
+        if (
+            compact.startswith("wc")
+            or compact.startswith("fib")
+            or compact.startswith("min")
+            or "care" in compact
+            or "wash" in compact
+            or "fiber" in compact
+            or "fibre" in compact
+            or "content" in compact
+            or "composition" in compact
+            or "coo" in compact
+        ):
+            return "FR"
 
     return ""
 
@@ -454,6 +454,18 @@ def get_field_type(field_name):
         or compact.startswith("rn")
     ):
         return "RN"
+
+    # Canadian registration number fields are distinct from RN but use the
+    # same structured-number evidence. Keep CA_Number from being classified as
+    # generic text.
+    if compact in {"ca", "canumber", "caregistrationnumber", "registrationcanumber"} or "canumber" in compact:
+        return "CA"
+
+    if "productionmark" in compact or "prodmark" in compact or compact == "production":
+        return "PRODUCTION_MARK"
+
+    if compact == "iso" or compact.startswith("iso"):
+        return "IDENTIFIER"
 
     if (
         "sku" in compact
@@ -491,6 +503,7 @@ def get_field_type(field_name):
         or "countryorigin" in compact
         or "madein" in compact
         or compact == "origin"
+        or compact.startswith("min")
     ):
         return "COO"
 
@@ -508,6 +521,7 @@ def get_field_type(field_name):
         or "lhcompodsc" in compact
         or "fabrication" in compact
         or "material" in compact
+        or compact.startswith("fib")
     ):
         return "CONTENT"
 
@@ -519,6 +533,7 @@ def get_field_type(field_name):
         or "washing" in compact
         or "laundry" in compact
         or "instruction" in compact
+        or compact.startswith("wc")
     ):
         return "CARE"
 
@@ -2068,14 +2083,45 @@ def build_page_lines(page_text, product_type):
     return lines
 
 
+def _select_comparison_text(page):
+    """Choose the cleanest comparison text while preserving OCR as fallback.
+
+    For editable PDFs, the PDF text layer often preserves reading order and
+    structured multi-line content much better than OCR. OCR remains the fallback
+    for scanned/non-editable artwork. This is a comparison-source decision only;
+    visual OCR boxes are still retained separately for annotations.
+    """
+    direct = str(page.get("direct_text", "") or "").strip()
+    ocr = str(page.get("ocr_text", "") or "").strip()
+
+    if direct:
+        direct_quality = _text_quality_score(direct)
+        ocr_quality = _text_quality_score(ocr) if ocr else 0
+        direct_alnum = len(re.findall(r"[A-Za-z0-9]", direct))
+
+        # Prefer a meaningful PDF text layer unless it is dramatically weaker
+        # than OCR. The 0.55 guard protects genuinely bad/partial text layers.
+        if direct_alnum >= 20 and (not ocr or direct_quality >= max(80, ocr_quality * 0.55)):
+            return direct, "pdf_text"
+
+    if ocr:
+        return ocr, "ocr"
+
+    if direct:
+        return direct, "pdf_text"
+
+    return str(page.get("text", "") or ""), str(page.get("source_type", "pdf_text"))
+
+
 def build_page_state(page, product_type):
     if not isinstance(page, dict):
         raise TypeError(
             f"Output page data is malformed. Expected a page dictionary, got {type(page).__name__}."
         )
 
+    comparison_text, comparison_source = _select_comparison_text(page)
     lines = build_page_lines(
-        page.get("text", ""),
+        comparison_text,
         product_type
     )
 
@@ -2112,7 +2158,8 @@ def build_page_state(page, product_type):
 
     return {
         "page": page.get("page"),
-        "source_type": page.get("source_type", "pdf_text"),
+        "source_type": comparison_source,
+        "comparison_text": comparison_text,
         "lines": lines,
         "direct_lines": direct_lines,
         "consumed": set(),
@@ -2672,17 +2719,37 @@ def coo_language(text):
     return ""
 
 
-def extract_rn_value(text):
+def extract_rn_ca_components(text):
+    """Extract RN and CA numbers independently from a combined artwork line."""
     normalized = normalize_text(text)
     if not normalized:
-        return None
+        return {"rn": None, "ca": None}
 
-    match = re.search(
-        r"\b(?:rn|ca)\s*[#:.-]?\s*([0-9][0-9a-z\-\/]*)",
+    result = {"rn": None, "ca": None}
+
+    rn_match = re.search(
+        r"\brn\s*[#:.-]?\s*([0-9][0-9a-z\-/]*)",
         normalized,
         re.IGNORECASE
     )
-    return match.group(1) if match else None
+    if rn_match:
+        result["rn"] = rn_match.group(1)
+
+    ca_match = re.search(
+        r"\bca\s*[#:.-]?\s*([0-9][0-9a-z\-/]*)",
+        normalized,
+        re.IGNORECASE
+    )
+    if ca_match:
+        result["ca"] = ca_match.group(1)
+
+    return result
+
+
+def extract_rn_value(text):
+    """Backward-compatible RN extractor; return RN first, then CA only if no RN exists."""
+    parts = extract_rn_ca_components(text)
+    return parts.get("rn") or parts.get("ca")
 
 
 def extract_identifier_value(text):
@@ -2744,38 +2811,75 @@ def extract_gender_value(text):
     return None
 
 
+def _content_material_key(material):
+    """Normalize a material name for comparison while preserving semantic words."""
+    value = _auto_strip_accents(material) if "_auto_strip_accents" in globals() else unicodedata.normalize("NFKD", str(material or "")).casefold()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
 def extract_content_values(text):
+    """Extract percentage/material pairs while preserving source order.
+
+    Works with: 60% cotton, 60cotton, POLY-ESTER, SPANDEX/ELASTANE, and
+    component labels such as SHELL/LINER/DOUBLURE/FORRO without treating those
+    labels as part of the material.
+    """
     normalized = normalize_text(text)
     if not normalized:
         return []
 
-    # Support both normal PDF text ('60% cotton') and OCR/PDF extraction that
-    # collapses the percent sign ('60cotton'). Material is captured until the
-    # next percentage/material component or end of the content run.
-    pattern = re.compile(
-        r"(?P<pct>\d{1,3}(?:\.\d+)?)\s*%?\s*"
-        r"(?P<material>[a-z][a-z0-9-]*(?:\s+[a-z][a-z0-9-]*){0,3})"
-        r"(?=\s+\d{1,3}(?:\.\d+)?\s*%?|$)",
-        re.IGNORECASE
-    )
+    stop_labels = {
+        "shell", "liner", "lining", "body", "cuerpo", "forro",
+        "exterior", "extrieur", "exterieur", "doublure",
+        "made", "hecho", "fabrique", "rn", "ca", "mx",
+        "cr", "ec", "gt", "pa", "sv", "us", "size", "color", "colour"
+    }
 
     values = []
-    for match in pattern.finditer(normalized):
-        material = match.group("material").strip()
-        if not material:
+
+    # Standard percentage forms. For each percentage, take the first material
+    # phrase immediately following it, stopping at the next component label or
+    # next percentage.
+    pct_matches = list(re.finditer(r"(?<![a-z0-9])(\d{1,3}(?:\.\d+)?)\s*%?", normalized))
+    for index, match in enumerate(pct_matches):
+        pct = match.group(1)
+        tail_start = match.end()
+        tail_end = pct_matches[index + 1].start() if index + 1 < len(pct_matches) else len(normalized)
+        tail = normalized[tail_start:tail_end].strip()
+        if not tail:
             continue
 
-        # Prevent accidental capture of common section/identifier words.
-        material = re.split(
-            r"\b(?:shell|liner|lining|body|rn|ca|made|size|color|colour)\b.*$",
-            material,
-            maxsplit=1
-        )[0].strip()
+        # Remove common separators and stop when a structural/component label
+        # begins.
+        tail = re.sub(r"^[^a-z0-9]+", "", tail)
+        tokens = re.findall(r"[a-z][a-z0-9]*(?:[-/][a-z][a-z0-9]*)?", tail, flags=re.IGNORECASE)
+        material_tokens = []
+        for token in tokens[:6]:
+            compact = re.sub(r"[^a-z0-9]", "", token.casefold())
+            if not compact:
+                continue
+            if compact in stop_labels:
+                break
+            material_tokens.append(token)
 
+        # Keep normal textile materials concise while allowing combinations such
+        # as SPANDEX/ELASTANE. Component labels stop the capture.
+        if not material_tokens:
+            continue
+
+        material = " ".join(material_tokens[:2]).strip()
         if material:
-            values.append(
-                f"{match.group('pct')}% {material}"
-            )
+            values.append(f"{pct}% {material}")
+
+    # OCR sometimes collapses 60% cotton to 60cotton. Add only attached-number
+    # matches that were not already captured.
+    for match in re.finditer(r"(?<![a-z0-9])(\d{1,3})(?=[a-z])([a-z][a-z0-9]*(?:[-/][a-z][a-z0-9]*)?)", normalized):
+        pct = match.group(1)
+        material = match.group(2)
+        candidate = f"{pct}% {material}"
+        if not any(_content_material_key(candidate) == _content_material_key(existing) for existing in values):
+            values.append(candidate)
 
     return values
 
@@ -3193,26 +3297,48 @@ def describe_text_difference(expected, actual):
     return "; ".join(differences[:8]) or "Content differs."
 
 
-# =========================================================
-# FIELD CHECKERS
-# =========================================================
+def _field_casefold_compact(text):
+    return re.sub(r"[^a-z0-9]", "", _auto_strip_accents(text))
+
+
+def _care_start_markers(region):
+    return {
+        "EN": ["machine wash", "wash cold"],
+        "FR": ["laver a la machine", "laver a machine", "laver à la machine", "laver"],
+        "SP": ["lavar a maquina", "lavar a máquina", "lavar a maquina con", "lavar"],
+        "": ["machine wash", "laver a la machine", "lavar a maquina", "lavar"],
+    }.get(region, ["machine wash", "laver a la machine", "lavar a maquina"])
+
+
+def _care_region_stop_markers(region):
+    common = ["made in", "fabrique en", "hecho en", "rn", "ca :", "mx :", "actual other sizes"]
+    if region == "EN":
+        return common + ["@ ca", "ca :"]
+    if region == "FR":
+        return common + ["@ cr/ec", "mx/pa/sv :", "lavar a maquina"]
+    if region == "SP":
+        return common + ["actual other sizes", "rn"]
+    return common
+
 
 def find_care_region(state, field_name):
+    """Find the language-specific care block using strong region starts."""
     region = get_field_region(field_name)
-    marker_sets = {
-        "EN": ["machine wash", "wash", "bleach", "dry clean", "tumble dry", "cool iron"],
-        "FR": ["laver", "blanchiment", "nettoyage", "sécher", "repasser"],
-        "SP": ["lavar", "cloro", "secadora", "plancha", "limpieza en seco"],
-        "": ["machine wash", "wash", "bleach", "dry clean", "laver", "lavar"],
-    }
-    markers = [normalize_text(m) for m in marker_sets.get(region, marker_sets[""]) if normalize_text(m)]
-
     lines = state["lines"]
+    start_patterns = {
+        "EN": ["machine wash"],
+        "FR": ["laver à la machine", "laver a la machine"],
+        "SP": ["lavar a maquina", "lavar a máquina"],
+        "": ["machine wash", "laver à la machine", "laver a la machine", "lavar a maquina", "lavar a máquina"],
+    }
+    starts = [normalize_text(x) for x in start_patterns.get(region, start_patterns[""]) if normalize_text(x)]
+
     start = None
     for idx, line in enumerate(lines):
         if not line_is_available(line, state):
             continue
-        if any(marker in line["norm"] for marker in markers):
+        norm = normalize_text(line["text"])
+        if any(marker in norm for marker in starts):
             start = idx
             break
 
@@ -3224,21 +3350,24 @@ def find_care_region(state, field_name):
         line = lines[idx]
         if not line_is_available(line, state):
             break
+        norm = normalize_text(line["text"])
 
         if idx > start:
-            if extract_coo_value(line["text"]) or extract_rn_value(line["text"]):
+            # Any explicit COO/content/RN marker begins another artwork region.
+            if extract_coo_value(line["text"]) or extract_rn_ca_components(line["text"]).get("rn"):
                 break
             if extract_content_values(line["text"]):
+                # A composition region after the care text belongs elsewhere.
                 break
-
-            # A non-text/symbol line, an isolated number, or a new obvious
-            # technical line ends the care region. This is essential so symbols,
-            # RN and OSZ data are not swallowed by the care matcher.
-            ascii_letters = len(re.findall(r"[A-Za-z]", line["text"]))
-            if ascii_letters == 0:
+            if region == "EN" and ("laver à la machine" in norm or "laver a la machine" in norm or "lavar a maquina" in norm):
                 break
-
-            if re.fullmatch(r"\s*[-+]?\d+(?:\.\d+)?\s*", line["text"]):
+            if region == "FR" and ("lavar a maquina" in norm or "lavar a máquina" in norm):
+                break
+            if region == "SP" and ("machine wash" in norm or "laver à la machine" in norm or "laver a la machine" in norm):
+                break
+            if "actual other sizes" in norm:
+                break
+            if len(re.findall(r"[A-Za-zÀ-ÿ]", line["text"])) == 0:
                 break
 
         region_lines.append(line)
@@ -3246,6 +3375,207 @@ def find_care_region(state, field_name):
             break
 
     return region_lines or None
+
+
+def _content_region_markers(field_name):
+    compact = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
+    if "fib_en" in compact or compact.endswith("en"):
+        return ["us : shell", "us shell", "shell:", "shell"]
+    if "fib_ca" in compact or compact.endswith("ca"):
+        return ["ca : extérieur", "ca : exterieur", "ca extérieur", "ca exterieur", "exterieur", "extérieur"]
+    if "fibspmexico" in compact:
+        return ["cr/ec/gt/pa/sv : cuerpo", "cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv"]
+    if "fibmexico" in compact:
+        return ["mx : cuerpo", "mx cuerpo", "mx :"]
+    if "fibsp" in compact or compact.endswith("sp"):
+        return ["mx : cuerpo", "mx cuerpo", "cr/ec/gt/pa/sv : cuerpo", "cuerpo"]
+    return ["shell", "exterieur", "cuerpo", "content"]
+
+
+def _content_region_stop_markers(field_name):
+    return [
+        "ca : exterieur", "ca : extérieur", "mx :", "cr/ec/gt/pa/sv :",
+        "machine wash", "laver a la machine", "laver à la machine",
+        "made in", "hecho en", "fabrique en", "rn ", "actual other sizes"
+    ]
+
+
+def find_content_region(state, field_name):
+    """Locate a complete composition block without crossing into another region."""
+    lines = state["lines"]
+    starts = [normalize_text(x) for x in _content_region_markers(field_name) if normalize_text(x)]
+    stops = [normalize_text(x) for x in _content_region_stop_markers(field_name) if normalize_text(x)]
+
+    start = None
+    for idx, line in enumerate(lines):
+        if not line_is_available(line, state):
+            continue
+        norm = normalize_text(line["text"])
+        if any(marker in norm for marker in starts):
+            start = idx
+            break
+    if start is None and not normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "").startswith("fib"):
+        # Generic CONTENT fields (e.g. 'Content') may not have a schema-specific
+        # marker. Anchor on the first composition-shaped line.
+        for idx, line in enumerate(lines):
+            if not line_is_available(line, state):
+                continue
+            if re.search(r"\d{1,3}\s*%", line.get("text", "")):
+                start = idx
+                break
+
+    if start is None:
+        return None
+
+    selected = []
+    for idx in range(start, len(lines)):
+        line = lines[idx]
+        if not line_is_available(line, state):
+            break
+
+        norm = normalize_text(line["text"])
+        is_stop = idx > start and any(marker in norm for marker in stops)
+
+        if is_stop:
+            current_text = join_lines(selected) if selected else ""
+            current_values = extract_content_values(current_text)
+            compact_field = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
+            has_complete_tail = any(re.match(r"100\s*%?\s+.+", normalize_text(v)) for v in current_values)
+            if not compact_field.startswith("fib") and current_values:
+                break
+            # If the current block already contains a complete 100% component,
+            # do not absorb the next region. Otherwise include one boundary line
+            # because OCR/PDF extraction can split the material name across it.
+            if has_complete_tail:
+                break
+            selected.append(line)
+            break
+
+        selected.append(line)
+
+        joined = join_lines(selected)
+        current_values = extract_content_values(joined)
+        has_complete_100 = any(
+            re.match(r"100\s*%?\s+.+", normalize_text(v))
+            for v in current_values
+        )
+        if has_complete_100 and idx > start and not re.search(r"\d{1,3}\s*%", line["text"]):
+            break
+
+        if len(selected) >= 8:
+            break
+
+    return selected or None
+
+
+
+def _composition_signature(values):
+    signature = []
+    for value in values:
+        match = re.match(r"(\d+(?:\.\d+)?)%?\s*(.+)", normalize_text(value))
+        if not match:
+            signature.append(("", _content_material_key(value)))
+            continue
+        pct = match.group(1)
+        material = _content_material_key(match.group(2))
+        signature.append((pct, material))
+    return signature
+
+
+def _describe_composition_difference(expected, actual):
+    exp = _composition_signature(extract_content_values(expected))
+    act = _composition_signature(extract_content_values(actual))
+    if exp == act:
+        return "—"
+    return f"Expected: {expected} | Found: {actual}"
+
+
+def _size_block_score(expected, actual):
+    from difflib import SequenceMatcher
+    exp = normalize_text(expected)
+    act = normalize_text(actual)
+    if not exp or not act:
+        return 0.0
+    if exp == act or _field_casefold_compact(exp) == _field_casefold_compact(act):
+        return 1.0
+    token_ratio = SequenceMatcher(None, exp.split(), act.split(), autojunk=False).ratio()
+    compact_ratio = SequenceMatcher(None, _field_casefold_compact(exp), _field_casefold_compact(act), autojunk=False).ratio()
+    return max(token_ratio, compact_ratio * 0.98)
+
+
+def find_size_block_match(expected, field_name, state):
+    """Find a multi-line size block, returning PASS or a best-evidence FAIL."""
+    expected = str(expected or "").strip()
+    if not expected:
+        return None
+
+    available = [line for line in state["lines"] if line_is_available(line, state)]
+    if not available:
+        return None
+
+    expected_line_count = max(1, len([x for x in expected.splitlines() if x.strip()]))
+    min_window = max(1, expected_line_count - 1)
+    max_window = min(8, expected_line_count + 2)
+
+    exact_candidates = []
+    scored = []
+    for size in range(min_window, max_window + 1):
+        for start in range(0, len(available) - size + 1):
+            candidate = available[start:start + size]
+            ids = [line["line_id"] for line in candidate]
+            if ids != list(range(ids[0], ids[-1] + 1)):
+                continue
+            text = join_lines(candidate)
+            score = _size_block_score(expected, text)
+            scored.append((score, candidate, text))
+            if score >= 0.999:
+                exact_candidates.append((candidate, text))
+
+    if exact_candidates:
+        # If the same exact size block exists twice, consume the first available
+        # occurrence; subsequent duplicate fields can use the next occurrence.
+        candidate, text = exact_candidates[0]
+        return {
+            "status": "PASS",
+            "lines": candidate,
+            "pdf": text,
+            "difference": "—",
+            "match_type": "SIZE_BLOCK_EXACT"
+        }
+
+    if not scored:
+        return None
+
+    # Favor candidates that contain a size-like token from the expected block.
+    expected_markers = [
+        token.casefold() for token in re.findall(r"[A-Za-z]{1,4}", expected)
+        if token.casefold() not in {"size"}
+    ]
+    ranked = []
+    for score, candidate, text in scored:
+        norm = normalize_text(text)
+        marker_hits = sum(1 for token in expected_markers if normalize_text(token) in norm)
+        digit_hits = len(set(re.findall(r"\d+", normalize_text(expected))) & set(re.findall(r"\d+", norm)))
+        ranked.append((score + marker_hits * 0.03 + digit_hits * 0.015, score, candidate, text))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best = ranked[0]
+    if best[1] >= 0.55 and (len(expected_markers) <= 1 or best[0] >= 0.62):
+        return {
+            "status": "FAIL",
+            "lines": best[2],
+            "pdf": best[3],
+            "difference": f"Expected: {expected} | Found: {best[3]}",
+            "match_type": "SIZE_BLOCK_MISMATCH"
+        }
+
+    return None
+
+
+# =========================================================
+# FIELD CHECKERS
+# =========================================================
+
 
 
 
@@ -3631,114 +3961,162 @@ def check_field(
         }
 
     # -----------------------------------------------------
-    # CONTENT: parse the composition before any generic text check.
+    # CONTENT: structured composition region
     # -----------------------------------------------------
     if field_type == "CONTENT":
-        expected_values = normalize_composition(
-            extract_content_values(expected)
-        )
+        expected_values = extract_content_values(expected)
+        region = find_content_region(state, field_name)
+        if region:
+            actual_text = join_lines(region)
+            actual_values = extract_content_values(actual_text)
+            if expected_values and actual_values:
+                if _composition_signature(expected_values) == _composition_signature(actual_values):
+                    return {
+                        "status": "PASS",
+                        "pdf": actual_text,
+                        "difference": "—",
+                        "match_type": "CONTENT_REGION_EXACT"
+                    }
 
-        if expected_values:
-            # Search contiguous windows, but only over unconsumed lines.
-            available = [
-                line for line in state["lines"]
-                if line_is_available(line, state)
-            ]
+                # A related composition region with meaningful components is a
+                # real FAIL, not NOT FOUND.
+                expected_materials = {_content_material_key(x) for x in expected_values}
+                actual_materials = {_content_material_key(x) for x in actual_values}
+                overlap = expected_materials & actual_materials
+                if overlap or len(actual_values) >= 1:
+                    return {
+                        "status": "FAIL",
+                        "pdf": actual_text,
+                        "difference": _describe_composition_difference(expected, actual_text),
+                        "match_type": "CONTENT_REGION_MISMATCH"
+                    }
 
-            max_window = min(8, len(available))
-
-            for size in range(1, max_window + 1):
-                for start in range(0, len(available) - size + 1):
-                    candidate = available[start:start + size]
-                    ids = [line["line_id"] for line in candidate]
-                    if ids != list(range(ids[0], ids[-1] + 1)):
-                        continue
-
-                    text = join_lines(candidate)
-                    actual_values = normalize_composition(
-                        extract_content_values(text)
-                    )
-
-                    if expected_values == actual_values:
-                        consume_lines(state, candidate)
-                        return {
+        # Fallback: search broader contiguous windows. This protects raster/OCR
+        # documents where the component heading itself is not recognized.
+        available = [line for line in state["lines"] if line_is_available(line, state)]
+        max_window = min(8, len(available))
+        for size in range(1, max_window + 1):
+            for start_index in range(0, len(available) - size + 1):
+                candidate = available[start_index:start_index + size]
+                ids = [line["line_id"] for line in candidate]
+                if ids != list(range(ids[0], ids[-1] + 1)):
+                    continue
+                actual_text = join_lines(candidate)
+                actual_values = extract_content_values(actual_text)
+                if actual_values and expected_values:
+                    if _composition_signature(expected_values) == _composition_signature(actual_values):
+                            return {
                             "status": "PASS",
-                            "pdf": text,
+                            "pdf": actual_text,
                             "difference": "—",
                             "match_type": "CONTENT_EXACT"
                         }
 
-            # If we have a relevant composition region with overlapping
-            # components, report the actual composition as FAIL.
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Expected composition was not detected in the relevant artwork region.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # RN / CA / combined RNCA
+    # -----------------------------------------------------
+    if field_type in {"RN", "CA"}:
+        compact_field = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
+        expected_parts = extract_rn_ca_components(expected)
+        is_combined = compact_field in {"rnca", "rncanumber"} or (
+            field_type == "RN" and expected_parts.get("rn") and expected_parts.get("ca")
+        )
+
+        if is_combined:
+            exp_rn = expected_parts.get("rn")
+            exp_ca = expected_parts.get("ca")
+            if not exp_rn or not exp_ca:
+                # Try to extract two numeric components directly from the value.
+                nums = re.findall(r"\d{4,}", normalize_text(expected))
+                if len(nums) >= 2:
+                    exp_rn, exp_ca = nums[0], nums[1]
+
             for line in state["lines"]:
                 if not line_is_available(line, state):
                     continue
-                text = line["text"]
-                actual_values = normalize_composition(
-                    extract_content_values(text)
-                )
-                if not actual_values:
+                parts = extract_rn_ca_components(line["text"])
+                if not parts.get("rn") and not parts.get("ca"):
                     continue
-                if set(expected_values) & set(actual_values):
-                    consume_lines(state, [line])
+                rn_match = exp_rn and parts.get("rn") == str(exp_rn)
+                ca_match = exp_ca and parts.get("ca") == str(exp_ca)
+                if rn_match and ca_match:
+                    # Consume only the two numeric spans so MIN/COO and other
+                    # content on the same line remain independently available.
+                    norm_line = line["norm"]
+                    spans = []
+                    for token in (parts.get("rn"), parts.get("ca")):
+                        if token:
+                            pos = norm_line.find(str(token))
+                            if pos >= 0:
+                                spans.append((pos, pos + len(str(token))))
+                    for a, b in spans:
+                        consume_span(state, line, a, b)
+                    return {
+                        "status": "PASS",
+                        "pdf": line["text"],
+                        "difference": "—",
+                        "match_type": "RN_CA_COMBINED_EXACT"
+                    }
+
+                # Same structured line but wrong number = genuine FAIL.
+                if (exp_rn and parts.get("rn")) or (exp_ca and parts.get("ca")):
                     return {
                         "status": "FAIL",
-                        "pdf": text,
-                        "difference": (
-                            f"Expected: {expected} | "
-                            f"Found: {' | '.join(actual_values)}"
-                        ),
-                        "match_type": "CONTENT_MISMATCH"
+                        "pdf": line["text"],
+                        "difference": f"Expected: {expected} | Found: {line['text']}",
+                        "match_type": "RN_CA_COMBINED_MISMATCH"
                     }
 
             return {
                 "status": "NOT FOUND",
                 "pdf": "Not found",
-                "difference": "Expected composition was not detected.",
+                "difference": "Combined RN/CA value was not detected.",
                 "match_type": "NOT_FOUND"
             }
 
-    # -----------------------------------------------------
-    # RN
-    # -----------------------------------------------------
-    if field_type == "RN":
-        expected_rn = extract_rn_value(expected)
-        expected_target = normalize_text(
-            expected_rn if expected_rn else expected
-        )
+        wanted_key = "rn" if field_type == "RN" else "ca"
+        expected_component = expected_parts.get(wanted_key)
+        if expected_component is None:
+            digits = re.sub(r"\D", "", normalize_text(expected))
+            expected_component = digits or str(expected).strip()
 
         for line in state["lines"]:
             if not line_is_available(line, state):
                 continue
-
-            actual_rn = extract_rn_value(line["text"])
-            if actual_rn is None:
+            parts = extract_rn_ca_components(line["text"])
+            actual_component = parts.get(wanted_key)
+            if actual_component is None:
                 continue
 
-            if normalize_text(actual_rn) == expected_target:
-                consume_lines(state, [line])
+            if str(actual_component) == str(expected_component):
+                pos = line["norm"].find(str(actual_component))
+                if pos >= 0:
+                    consume_span(state, line, pos, pos + len(str(actual_component)))
                 return {
                     "status": "PASS",
                     "pdf": line["text"],
                     "difference": "—",
-                    "match_type": "RN_EXACT"
+                    "match_type": f"{wanted_key.upper()}_EXACT_SPAN"
                 }
 
-            consume_lines(state, [line])
             return {
                 "status": "FAIL",
                 "pdf": line["text"],
-                "difference": (
-                    f"Expected: {expected} | "
-                    f"Found: RN# {actual_rn}"
-                ),
-                "match_type": "RN_MISMATCH"
+                "difference": f"Expected: {expected} | Found: {wanted_key.upper()} {actual_component}",
+                "match_type": f"{wanted_key.upper()}_MISMATCH"
             }
 
         return {
             "status": "NOT FOUND",
             "pdf": "Not found",
-            "difference": "RN value was not detected.",
+            "difference": f"Expected {wanted_key.upper()} value was not detected.",
             "match_type": "NOT_FOUND"
         }
 
@@ -3860,7 +4238,21 @@ def check_field(
             expected_size
         ).strip()
 
-        # Prefer labeled size blocks.
+        # Multi-line/structured size fields must be treated as a block. This is
+        # essential for Main_Size and OS_Size_* schemas where several regional
+        # labels belong to one artwork size entry.
+        if "\n" in str(expected) or len(str(expected_size).split()) >= 2:
+            block = find_size_block_match(expected, field_name, state)
+            if block:
+                consume_lines(state, block["lines"])
+                return {
+                    "status": block["status"],
+                    "pdf": block["pdf"],
+                    "difference": block["difference"],
+                    "match_type": block["match_type"]
+                }
+
+        # Prefer labeled single-size blocks.
         for line in state["lines"]:
             if not line_is_available(line, state):
                 continue
@@ -3888,7 +4280,6 @@ def check_field(
                 "match_type": "SIZE_MISMATCH"
             }
 
-        # Then exact text, useful when artwork prints only the value.
         exact = find_exact_lines(
             expected,
             field_name,
@@ -3909,7 +4300,34 @@ def check_field(
         return {
             "status": "NOT FOUND",
             "pdf": "Not found",
-            "difference": "Size value was not detected.",
+            "difference": "Size value/block was not detected.",
+            "match_type": "NOT_FOUND"
+        }
+
+    # -----------------------------------------------------
+    # PRODUCTION MARK
+    # -----------------------------------------------------
+    if field_type == "PRODUCTION_MARK":
+        expected_raw = str(expected).strip()
+        for line in state["lines"]:
+            if not line_is_available(line, state):
+                continue
+            tokens = [t for t in re.split(r"[^A-Za-z0-9]+", line["text"]) if t]
+            for token in tokens:
+                if token.casefold() == expected_raw.casefold():
+                    pos = line["norm"].find(normalize_text(token))
+                    if pos >= 0:
+                        consume_span(state, line, pos, pos + len(normalize_text(token)))
+                    return {
+                        "status": "PASS",
+                        "pdf": line["text"],
+                        "difference": "—",
+                        "match_type": "PRODUCTION_MARK_EXACT"
+                    }
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "Production mark was not detected.",
             "match_type": "NOT_FOUND"
         }
 
@@ -3957,6 +4375,21 @@ def check_field(
     # CARE
     # -----------------------------------------------------
     if field_type == "CARE":
+        expected_care_norm = normalize_text(expected)
+        comparison_text = normalize_text(state.get("comparison_text", ""))
+        # A complete expected care phrase can span several extracted lines.
+        # Validate it against the page-level text first, then use the regional
+        # block only for the displayed PDF value/visual location.
+        if expected_care_norm and expected_care_norm in comparison_text:
+            care_region = find_care_region(state, field_name)
+            actual_display = join_lines(care_region) if care_region else str(expected)
+            return {
+                "status": "PASS",
+                "pdf": actual_display,
+                "difference": "—",
+                "match_type": "CARE_PAGE_TEXT_EXACT"
+            }
+
         care_region = find_care_region(state, field_name)
 
         if care_region:
@@ -4070,6 +4503,7 @@ FIELD_PRIORITY = {
     "OSZ": 10,
     "BARCODE": 15,
     "RN": 20,
+    "CA": 20,
     "IDENTIFIER": 20,
     "COO": 30,
     "CONTENT": 40,
@@ -4222,8 +4656,9 @@ def _auto_detect_page_text(page):
         return ""
 
     values = []
-    # Prefer OCR because the artwork may be a scanned/non-editable PDF.
-    for key in ("ocr_text", "ocr_alt_text", "text", "direct_text"):
+    # Prefer a clean PDF text layer when it exists, while retaining OCR/alternate
+    # text as supplementary evidence for scanned or partially editable artwork.
+    for key in ("direct_text", "ocr_text", "ocr_alt_text", "text"):
         value = page.get(key, "")
         if value and str(value).strip():
             values.append(str(value))
@@ -4523,7 +4958,7 @@ def _auto_coo_evidence(expected, field_name, text):
     # was not found.
     markers = {
         "EN": ("made in", "country of origin"),
-        "FR": ("fabrique en", "fabriqué en", "made in"),
+        "FR": ("fabrique en", "fabriqué en"),
         "SP": ("hecho en",),
         "": ("made in", "fabrique en", "fabriqué en", "hecho en"),
     }
@@ -4644,11 +5079,23 @@ def _auto_text_evidence(expected, field_name, text):
     """Conservative Auto Detect evidence check."""
     from rapidfuzz import fuzz
 
+    field_type = get_field_type(field_name)
+
+    # Custom-font symbols must be checked before normalize_text() because
+    # normalization can change/remove the actual keystroke/codepoint.
+    if field_type == "SYMBOL":
+        raw_expected = str(expected or "")
+        if not raw_expected.strip():
+            return False
+        return any(
+            _symbol_text_matches(raw_expected, line)
+            for line in str(text or "").splitlines()
+        )
+
     expected_norm = normalize_text(expected)
     if not expected_norm:
         return False
 
-    field_type = get_field_type(field_name)
     if field_type == "GENERAL":
         field_type = _auto_semantic_type(field_name) or field_type
     compact_expected = re.sub(r"[^a-z0-9]", "", expected_norm)
@@ -4668,12 +5115,27 @@ def _auto_text_evidence(expected, field_name, text):
         return _auto_identifier_evidence(expected, field_name, norm_text)
 
     if field_type == "RN":
+        compact_field = normalize_text(field_name).replace(" ", "").replace("_", "").replace("-", "")
+        if compact_field == "rnca":
+            parts = extract_rn_ca_components(expected)
+            rn = parts.get("rn")
+            ca = parts.get("ca")
+            if rn and ca:
+                return bool(re.search(rf"\brn\s*[#:\-./ ]*{re.escape(rn)}\b", norm_text)) and bool(
+                    re.search(rf"\bca\s*[#:\-./ ]*{re.escape(ca)}\b", norm_text)
+                )
         digits = re.sub(r"\D", "", expected_norm)
         if not digits or len(digits) < 4:
             return False
-        if re.search(r"\b(?:rn|ca)\s*[#:\-./ ]*\d+", norm_text):
-            return digits in re.sub(r"\D", "", norm_text)
-        return bool(re.search(rf"(?<!\d){re.escape(digits)}(?!\d)", norm_text))
+        return bool(re.search(rf"\brn\s*[#:\-./ ]*{re.escape(digits)}\b", norm_text)) or bool(
+            re.search(rf"(?<!\d){re.escape(digits)}(?!\d)", norm_text)
+        )
+
+    if field_type == "CA":
+        digits = re.sub(r"\D", "", expected_norm)
+        if not digits or len(digits) < 4:
+            return False
+        return bool(re.search(rf"\bca\s*[#:\-./ ]*{re.escape(digits)}\b", norm_text))
 
     if field_type == "COO":
         return _auto_coo_evidence(expected, field_name, norm_text)
@@ -4712,6 +5174,17 @@ def _auto_text_evidence(expected, field_name, text):
         # matching because the symbol/codepoint itself is the data.
         for line in str(text or "").splitlines():
             if _symbol_text_matches(expected_norm, line):
+                return True
+        return False
+
+    if field_type == "PRODUCTION_MARK":
+        expected_raw = str(expected or "").strip()
+        if not expected_raw:
+            return False
+        # Exact token match first; this supports one-letter marks such as V.
+        for line in str(text or "").splitlines():
+            tokens = [t for t in re.split(r"[^A-Za-z0-9]+", line) if t]
+            if any(token.casefold() == expected_raw.casefold() for token in tokens):
                 return True
         return False
 
@@ -4859,7 +5332,10 @@ def auto_detect_fields(
         "CARE",
         "ATTRIBUTE",
         "RN",
+        "CA",
         "OSZ",
+        "SYMBOL",
+        "PRODUCTION_MARK",
         "SYMBOL",
         "GENERAL",
     }
