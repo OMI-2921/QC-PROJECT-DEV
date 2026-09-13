@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-13-COMPARISON-ENGINE-STRUCTURED-TEXT-13"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-13-COMPARISON-ENGINE-EVIDENCE-LINKED-VISUAL-14"
 import pandas as pd
 import fitz
 import re
@@ -1330,500 +1330,1218 @@ def _place_label_above_or_below(box, label_w, label_h, image_w, image_h, occupie
     )
 
 
-def _visual_osz_candidates(page):
-    """Build visual-only OSZ sequence candidates from scaled OCR coordinates.
-
-    This function is presentation-only. It never participates in PASS/FAIL
-    comparison decisions. It exists so an OSZ field can point to the correct
-    sequence position even when the comparison result is FAIL.
-    """
-    numeric_words = []
-    for group in _visual_group_words(page):
-        for word in group:
-            raw = str(word.get("text", "")).strip()
-            if not re.fullmatch(r"\d+", raw):
-                continue
-            width = int(word.get("width", 0) or 0)
-            height = int(word.get("height", 0) or 0)
-            if width <= 0 or height <= 0:
-                continue
-            numeric_words.append({
-                **word,
-                "value": raw,
-                "cx": float(word.get("left", 0)) + width / 2.0,
-                "cy": float(word.get("top", 0)) + height / 2.0,
-            })
-
-    if len(numeric_words) < 3:
-        return []
-
-    candidates = []
-    for orientation in ("vertical", "horizontal"):
-        # A vertical OSZ list progresses on Y while its items share a common X.
-        # A horizontal list progresses on X while its items share a common Y.
-        axis = "cy" if orientation == "vertical" else "cx"
-        cross = "cx" if orientation == "vertical" else "cy"
-        ordered = sorted(numeric_words, key=lambda item: (item[cross], item[axis]))
-
-        groups = []
-        for word in ordered:
-            added = False
-            for group in groups:
-                ref = sum(item[cross] for item in group) / len(group)
-                tolerance = max(
-                    14.0,
-                    min(90.0, max(word.get("width", 1), word.get("height", 1)) * 1.7)
-                )
-                if abs(word[cross] - ref) <= tolerance:
-                    group.append(word)
-                    added = True
-                    break
-            if not added:
-                groups.append([word])
-
-        for group in groups:
-            if len(group) < 3:
-                continue
-            seq = sorted(group, key=lambda item: (item["cy"], item["cx"])) if orientation == "vertical" else sorted(group, key=lambda item: (item["cx"], item["cy"]))
-            gaps = [
-                (seq[i + 1][axis] - seq[i][axis])
-                for i in range(len(seq) - 1)
-            ]
-            gaps = [gap for gap in gaps if gap > 0]
-            if not gaps:
-                continue
-            median_gap = sorted(gaps)[len(gaps) // 2]
-            if median_gap <= 0:
-                continue
-            regularity = sum(
-                0.45 * median_gap <= gap <= 1.85 * median_gap
-                for gap in gaps
-            ) / len(gaps)
-            cross_spread = max(item[cross] for item in seq) - min(item[cross] for item in seq)
-            alignment_ratio = cross_spread / max(1.0, median_gap)
-            if regularity < 0.55 or alignment_ratio > 0.75:
-                continue
-            score = len(seq) * 10.0 + regularity * 12.0 - alignment_ratio * 8.0
-            signature = tuple((item["value"], round(item["cx"] / 5), round(item["cy"] / 5)) for item in seq)
-            if any(existing["signature"] == signature for existing in candidates):
-                continue
-            candidates.append({
-                "orientation": orientation,
-                "items": seq,
-                "score": score,
-                "signature": signature,
-            })
-
-    candidates.sort(key=lambda item: item["score"], reverse=True)
-    return candidates[:20]
-
-
-def _find_visual_osz_box(page, field_name, actual_value=""):
-    """Find the artwork box for an OSZ field by sequence position."""
-    field_type = get_field_type(field_name)
-    if field_type != "OSZ":
-        return []
-
-    compact = normalize_text(field_name).replace(" ", "")
-    match = re.fullmatch(r"osz(\d+)", compact)
-    if not match:
-        return []
-    index = int(match.group(1))
-    if index <= 0:
-        return []
-
-    candidates = [c for c in _visual_osz_candidates(page) if len(c.get("items", [])) >= index]
-    if not candidates:
-        return []
-
-    actual_num = normalize_numeric(actual_value)
-    if actual_num is not None:
-        matching = [
-            c for c in candidates
-            if normalize_numeric(c["items"][index - 1].get("value")) == actual_num
-        ]
-        if matching:
-            candidates = matching
-
-    chosen = max(candidates, key=lambda item: item.get("score", 0.0))
-    item = chosen["items"][index - 1]
-    return _boxes_from_words([item])
-
-
-def _truncate_visual_value(value, limit=42):
-    value = re.sub(r"\s+", " ", str(value or "").strip())
-    if len(value) <= limit:
-        return value
-    return value[: max(1, limit - 1)] + "…"
-
-
-def _visual_field_uses_block_mapping(field_name, expected_value="", actual_value=""):
-    """Return True when the visual should show the whole compared text block.
-
-    This is presentation-only. It never changes the comparison decision.
-    Long structured text fields are intentionally shown as complete regions so
-    the reviewer can see the exact block that was evaluated, rather than only
-    one differing word.
-    """
-    field_type = get_field_type(field_name)
-    if field_type in {"CARE", "CONTENT"}:
-        return True
-
-    if field_type in {"ATTRIBUTE", "GENERAL", "BRAND"}:
-        sample = str(actual_value or expected_value or "").strip()
-        tokens = tokenize(sample)
-        return len(tokens) >= 5 or len(sample) >= 45
-
-    return False
-
-
 def _visual_group_text(group):
     return re.sub(
         r"\s+",
         " ",
-        " ".join(str(word.get("text", "")).strip() for word in group if str(word.get("text", "")).strip())
+        " ".join(
+            str(word.get("text", "")).strip()
+            for word in group
+            if str(word.get("text", "")).strip()
+        )
     ).strip()
 
 
+def _visual_word_center(word):
+    left = float(word.get("left", 0) or 0)
+    top = float(word.get("top", 0) or 0)
+    width = float(word.get("width", 0) or 0)
+    height = float(word.get("height", 0) or 0)
+    return left + width / 2.0, top + height / 2.0
+
+
+def _visual_direct_groups(page):
+    """Build line groups from the PDF text layer using rendered-image coordinates."""
+    words = []
+    for word in page.get("direct_words", []) or []:
+        if not isinstance(word, dict):
+            continue
+        if not str(word.get("text", "")).strip():
+            continue
+        words.append({
+            **word,
+            "left": int(word.get("left", 0) or 0),
+            "top": int(word.get("top", 0) or 0),
+            "width": max(1, int(word.get("width", 1) or 1)),
+            "height": max(1, int(word.get("height", 1) or 1)),
+        })
+
+    if not words:
+        return []
+
+    heights = sorted(max(1, int(w.get("height", 1))) for w in words)
+    median_height = float(heights[len(heights) // 2]) if heights else 16.0
+    tolerance = max(3.0, median_height * 0.55)
+
+    groups = []
+    for word in sorted(words, key=lambda item: (_visual_word_center(item)[1], item["left"])):
+        _, cy = _visual_word_center(word)
+        best_group = None
+        best_distance = None
+        for group in groups:
+            distance = abs(cy - group["center_y"])
+            if distance <= tolerance and (best_distance is None or distance < best_distance):
+                best_group = group
+                best_distance = distance
+        if best_group is None:
+            groups.append({"center_y": cy, "words": [word]})
+        else:
+            best_group["words"].append(word)
+            best_group["center_y"] = sum(_visual_word_center(w)[1] for w in best_group["words"]) / len(best_group["words"])
+
+    result = [group["words"] for group in groups]
+    for group in result:
+        group.sort(key=lambda item: item["left"])
+    result.sort(key=lambda group: (min(w["top"] for w in group), min(w["left"] for w in group)))
+    return result
+
+
+def _visual_all_groups(page):
+    """Prefer OCR geometry, then supplement missing lines from the PDF text layer."""
+    ocr_groups = _visual_group_words(page)
+    direct_groups = _visual_direct_groups(page)
+
+    if not ocr_groups:
+        return direct_groups
+    if not direct_groups:
+        return ocr_groups
+
+    # OCR is normally better for visual reading order, but a PDF text layer can
+    # contain custom-font or tiny-text words that OCR completely misses. Keep OCR
+    # as the primary geometry and add only clearly distinct PDF lines.
+    merged = list(ocr_groups)
+    existing_lines = [_visual_norm(_visual_group_text(group)) for group in merged]
+    for direct_group in direct_groups:
+        direct_text = _visual_norm(_visual_group_text(direct_group))
+        if not direct_text:
+            continue
+        if any(direct_text == line or _visual_compact(direct_text) == _visual_compact(line) for line in existing_lines if line):
+            continue
+        # Only add a direct group if its center is not almost identical to a very
+        # different OCR group. This prevents duplicate text boxes on the same line.
+        _, dcy = _visual_word_center(direct_group[0])
+        too_close = False
+        for ocr_group in merged:
+            _, ocy = _visual_word_center(ocr_group[0])
+            if abs(dcy - ocy) <= max(5.0, float(max(1, direct_group[0].get("height", 1))) * 0.7):
+                too_close = True
+                break
+        if not too_close:
+            merged.append(direct_group)
+            existing_lines.append(direct_text)
+
+    merged.sort(key=lambda group: (min(float(w.get("top", 0)) for w in group), min(float(w.get("left", 0)) for w in group)))
+    return merged
+
+
 def _visual_match_line_score(target_line, actual_line):
-    """Similarity score for locating one already-compared OCR line."""
+    """Similarity score used only to align comparison text to OCR/PDF line geometry."""
     target_norm = _visual_norm(target_line)
     actual_norm = _visual_norm(actual_line)
     if not target_norm or not actual_norm:
         return 0.0
-
     if target_norm == actual_norm or _visual_compact(target_norm) == _visual_compact(actual_norm):
         return 1.0
-
     from difflib import SequenceMatcher
-
-    target_tokens = target_norm.split()
-    actual_tokens = actual_norm.split()
     token_ratio = SequenceMatcher(
-        None, target_tokens, actual_tokens, autojunk=False
+        None,
+        target_norm.split(),
+        actual_norm.split(),
+        autojunk=False,
     ).ratio()
     compact_ratio = SequenceMatcher(
-        None, _visual_compact(target_norm), _visual_compact(actual_norm), autojunk=False
+        None,
+        _visual_compact(target_norm),
+        _visual_compact(actual_norm),
+        autojunk=False,
     ).ratio()
-
-    # Token similarity is more meaningful for long care/composition lines.
     return max(token_ratio, compact_ratio * 0.98)
 
 
-def _visual_region_markers(field_name):
-    """Return start/stop markers for locating a complete visual text region."""
-    field_type = get_field_type(field_name)
-    region = get_field_region(field_name)
+def _visual_find_text_occurrences(page, target, groups=None, min_score=0.80):
+    """Find one or more physically grounded occurrences of a text/value."""
+    target = str(target or "").strip()
+    if not target or normalize_text(target) in {"not found", "-", "—"}:
+        return []
 
-    if field_type == "CARE":
-        starts = {
-            "EN": ["machine wash", "wash", "bleach", "dry clean", "tumble dry", "cool iron"],
-            "FR": ["laver", "blanchiment", "nettoyage", "sécher", "repasser"],
-            "SP": ["lavar", "cloro", "secadora", "plancha", "limpieza en seco"],
-            "": ["machine wash", "wash", "bleach", "dry clean", "laver", "lavar"],
-        }
-        return starts.get(region, starts[""]), [
-            "rn", "rn#", "made in", "fabrique en", "hecho en"
-        ]
-
-    if field_type == "CONTENT":
-        return ["%", "cotton", "polyester", "spandex", "elastane", "nylon", "shell", "lining"], [
-            "rn", "rn#", "made in", "fabrique en", "hecho en",
-            "machine wash", "wash", "laver", "lavar", "bleach", "cloro"
-        ]
-
-    return [], ["rn", "rn#", "made in", "fabrique en", "hecho en"]
-
-
-def _visual_is_numeric_only_group(group):
-    text = _visual_group_text(group)
-    compact = re.sub(r"[^0-9]", "", text)
-    alpha = re.sub(r"[^a-z]", "", text.casefold())
-    return bool(compact) and not alpha and len(compact) <= 6
-
-
-def _visual_is_short_code_group(group):
-    """Detect small standalone technical codes after a long text block."""
-    text = _visual_group_text(group).strip()
-    compact_alpha = re.sub(r"[^A-Za-z]", "", text)
-    if not compact_alpha:
-        return False
-    if len(compact_alpha) > 5:
-        return False
-    # Preserve normal short words that legitimately continue care text.
-    common_short_words = {
-        "if", "no", "use", "with", "cold", "like", "only", "when",
-        "dry", "low", "iron", "cool", "wash", "bleach", "needed",
-        "laver", "avec", "sans", "si", "lavar"
-    }
-    normalized = _visual_norm(text)
-    if normalized in common_short_words:
-        return False
-    return text.upper() == text and len(compact_alpha) <= 5
-
-
-def _find_visual_semantic_block_boxes(page, field_name):
-    """Locate the complete physical artwork block for a long text field.
-
-    This is presentation-only. It never changes PASS/FAIL logic. For CARE the
-    physical block can be interrupted by standalone OSZ numbers, so numeric-only
-    lines are skipped while the care text continues. For CONTENT, the block ends
-    when the next care/COO/RN region starts.
-    """
-    groups = _visual_group_words(page)
+    groups = groups or _visual_all_groups(page)
     if not groups:
         return []
 
-    starts, stops = _visual_region_markers(field_name)
+    target_lines = [re.sub(r"\s+", " ", str(line).strip()) for line in target.splitlines() if str(line).strip()]
+    target_norm = _visual_norm(target)
+    target_compact = _visual_compact(target)
+
+    # Exact physical line match.
+    exact_groups = []
+    used_start = 0
+    for target_line in target_lines:
+        best_idx = None
+        for idx in range(used_start, len(groups)):
+            line_text = _visual_group_text(groups[idx])
+            if not line_text:
+                continue
+            if _visual_norm(target_line) == _visual_norm(line_text) or _visual_compact(target_line) == _visual_compact(line_text):
+                best_idx = idx
+                break
+        if best_idx is None:
+            exact_groups = []
+            break
+        exact_groups.append(best_idx)
+        used_start = best_idx + 1
+
+    if exact_groups and len(exact_groups) == len(target_lines):
+        return [_boxes_from_words(groups[idx])[0] for idx in exact_groups if _boxes_from_words(groups[idx])]
+
+    # Exact contiguous words within each physical line.
+    for group in groups:
+        normalized = [_visual_norm(word.get("text", "")) for word in group]
+        compact_tokens = [_visual_compact(word.get("text", "")) for word in group]
+        for start in range(len(group)):
+            joined_parts = []
+            chosen = []
+            compact_joined = ""
+            for end in range(start, len(group)):
+                token = normalized[end]
+                compact_token = compact_tokens[end]
+                if not token and not compact_token:
+                    continue
+                joined_parts.append(token)
+                compact_joined += compact_token
+                chosen.append(group[end])
+                joined = " ".join(x for x in joined_parts if x).strip()
+                if joined == target_norm or compact_joined == target_compact:
+                    box = _boxes_from_words(chosen)
+                    if box:
+                        return box
+                if len(compact_joined) > len(target_compact) + 10:
+                    break
+
+    # Fuzzy monotonic line alignment for OCR line wrapping.
+    if len(target_lines) > 1:
+        chosen = []
+        search_from = 0
+        for target_line in target_lines:
+            best_idx = None
+            best_score = 0.0
+            for idx in range(search_from, min(len(groups), search_from + 18)):
+                actual_line = _visual_group_text(groups[idx])
+                score = _visual_match_line_score(target_line, actual_line)
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+            if best_idx is None or best_score < min_score:
+                continue
+            chosen.append(best_idx)
+            search_from = best_idx + 1
+        if chosen and len(chosen) >= max(1, int(len(target_lines) * 0.60)):
+            result = []
+            for idx in chosen:
+                result.extend(_boxes_from_words(groups[idx]))
+            if result:
+                return result
+
+    # Token-level fallback. Prefer longer tokens to avoid selecting a lone 'S',
+    # 'M', 'L', '18', etc. unless that is genuinely all the evidence available.
+    tokens = sorted(
+        [token for token in tokenize(target) if len(token) >= 2 or token.isdigit()],
+        key=lambda item: (-len(item), item),
+    )
+    for token in tokens:
+        token_compact = _visual_compact(token)
+        if not token_compact:
+            continue
+        matches = []
+        for group in groups:
+            for word in group:
+                word_norm = _visual_norm(word.get("text", ""))
+                word_compact = _visual_compact(word.get("text", ""))
+                if word_norm == _visual_norm(token) or word_compact == token_compact:
+                    matches.append(word)
+        if matches:
+            return _boxes_from_words([matches[0]])
+
+    return []
+
+
+def _visual_field_markers(field_name):
+    """Strong region anchors for field-specific visual evidence."""
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    field_type = get_field_type(field_name)
+    region = get_field_region(field_name)
+
+    if field_type == "CONTENT":
+        if "fibspmexico" in compact:
+            return ["cr/ec/gt/pa/sv : cuerpo", "cr/ec/gt/pa/sv:", "cr/ec/gt/pa/sv", "cuerpo"], [
+                "mx :", "mx cuerpo", "machine wash", "laver", "lavar", "made in", "rn"
+            ]
+        if "fibmexico" in compact:
+            return ["mx : cuerpo", "mx cuerpo", "mx :", "mx:"], [
+                "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
+            ]
+        if "fibca" in compact:
+            return ["ca : extérieur", "ca : exterieur", "ca extérieur", "ca exterieur", "extérieur", "exterieur"], [
+                "mx :", "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
+            ]
+        if "fibsp" in compact:
+            return ["cr/ec/gt/pa/sv : cuerpo", "cr/ec/gt/pa/sv:", "cr/ec/gt/pa/sv", "cuerpo"], [
+                "mx :", "machine wash", "laver", "lavar", "made in", "rn"
+            ]
+        if "fiben" in compact:
+            return ["us : shell", "us shell", "shell:", "shell"], [
+                "ca :", "mx :", "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
+            ]
+        return ["shell", "content"], ["machine wash", "laver", "lavar", "made in", "rn"]
+
+    if field_type == "CARE":
+        if region == "FR":
+            return ["laver à la machine", "laver a la machine", "laver"], ["machine wash", "lavar", "made in", "rn"]
+        if region == "SP":
+            return ["lavar a máquina", "lavar a maquina", "lavar"], ["machine wash", "laver", "made in", "rn"]
+        return ["machine wash", "wash"], ["laver", "lavar", "made in", "rn"]
+
+    if field_type == "COO":
+        if region == "FR":
+            return ["fabrique en"], ["made in", "hecho en", "rn", "ca"]
+        if region == "SP":
+            return ["hecho en"], ["made in", "fabrique en", "rn", "ca"]
+        return ["made in"], ["fabrique en", "hecho en", "rn", "ca"]
+
+    if field_type in {"RN", "CA"}:
+        return ["rn", "ca"], ["machine wash", "laver", "lavar", "made in"]
+
+    return [], []
+
+
+def _visual_find_direct_scalar_box(page, target):
+    """Search the original PDF text layer directly for a short scalar value."""
+    target = str(target or "").strip()
+    target_norm = _visual_norm(target)
+    target_compact = _visual_compact(target)
+    if not target_norm:
+        return []
+
+    words = []
+    for word in page.get("direct_words", []) or []:
+        if not str(word.get("text", "")).strip():
+            continue
+        words.append(word)
+
+    # Whole-word/whole-token match first.
+    for word in words:
+        word_norm = _visual_norm(word.get("text", ""))
+        word_compact = _visual_compact(word.get("text", ""))
+        if word_norm == target_norm or word_compact == target_compact:
+            return _boxes_from_words([word])
+
+    # A registered-symbol or punctuation suffix may make the PDF word longer
+    # than the compared identifier. Compact substring matching is safe for
+    # identifiers of 3+ characters.
+    if len(target_compact) >= 3:
+        for word in words:
+            word_compact = _visual_compact(word.get("text", ""))
+            if target_compact in word_compact:
+                return _boxes_from_words([word])
+
+    return []
+
+
+def _visual_region_groups(page, field_name):
+    """Return the physically relevant OCR/PDF line groups for a semantic field."""
+    groups = _visual_all_groups(page)
+    if not groups:
+        return []
+
+    starts, stops = _visual_field_markers(field_name)
     starts = [_visual_norm(x) for x in starts if _visual_norm(x)]
     stops = [_visual_norm(x) for x in stops if _visual_norm(x)]
     if not starts:
         return []
 
-    field_type = get_field_type(field_name)
     start_idx = None
     for idx, group in enumerate(groups):
         line_text = _visual_norm(_visual_group_text(group))
         if line_text and any(marker in line_text for marker in starts):
             start_idx = idx
             break
-
     if start_idx is None:
         return []
 
-    selected_groups = []
-    meaningful_text_groups = 0
+    field_type = get_field_type(field_name)
+    selected = []
+    max_lines = 10 if field_type == "CONTENT" else 22 if field_type == "CARE" else 3
 
-    for idx in range(start_idx, len(groups)):
+    for idx in range(start_idx, min(len(groups), start_idx + max_lines)):
         group = groups[idx]
         line_text = _visual_norm(_visual_group_text(group))
-
-        if idx > start_idx and any(marker in line_text for marker in stops):
-            break
-
-        # A numeric OSZ line may sit inside/adjacent to the care block. It is
-        # not part of the care instruction and must not be highlighted.
-        if idx > start_idx and _visual_is_numeric_only_group(group):
+        if not line_text:
             continue
 
-        if idx > start_idx and field_type == "CARE" and _visual_is_short_code_group(group):
+        if idx > start_idx:
+            # A region marker on the same line is handled below; a marker on a
+            # new line ends the current semantic region before that line.
+            if any(stop in line_text for stop in stops):
+                break
+
+        group_to_use = list(group)
+
+        # When multiple regional values share one physical OCR line, clip the
+        # group before the next region marker instead of highlighting the entire
+        # combined line. This is critical for CA/MX/CR-EC-GT-PA-SV content.
+        if idx >= start_idx and stops:
+            for wi, word in enumerate(group_to_use):
+                word_norm = _visual_norm(word.get("text", ""))
+                if not word_norm:
+                    continue
+                if any(stop == word_norm or stop in word_norm for stop in stops):
+                    if idx == start_idx and wi == 0:
+                        group_to_use = []
+                    else:
+                        group_to_use = group_to_use[:wi]
+                    break
+
+        if not group_to_use:
             break
 
-        if line_text:
-            selected_groups.append(group)
-            meaningful_text_groups += 1
+        if field_type == "CONTENT" and idx > start_idx:
+            raw_line = _visual_group_text(group_to_use)
+            has_content = bool(re.search(r"\d{1,3}\s*%", raw_line)) or any(
+                material in _visual_norm(raw_line)
+                for material in (
+                    "polyester", "spandex", "elastane", "cotton", "nylon", "rayon",
+                    "viscose", "acrylic", "linen", "wool", "elastodiene", "polyamide"
+                )
+            )
+            if not has_content:
+                if idx == start_idx + 1 and selected:
+                    selected.append(group_to_use)
+                    continue
+                break
 
-        if meaningful_text_groups >= 20:
+        selected.append(group_to_use)
+
+        if field_type == "CONTENT" and len(selected) >= 8:
+            break
+        if field_type not in {"CONTENT", "CARE"} and len(selected) >= 3:
             break
 
+    return selected
+
+
+def _visual_region_boxes(page, field_name, actual_value=""):
+    """Find a semantic region when exact text occurrence is insufficient."""
+    groups = _visual_region_groups(page, field_name)
+    if not groups:
+        return []
     boxes = []
-    for group in selected_groups:
-        box = _boxes_from_words(group)
-        if box:
-            boxes.extend(box)
+    for group in groups:
+        boxes.extend(_boxes_from_words(group))
     return boxes
 
 
-def _find_visual_block_boxes(page, target, field_name=""):
-    """Locate the complete OCR line block represented by a compared text value.
 
-    For CARE/CONTENT (and long ATTRIBUTE/GENERAL/BRAND fields), the comparison
-    result often represents several complete artwork lines. The visual layer
-    therefore maps every relevant OCR line in that block, rather than searching
-    only for the word that differs.
-    """
-    target = str(target or "").strip()
-    if not target or target.casefold() in {"not found", "-", "—"}:
+def _visual_size_like_text(text):
+    norm = _visual_norm(text)
+    if not norm:
+        return False
+    patterns = [
+        r"\b(?:xxxs|xxs|xs|s|m|l|xl|xxl|xxxl|2xl|3xl|4xl|5xl)\b",
+        r"\b(?:tp|p|g|gg|tg|ttg|ech|ch|eg|ee|eeg|petite)\b",
+        r"\b\d{1,3}\s*[-/]\s*\d{1,3}\b",
+        r"\b\d{1,3}\s*\(\s*\d{1,3}(?:\s*[-/]\s*\d{1,3})?\s*\)",
+    ]
+    return any(re.search(pattern, norm, re.IGNORECASE) for pattern in patterns)
+
+
+def _visual_raw_size_like_text(text):
+    raw = str(text or "").casefold()
+    normalized = _visual_norm(raw)
+    patterns = [
+        r"\b(?:xxxs|xxs|xs|s|m|l|xl|xxl|xxxl|2xl|3xl|4xl|5xl)\b",
+        r"\b(?:tp|p|g|gg|tg|ttg|ech|ch|eg|ee|eeg|petite)\b",
+        r"\b\d{1,3}\s*[/\-]\s*\d{1,3}\b",
+        r"\b\d{1,3}\s*\(\s*\d{1,3}(?:\s*[-/]\s*\d{1,3})?\s*\)",
+        r"\b\d{1,3}\s*[-]\s*\d{1,3}\b",
+    ]
+    return any(re.search(pattern, raw, re.IGNORECASE) for pattern in patterns) or _visual_size_like_text(normalized)
+
+
+def _visual_size_sequence_blocks(page):
+    """Group physical size rows into actual size blocks rather than individual lines."""
+    groups = _visual_all_groups(page)
+    if not groups:
         return []
 
+    candidates = []
+    for idx, group in enumerate(groups):
+        text = _visual_group_text(group)
+        if not _visual_raw_size_like_text(text):
+            continue
+        box_list = _boxes_from_words(group)
+        if not box_list:
+            continue
+        left, top, right, bottom = box_list[0]
+        candidates.append({
+            "group_index": idx,
+            "group": group,
+            "text": text,
+            "box": (left, top, right, bottom),
+            "cx": (left + right) / 2.0,
+            "cy": (top + bottom) / 2.0,
+        })
+
+    if len(candidates) < 2:
+        return []
+
+    blocks = []
+    # Size blocks in the current artworks are primarily vertical columns. Group
+    # rows with similar X and ordinary line spacing; a larger vertical gap starts
+    # the next logical size block.
+    for item in sorted(candidates, key=lambda x: (x["cx"], x["cy"])):
+        placed = False
+        for block in blocks:
+            avg_x = sum(x["cx"] for x in block) / len(block)
+            last = block[-1]
+            gap = item["cy"] - last["cy"]
+            typical_heights = [max(1, b["box"][3] - b["box"][1]) for b in block]
+            typical_h = sorted(typical_heights)[len(typical_heights) // 2]
+            x_tolerance = max(24.0, typical_h * 2.5)
+            max_gap = max(46.0, typical_h * 1.95)
+            if abs(item["cx"] - avg_x) <= x_tolerance and -5.0 <= gap <= max_gap:
+                block.append(item)
+                block.sort(key=lambda x: x["cy"])
+                placed = True
+                break
+        if not placed:
+            blocks.append([item])
+
+    # Some columns can be split into multiple blocks because OCR drops the
+    # regional numeric line. Merge neighboring blocks when the gap is small and
+    # they share the same horizontal column.
+    merged = []
+    for block in sorted(blocks, key=lambda b: (sum(x["cx"] for x in b) / len(b), min(x["cy"] for x in b))):
+        if not merged:
+            merged.append(block)
+            continue
+        prev = merged[-1]
+        prev_x = sum(x["cx"] for x in prev) / len(prev)
+        curr_x = sum(x["cx"] for x in block) / len(block)
+        prev_bottom = max(x["box"][3] for x in prev)
+        curr_top = min(x["box"][1] for x in block)
+        gap = curr_top - prev_bottom
+        if abs(prev_x - curr_x) <= 34 and gap <= 48:
+            prev.extend(block)
+            prev.sort(key=lambda x: x["cy"])
+        else:
+            merged.append(block)
+
+    result = []
+    for block in merged:
+        if not block:
+            continue
+        # Only keep plausible size blocks; long unrelated text strings should
+        # not become a sequence merely because they contain an 'S' or a number.
+        alpha_size_count = sum(
+            bool(re.search(r"\b(?:xxs|xs|s|m|l|xl|xxl|xxxl|tp|tg|ttg|ech|ch|eg|eeg|p|g)\b", _visual_norm(item["text"])))
+            for item in block
+        )
+        if alpha_size_count >= 1 or len(block) >= 2:
+            result.append(block)
+
+    # Sort blocks from top-to-bottom for the dominant size column. If several
+    # columns exist, prioritize the longest/plausible size column.
+    result.sort(key=lambda block: (min(item["cy"] for item in block), min(item["cx"] for item in block)))
+    return result
+
+
+def _find_visual_osz_box(page, field_name, actual_value=""):
+    """Locate OSZ/OS_Size_N by size-block position, not by arbitrary number position."""
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    match = re.search(r"(?:osz|ossize)(\d+)$", compact)
+    if not match:
+        return []
+    index = int(match.group(1))
+    if index <= 0:
+        return []
+
+    blocks = _visual_size_sequence_blocks(page)
+    if not blocks or index > len(blocks):
+        return []
+
+    actual_norm = _visual_norm(actual_value)
+    actual_compact = _visual_compact(actual_value)
+
+    # Prefer a block whose combined text substantially overlaps the compared
+    # output. For a mismatch, this still chooses the correct physical size block.
+    def block_score(block):
+        text = " ".join(item["text"] for item in block)
+        norm = _visual_norm(text)
+        score = 0.0
+        if actual_norm:
+            if actual_norm == norm:
+                score += 50
+            elif actual_compact and actual_compact in _visual_compact(norm):
+                score += 35
+            # Token overlap is useful when punctuation/line wrapping differs.
+            at = set(tokenize(actual_value))
+            bt = set(tokenize(text))
+            if at and bt:
+                score += 20.0 * len(at & bt) / max(1, len(at))
+        score += min(12.0, len(block) * 2.0)
+        return score
+
+    # The report's OS_Size_N numbering is the semantic sequence order. First try
+    # the exact ordinal block because that is the strongest source of identity.
+    chosen_block = blocks[index - 1]
+
+    # If the ordinal block looks implausible but another block strongly matches
+    # the actual output, use the stronger semantic match.
+    ordinal_score = block_score(chosen_block)
+    best_idx = max(
+        range(len(blocks)),
+        key=lambda idx: block_score(blocks[idx])
+    )
+    best_score = block_score(blocks[best_idx])
+    if best_score >= ordinal_score + 25:
+        chosen_block = blocks[best_idx]
+
+    boxes = []
+    for item in chosen_block:
+        boxes.extend(_boxes_from_words(item["group"]))
+    return boxes
+
+
+
+def _visual_text_similarity(a, b):
+    """Return a robust token/compact similarity for visual evidence matching."""
+    a = str(a or "").strip()
+    b = str(b or "").strip()
+    if not a or not b:
+        return 0.0
+    if _visual_norm(a) == _visual_norm(b) or _visual_compact(a) == _visual_compact(b):
+        return 1.0
+    from difflib import SequenceMatcher
+    token_ratio = SequenceMatcher(
+        None,
+        _visual_norm(a).split(),
+        _visual_norm(b).split(),
+        autojunk=False,
+    ).ratio()
+    compact_ratio = SequenceMatcher(
+        None,
+        _visual_compact(a),
+        _visual_compact(b),
+        autojunk=False,
+    ).ratio()
+    return max(token_ratio, compact_ratio * 0.98)
+
+
+def _visual_find_multiline_block_boxes(page, target, groups=None, min_score=0.48, max_lines=10):
+    """
+    Locate a multi-line field as a physical block.
+
+    This deliberately works from the actual text returned by the comparison
+    engine (usually PDF text or OCR output) rather than trying to rediscover a
+    generic phrase.  It is tolerant of OCR punctuation/line-break differences
+    and can therefore map FAIL values such as an OS_Size block where only one
+    number differs.
+    """
+    target = str(target or "").strip()
+    if not target:
+        return []
+    groups = groups or _visual_all_groups(page)
+    if not groups:
+        return []
+
+    # Preserve explicit source newlines when they exist.  When they do not,
+    # derive soft target lines from common size-row patterns.
+    raw_lines = [re.sub(r"\s+", " ", line).strip() for line in target.splitlines() if str(line).strip()]
+    if len(raw_lines) <= 1:
+        compact_target = _visual_compact(target)
+        # Common artwork size rows.  This lets a collapsed comparison result
+        # still resolve to four physical size lines.
+        extracted = re.findall(
+            r"(?:\b(?:XXXS|XXS|XS|S|M|L|XL|XXL|XXXL|TP|P|G|GG|TG|TTG|ECH|CH|EG|EE|EEG)\b\s*\([^)]*\)|"
+            r"\b\d{1,3}\s*/\s*\d{1,3}\s*[-–]\s*\d{1,3}(?:\s*[-–]\s*\d{1,3})?\b)",
+            target,
+            flags=re.IGNORECASE,
+        )
+        if len(extracted) >= 2:
+            raw_lines = extracted
+        else:
+            raw_lines = [target]
+
+    # Build candidate windows.  Size and long regional blocks rarely exceed ten
+    # physical OCR lines, so this remains lightweight even on large pages.
+    target_count = len(raw_lines)
+    candidate_sizes = range(
+        max(1, target_count - 2),
+        min(max_lines, target_count + 2) + 1,
+    )
+
+    best = None
+    group_texts = [_visual_group_text(g) for g in groups]
+
+    for window_size in candidate_sizes:
+        if window_size > len(groups):
+            continue
+        for start in range(0, len(groups) - window_size + 1):
+            window = groups[start:start + window_size]
+            texts = group_texts[start:start + window_size]
+
+            # For explicit multi-line targets, align target line -> one physical
+            # group. For collapsed targets, allow a token coverage score.
+            if len(raw_lines) > 1:
+                scores = []
+                search_pos = 0
+                for target_line in raw_lines:
+                    local_best = 0.0
+                    local_idx = None
+                    for idx in range(search_pos, len(texts)):
+                        score = _visual_text_similarity(target_line, texts[idx])
+                        if score > local_best:
+                            local_best = score
+                            local_idx = idx
+                    if local_idx is None:
+                        scores.append(0.0)
+                        continue
+                    scores.append(local_best)
+                    search_pos = local_idx + 1
+                if not scores:
+                    continue
+                line_coverage = sum(1 for score in scores if score >= 0.42) / max(1, len(scores))
+                avg_score = sum(scores) / len(scores)
+                # Strongly reward candidates where the expected number of rows
+                # is actually present. This prevents a random nearby paragraph
+                # from winning on one long shared word.
+                score = avg_score * 0.72 + line_coverage * 0.28
+            else:
+                joined = " ".join(texts)
+                score = _visual_text_similarity(target, joined)
+
+            # Size-shaped windows receive a small bonus when most groups look
+            # like size rows. This is especially useful when the page has many
+            # unrelated numeric lines nearby.
+            size_like = sum(1 for text in texts if _visual_raw_size_like_text(text))
+            if size_like >= max(2, min(4, len(raw_lines))):
+                score += 0.05
+
+            # Prefer tighter windows over oversized paragraphs.
+            score -= max(0, window_size - max(1, target_count)) * 0.015
+
+            if best is None or score > best[0]:
+                best = (score, start, window_size)
+
+    if best is None or best[0] < min_score:
+        return []
+
+    _, start, window_size = best
+    boxes = []
+    for group in groups[start:start + window_size]:
+        boxes.extend(_boxes_from_words(group))
+    return boxes
+
+
+def _visual_field_markers(field_name):
+    """Field-specific visual anchors with explicit regional boundaries."""
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    field_type = get_field_type(field_name)
+    region = get_field_region(field_name)
+
+    if field_type == "CONTENT":
+        # These are intentionally specific. Generic anchors such as "cuerpo" or
+        # "lavar" caused several Spanish fields to point at the same first match.
+        if "fibspmexico" in compact:
+            return ["mx :", "mx:", "cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv:", "cuerpo"], [
+                "machine wash", "laver", "lavar a", "made in", "hecho en", "fabrique en", "rn ", "ca :"
+            ]
+        if "fibmexico" in compact:
+            return ["mx :", "mx:", "mx cuerpo"], [
+                "cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv:", "machine wash", "laver", "lavar a", "made in", "hecho en", "rn ", "ca :"
+            ]
+        if "fibsp" in compact:
+            return ["cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv:", "cr/ec/gt/pa/sv"], [
+                "machine wash", "laver", "lavar a", "made in", "hecho en", "fabrique en", "rn ", "ca :"
+            ]
+        if "fibca" in compact:
+            return ["ca : exterieur", "ca : extérieur", "ca exterieur", "ca extérieur", "exterieur", "extérieur"], [
+                "mx :", "cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv:", "machine wash", "laver", "lavar a", "made in", "rn "
+            ]
+        if "fiben" in compact:
+            return ["us : shell", "us shell", "shell:"], [
+                "ca :", "mx :", "cr/ec/gt/pa/sv :", "machine wash", "laver", "lavar a", "made in", "rn "
+            ]
+        return ["shell", "exterieur", "cuerpo", "content"], ["machine wash", "laver", "lavar a", "made in", "rn "]
+
+    if field_type == "CARE":
+        if region == "FR":
+            return ["ca : laver", "ca: laver", "laver à la machine", "laver a la machine"], [
+                "mx/pa/sv :", "mx/pa/sv:", "cr/ec/gt/pa/sv :", "cr/ec/gt/pa/sv", "made in", "hecho en", "rn "
+            ]
+        if region == "SP":
+            return ["mx/pa/sv : lavar", "mx/pa/sv: lavar", "cr/ec/gt/mx/pa/sv : lavar", "lavar a maquina", "lavar a máquina"], [
+                "actual other sizes", "made in", "hecho en", "rn ", "ca :"
+            ]
+        return ["machine wash", "machine wash cold", "wash"], [
+            "ca : laver", "ca: laver", "laver", "lavar", "made in", "hecho en", "rn "
+        ]
+
+    if field_type == "COO":
+        if region == "FR":
+            return ["fabrique en"], ["made in", "hecho en", "rn", "ca"]
+        if region == "SP":
+            return ["hecho en"], ["made in", "fabrique en", "rn", "ca"]
+        return ["made in"], ["fabrique en", "hecho en", "rn", "ca"]
+
+    if field_type in {"RN", "CA"}:
+        return ["rn ", "ca ", "rn", "ca"], ["machine wash", "laver", "lavar", "made in", "hecho en"]
+
+    return [], []
+
+
+def _visual_region_groups(page, field_name):
+    """Return only the semantic artwork region belonging to one field family."""
+    groups = _visual_all_groups(page)
+    if not groups:
+        return []
+
+    starts, stops = _visual_field_markers(field_name)
+    starts = [_visual_norm(x) for x in starts if _visual_norm(x)]
+    stops = [_visual_norm(x) for x in stops if _visual_norm(x)]
+    if not starts:
+        return []
+
+    field_type = get_field_type(field_name)
+    candidates = []
+
+    # Find every possible anchor; later fields such as FIB_Mexico/FIB_SP need
+    # occurrence-aware selection instead of always taking the first "cuerpo".
+    for idx, group in enumerate(groups):
+        line_text = _visual_norm(_visual_group_text(group))
+        if not line_text:
+            continue
+        if any(marker in line_text for marker in starts):
+            candidates.append(idx)
+
+    if not candidates:
+        return []
+
+    def collect_from(start_idx):
+        selected = []
+        anchor_group = groups[start_idx]
+        anchor_words = _boxes_from_words(anchor_group)
+        anchor_left = anchor_words[0][0] if anchor_words else 0
+        for idx in range(start_idx, min(len(groups), start_idx + (10 if field_type == "CONTENT" else 18 if field_type == "CARE" else 3))):
+            group = groups[idx]
+            line_text = _visual_norm(_visual_group_text(group))
+            if not line_text:
+                continue
+
+            # CONTENT and CARE are usually columnar. Keep the region in the same
+            # physical text column as its anchor so an adjacent IMPORTED BY block
+            # cannot be accidentally absorbed into the highlight.
+            group_boxes = _boxes_from_words(group)
+            group_left = group_boxes[0][0] if group_boxes else anchor_left
+            if field_type in {"CONTENT", "CARE"} and idx > start_idx:
+                if abs(group_left - anchor_left) > 85:
+                    continue
+
+            if idx > start_idx and any(stop in line_text for stop in stops):
+                break
+
+            selected.append(group)
+
+            if field_type == "CONTENT":
+                has_pct = bool(re.search(r"\b\d{1,3}\s*%", line_text))
+                has_material = any(
+                    material in line_text
+                    for material in (
+                        "polyester", "spandex", "elastane", "elasthanne", "cotton", "nylon",
+                        "rayon", "viscose", "acrylic", "linen", "wool", "elastodiene",
+                        "polyamide", "poliester", "poliéster", "elastano", "elastán"
+                    )
+                )
+                if idx > start_idx and not (has_pct or has_material):
+                    if len(selected) > 1:
+                        selected.pop()
+                        break
+            elif field_type == "CARE":
+                if idx > start_idx and any(stop in line_text for stop in stops):
+                    break
+
+        return selected
+
+    # Strongly anchored fields: choose the first candidate that contains the
+    # compared semantic family. For repeated Spanish regions, use all matching
+    # candidate blocks for FIB_SP_Mexico, but one block for FIB_Mexico/FIB_SP.
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    if "fibspmexico" in compact:
+        combined = []
+        for start_idx in candidates[:2]:
+            block = collect_from(start_idx)
+            if block:
+                combined.extend(block)
+        return combined
+
+    for start_idx in candidates:
+        block = collect_from(start_idx)
+        if block:
+            return block
+    return []
+
+
+def _visual_region_boxes(page, field_name, actual_value=""):
+    """Find a semantic region when exact text occurrence is insufficient."""
+    groups = _visual_region_groups(page, field_name)
+    if not groups:
+        return []
+    boxes = []
+    for group in groups:
+        boxes.extend(_boxes_from_words(group))
+    return boxes
+
+
+def _visual_find_size_field_boxes(page, actual_value, expected_value="", field_name=""):
+    """Resolve Main_Size/OS_Size_N to one coherent physical size block."""
     groups = _visual_group_words(page)
     if not groups:
         return []
 
-    target_lines = [
-        re.sub(r"\s+", " ", line).strip()
-        for line in target.splitlines()
-        if str(line).strip()
-    ]
-
-    # When the comparison PDF OUTPUT is a single long line, wrap it only for
-    # matching if the OCR itself has multiple physical lines. Otherwise use the
-    # whole matched OCR group.
-    if not target_lines:
-        return []
-
-    group_texts = [_visual_group_text(group) for group in groups]
-
-    # First pass: exact/compact line matches, preserving physical order.
-    chosen_indices = []
-    search_from = 0
-    for target_line in target_lines:
-        exact_idx = None
-        for idx in range(search_from, len(groups)):
-            candidate = group_texts[idx]
-            if not candidate:
-                continue
-            if (
-                _visual_norm(target_line) == _visual_norm(candidate)
-                or _visual_compact(target_line) == _visual_compact(candidate)
-            ):
-                exact_idx = idx
-                break
-        if exact_idx is not None:
-            chosen_indices.append(exact_idx)
-            search_from = exact_idx + 1
-
-    # If all target lines were found, return those physical lines.
-    if len(chosen_indices) == len(target_lines):
-        selected_groups = [groups[idx] for idx in chosen_indices]
-        boxes = []
-        for group in selected_groups:
-            boxes.extend(_boxes_from_words(group))
-        return boxes
-
-    # Second pass: fuzzy line alignment. Use a monotonic assignment so the
-    # highlight cannot jump to a distant unrelated block just because one word
-    # happens to be similar.
-    fuzzy_indices = []
-    search_from = 0
-    for target_line in target_lines:
-        best_idx = None
-        best_score = 0.0
-        for idx in range(search_from, min(len(groups), search_from + 12)):
-            score = _visual_match_line_score(target_line, group_texts[idx])
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        if best_idx is None or best_score < 0.68:
+    size_items = []
+    for idx, group in enumerate(groups):
+        text = _visual_group_text(group)
+        if not _visual_raw_size_like_text(text):
             continue
-        fuzzy_indices.append(best_idx)
-        search_from = best_idx + 1
+        boxes = _boxes_from_words(group)
+        if not boxes:
+            continue
+        box = boxes[0]
+        size_items.append({
+            "index": idx,
+            "text": text,
+            "group": group,
+            "box": box,
+            "cx": (box[0] + box[2]) / 2.0,
+            "cy": (box[1] + box[3]) / 2.0,
+        })
 
-    if not fuzzy_indices:
+    if len(size_items) < 2:
         return []
 
-    # For a block field, at least half the source lines should align before we
-    # accept the result. This protects against accidental one-word matches.
-    if len(fuzzy_indices) < max(1, int(len(target_lines) * 0.5)):
+    # Identify the dominant size column by X-position. This is much safer than
+    # treating every numeric-looking line on the page as part of one OSZ block.
+    clusters = []
+    for item in sorted(size_items, key=lambda x: x["cx"]):
+        placed = False
+        for cluster in clusters:
+            avg_x = sum(x["cx"] for x in cluster) / len(cluster)
+            if abs(item["cx"] - avg_x) <= 95:
+                cluster.append(item)
+                placed = True
+                break
+        if not placed:
+            clusters.append([item])
+    dominant = max(clusters, key=lambda c: (len(c), max(x["cy"] for x in c) - min(x["cy"] for x in c)))
+    dominant.sort(key=lambda x: x["cy"])
+
+    # Remove occasional non-size fragments that happen to land in the same X
+    # band. Valid size rows normally contain a recognized alpha size token or a
+    # regional numeric-size pattern.
+    size_token_re = re.compile(
+        r"^\s*(?:xxxs|xxs|xs|s|m|l|xl|xxl|xxxl|tp|p|g|gg|tg|ttg|ech|ch|eg|ee|eeg)\b",
+        re.IGNORECASE,
+    )
+    numeric_size_re = re.compile(r"^\s*\d{1,3}\s*/\s*\d{1,3}\s*[-–]\s*\d", re.IGNORECASE)
+    cleaned = [
+        item for item in dominant
+        if size_token_re.search(item["text"]) or numeric_size_re.search(item["text"])
+    ]
+    if len(cleaned) >= 2:
+        dominant = cleaned
+
+    # Split the dominant column at the noticeably larger vertical whitespace
+    # between logical size blocks. Within a block, rows are tightly packed;
+    # between blocks the gap is visibly larger. This avoids treating TG/EG as
+    # new blocks just because they are themselves alphabetic size labels.
+    blocks = []
+    current_block = []
+    previous = None
+    raw_gaps = []
+    for item in dominant:
+        if previous is not None:
+            raw_gaps.append(max(0.0, item["box"][1] - previous["box"][3]))
+        previous = item
+    positive_gaps = sorted(g for g in raw_gaps if g >= 0)
+    median_gap = positive_gaps[len(positive_gaps) // 2] if positive_gaps else 5.0
+    split_gap = max(12.0, median_gap * 1.55)
+
+    previous = None
+    for item in dominant:
+        if previous is not None:
+            gap = item["box"][1] - previous["box"][3]
+            if gap > split_gap and current_block:
+                blocks.append(current_block)
+                current_block = []
+        current_block.append(item)
+        previous = item
+    if current_block:
+        blocks.append(current_block)
+
+    blocks = [block for block in blocks if block]
+    if not blocks:
         return []
 
-    # Include intermediate physical OCR lines between first and last aligned
-    # targets when the comparison target represents a continuous block. This is
-    # what makes a 5-line care instruction appear as one clearly compared region.
-    first_idx = fuzzy_indices[0]
-    last_idx = fuzzy_indices[-1]
-    selected_groups = groups[first_idx:last_idx + 1]
+    compact_field = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    if compact_field == "mainsize":
+        block_index = 0
+    else:
+        match = re.search(r"(?:osz|ossize)(\d+)$", compact_field)
+        block_index = int(match.group(1)) - 1 if match else 0
+
+    if block_index < 0 or block_index >= len(blocks):
+        return []
+
+    # If the selected block has a strong textual match to the actual output,
+    # use it. Otherwise retain the semantic ordinal because OS_Size_N is itself
+    # the field's identity.
+    chosen = blocks[block_index]
+    target = str(actual_value or expected_value or "").strip()
+    block_text = " ".join(item["text"] for item in chosen)
+    if target and _visual_text_similarity(target, block_text) < 0.38:
+        # A single missing/merged line can shift a block boundary. Search for a
+        # nearby block with a materially stronger match without abandoning the
+        # ordinal field identity on weak evidence.
+        ranked = sorted(
+            ((
+                _visual_text_similarity(target, " ".join(item["text"] for item in block)),
+                idx,
+                block,
+            ) for idx, block in enumerate(blocks)),
+            reverse=True,
+        )
+        if ranked and ranked[0][0] >= 0.62:
+            chosen = ranked[0][2]
 
     boxes = []
-    for group in selected_groups:
-        box = _boxes_from_words(group)
-        if box:
-            boxes.extend(box)
+    for item in chosen:
+        boxes.extend(_boxes_from_words(item["group"]))
     return boxes
 
 
-def _find_visual_failure_boxes(page, field_name, expected_value, actual_value, difference):
-    """Find the actual artwork region for a FAIL, presentation layer only."""
+def _visual_field_uses_block_mapping(field_name, expected_value="", actual_value=""):
+    field_type = get_field_type(field_name)
+    if field_type in {"CARE", "CONTENT"}:
+        return True
+    if field_type in {"ATTRIBUTE", "GENERAL", "BRAND"}:
+        sample = str(actual_value or expected_value or "").strip()
+        return len(tokenize(sample)) >= 5 or len(sample) >= 45
+    return False
+
+
+def _visual_find_field_boxes(page, field_name, expected_value, actual_value, status):
+    """
+    Evidence-linked visual mapper.
+
+    The validation result remains authoritative.  This function only answers:
+    "Which physical pixels correspond to the evidence that the validator used?"
+    It deliberately avoids a generic first-match search for structured fields.
+    """
+    field_type = get_field_type(field_name)
     actual_value = str(actual_value or "").strip()
     expected_value = str(expected_value or "").strip()
-    difference = str(difference or "").strip()
 
-    if get_field_type(field_name) == "OSZ":
-        boxes = _find_visual_osz_box(page, field_name, actual_value)
+    if not actual_value or actual_value.casefold() in {"not found", "-", "—"}:
+        if status in {"PASS", "FAIL"} and field_type in {"CONTENT", "CARE", "COO"}:
+            return _visual_region_boxes(page, field_name, actual_value)
+        return []
+
+    compact_field = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    is_osz = bool(re.search(r"(?:osz|ossize)\d+$", compact_field))
+
+    # ------------------------------------------------------------------
+    # 1. Multi-line structured blocks. This is the highest-confidence path
+    #    for Main_Size and OS_Size_N and fixes the old "first size column"
+    #    behaviour.
+    # ------------------------------------------------------------------
+    if is_osz:
+        if compact_field.startswith("osz") and not compact_field.startswith("ossize"):
+            boxes = _visual_find_osz_field_boxes(
+                page,
+                field_name,
+                actual_value=actual_value,
+                expected_value=expected_value,
+            )
+            if boxes:
+                return boxes
+        else:
+            boxes = _visual_find_size_field_boxes(
+                page,
+                actual_value,
+                expected_value,
+                field_name=field_name,
+            )
+            if boxes:
+                return boxes
+    elif field_type == "SIZE":
+        boxes = _visual_find_size_field_boxes(
+            page,
+            actual_value,
+            expected_value,
+            field_name=field_name,
+        )
         if boxes:
             return boxes
 
-    if get_field_type(field_name) == "SYMBOL":
+    # ------------------------------------------------------------------
+    # 2. CONTENT / CARE use semantic regional anchors first. Exact phrase
+    #    search is only a fallback because several language fields may contain
+    #    identical material/care text.
+    # ------------------------------------------------------------------
+    if field_type in {"CONTENT", "CARE"}:
+        region_groups = _visual_region_groups(page, field_name)
+        if region_groups:
+            # For long semantic fields the region itself is the evidence.
+            # Returning the complete region is more trustworthy than trying to
+            # rediscover one repeated phrase inside a multilingual block.
+            region_boxes = []
+            for group in region_groups:
+                region_boxes.extend(_boxes_from_words(group))
+            if region_boxes:
+                return region_boxes
+
+    # ------------------------------------------------------------------
+    # 3. COO / RN / CA: use the exact scalar first, but search the semantic
+    #    line if the number is embedded in RN/CA combined text.
+    # ------------------------------------------------------------------
+    if field_type in {"COO", "RN", "CA"}:
+        if field_type in {"RN", "CA"}:
+            direct = _visual_find_direct_scalar_box(page, actual_value)
+            if direct:
+                return direct
+        exact = _visual_find_text_occurrences(page, actual_value, min_score=0.74)
+        if exact:
+            return exact
+        region_boxes = _visual_region_boxes(page, field_name, actual_value)
+        if region_boxes:
+            return region_boxes
+
+    # ------------------------------------------------------------------
+    # 4. Symbols / identifiers are safest against the PDF text layer.
+    # ------------------------------------------------------------------
+    if field_type == "SYMBOL":
         boxes = _find_visual_symbol_boxes(page, actual_value)
-        if boxes:
-            return boxes
-        boxes = _find_visual_symbol_boxes(page, expected_value)
-        if boxes:
-            return boxes
-
-    # For block-based fields, ALWAYS try the complete compared block first.
-    # This intentionally prevents a care mismatch from highlighting only a word
-    # such as "ONLY".
-    if _visual_field_uses_block_mapping(field_name, expected_value, actual_value):
-        boxes = _find_visual_semantic_block_boxes(page, field_name)
         if not boxes:
-            boxes = _find_visual_block_boxes(page, actual_value, field_name)
+            boxes = _find_visual_symbol_boxes(page, expected_value)
         if boxes:
             return boxes
 
-    # Fallback for scalar/structured failures: locate the actual PDF output.
-    boxes = _find_visual_boxes(page, actual_value, field_name)
+    if field_type == "IDENTIFIER":
+        boxes = _visual_find_direct_scalar_box(page, actual_value)
+        if boxes:
+            return boxes
+
+    # ------------------------------------------------------------------
+    # 5. General scalar/text fields.
+    # ------------------------------------------------------------------
+    boxes = _visual_find_text_occurrences(page, actual_value, min_score=0.80)
     if boxes:
         return boxes
 
-    from difflib import SequenceMatcher
+    # ------------------------------------------------------------------
+    # 6. FAIL-specific token fallback.  This is deliberately last so an
+    #    isolated "S", "18" or other tiny token cannot hijack a structured
+    #    field's highlight.
+    # ------------------------------------------------------------------
+    if status == "FAIL":
+        expected_tokens = tokenize(expected_value)
+        actual_tokens = tokenize(actual_value)
+        try:
+            from difflib import SequenceMatcher
+            matcher = SequenceMatcher(None, expected_tokens, actual_tokens, autojunk=False)
+            for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
+                if tag not in {"replace", "insert"}:
+                    continue
+                fragment = " ".join(actual_tokens[b1:b2]).strip()
+                if not fragment or len(fragment) < 2:
+                    continue
+                boxes = _visual_find_text_occurrences(page, fragment, min_score=0.80)
+                if boxes:
+                    return boxes
+        except Exception:
+            pass
 
-    expected_tokens = tokenize(expected_value)
-    actual_tokens = tokenize(actual_value)
-    candidate_tokens = []
+    for token in sorted(tokenize(actual_value), key=lambda x: (-len(x), x)):
+        if len(token) < 2 and len(tokenize(actual_value)) > 1:
+            continue
+        boxes = _visual_find_text_occurrences(page, token, min_score=0.82)
+        if boxes:
+            return boxes
 
-    if expected_tokens and actual_tokens:
-        matcher = SequenceMatcher(None, expected_tokens, actual_tokens, autojunk=False)
-        for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
-            if tag in {"replace", "insert"}:
-                candidate_tokens.extend(actual_tokens[b1:b2])
+    return []
 
-    # Stored differences can contain useful actual-value fragments.
-    for item in re.findall(
-        r"(?:Extra|Found|PDF)\s*:\s*([^;]+)",
-        difference,
-        flags=re.IGNORECASE
-    ):
-        candidate_tokens.extend(tokenize(item))
-
-    seen = set()
+def _merge_nearby_boxes(boxes, gap=8):
+    """Merge boxes that overlap or are nearly adjacent on the same line."""
+    if not boxes:
+        return []
     cleaned = []
-    for token in candidate_tokens:
-        token_norm = normalize_text(token)
-        if not token_norm:
+    for box in boxes:
+        try:
+            l, t, r, b = [int(v) for v in box]
+        except Exception:
             continue
-        if len(token_norm) <= 1 and len(actual_tokens) > 1:
+        if r > l and b > t:
+            cleaned.append((l, t, r, b))
+    if not cleaned:
+        return []
+
+    cleaned.sort(key=lambda b: (b[1], b[0]))
+    merged = []
+    for box in cleaned:
+        if not merged:
+            merged.append(box)
             continue
-        if token_norm not in seen:
-            seen.add(token_norm)
-            cleaned.append(token_norm)
+        ml, mt, mr, mb = merged[-1]
+        l, t, r, b = box
+        vertical_overlap = min(mb, b) - max(mt, t)
+        horizontal_gap = max(0, max(l, ml) - min(r, mr))
+        if vertical_overlap > -gap and horizontal_gap <= gap:
+            merged[-1] = (min(ml, l), min(mt, t), max(mr, r), max(mb, b))
+        else:
+            merged.append(box)
+    return merged
 
-    found = []
-    for token in cleaned:
-        for box in _find_visual_boxes(page, token, field_name):
-            if box not in found:
-                found.append(box)
 
-    return found
+def _visual_marker_position(box, radius, image_w, image_h, occupied):
+    """Place numbered marker just outside the highlight without covering text."""
+    x1, y1, x2, y2 = box
+    candidates = [
+        (x1 - radius - 4, y1 - radius - 4),
+        (x2 + radius + 4, y1 - radius - 4),
+        (x1 - radius - 4, y2 + radius + 4),
+        (x2 + radius + 4, y2 + radius + 4),
+    ]
+    for cx, cy in candidates:
+        cx = max(radius + 3, min(image_w - radius - 3, cx))
+        cy = max(radius + 3, min(image_h - radius - 3, cy))
+        rect = (cx - radius, cy - radius, cx + radius, cy + radius)
+        if not any(_rect_intersects(rect, existing, pad=4) for existing in occupied):
+            return cx, cy
+    return max(radius + 3, min(image_w - radius - 3, x1)), max(radius + 3, min(image_h - radius - 3, y1))
 
 
 def build_highlighted_page_image(page, page_report, field_colors=None):
-    """Draw the existing comparison result onto the original artwork.
-
-    IMPORTANT: presentation-only. This function never re-runs comparison
-    logic. It only visualizes rows already present in ``page_report``.
-
-    Visual rules:
-      - PASS: highlight the actual matched artwork value/block in its field color.
-      - FAIL: highlight the actual incorrect artwork value/block with a red fill
-        while retaining the field-specific outline color.
-      - CARE/CONTENT/long text: highlight the complete physical block that was
-        compared, not only the word that differs.
-      - Annotation text is ALWAYS just ``FIELD • STATUS``. Detailed reasons stay
-        exclusively in the comparison table.
-    """
+    """Render clean, evidence-driven QC highlights on the original artwork."""
     image_bytes = page.get("image_bytes")
     if not image_bytes:
         return None
 
     base = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    if page_report is None or page_report.empty:
+        return base.convert("RGB")
+
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     field_colors = field_colors or {}
-    regular_font, bold_font = _load_visual_fonts()
-
-    if page_report is None or page_report.empty:
-        return base.convert("RGB")
 
     field_order = []
     for _, row in page_report.iterrows():
@@ -1832,11 +2550,11 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             field_order.append(field)
     number_by_field = {field: i + 1 for i, field in enumerate(field_order)}
 
-    # Collect one visual annotation per field. For block fields the anchor is the
-    # union of all line boxes, while the actual artwork still gets line-by-line
-    # boxes so the compared physical block is clear.
-    annotations = []
-    annotated_fields = set()
+    marker_occupied = []
+    annotated = []
+    min_dim = min(base.width, base.height)
+    pad = max(3, int(min_dim * 0.0022))
+    radius = max(13, int(min_dim * 0.010))
 
     for _, row in page_report.iterrows():
         status = str(row.get("STATUS", "")).strip().upper()
@@ -1848,192 +2566,101 @@ def build_highlighted_page_image(page, page_report, field_colors=None):
             continue
 
         expected_value = str(row.get("ORDER FORM DATA", "") or "").strip()
-        pdf_output = str(row.get("PDF OUTPUT", "") or "").strip()
-
-        if pdf_output.casefold() in {"", "not found", "—", "-"}:
-            continue
-
-        field_type = get_field_type(field_name)
-
-        # Long/block fields must NEVER fall back to a single differing token.
-        if field_type == "BARCODE":
-            boxes = _find_visual_boxes(page, pdf_output, field_name)
-            if not boxes and status == "FAIL":
-                boxes = _find_visual_failure_boxes(
-                    page, field_name, expected_value, pdf_output,
-                    row.get("DIFFERENCE", "")
-                )
-        elif field_type == "SYMBOL":
-            boxes = _find_visual_symbol_boxes(page, pdf_output)
-            if not boxes:
-                boxes = _find_visual_symbol_boxes(page, expected_value)
-        elif _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
-            boxes = _find_visual_semantic_block_boxes(page, field_name)
-            if not boxes:
-                boxes = _find_visual_block_boxes(page, pdf_output, field_name)
-            if not boxes and status == "FAIL":
-                boxes = _find_visual_failure_boxes(
-                    page, field_name, expected_value, pdf_output,
-                    row.get("DIFFERENCE", "")
-                )
-        elif field_type == "OSZ":
-            boxes = _find_visual_osz_box(page, field_name, pdf_output)
-            if not boxes and status == "FAIL":
-                boxes = _find_visual_failure_boxes(
-                    page, field_name, expected_value, pdf_output,
-                    row.get("DIFFERENCE", "")
-                )
-        else:
-            boxes = _find_visual_boxes(page, pdf_output, field_name)
-            if not boxes and status == "FAIL":
-                boxes = _find_visual_failure_boxes(
-                    page, field_name, expected_value, pdf_output,
-                    row.get("DIFFERENCE", "")
-                )
-
+        actual_value = str(row.get("PDF OUTPUT", "") or "").strip()
+        boxes = _visual_find_field_boxes(
+            page,
+            field_name,
+            expected_value,
+            actual_value,
+            status,
+        )
+        boxes = _merge_nearby_boxes(boxes, gap=max(6, pad * 2))
         if not boxes:
             continue
 
         color = field_colors.get(field_name, FIELD_VISUAL_COLORS[0])
         rgb = _hex_rgb(color)
-        padded_boxes = []
 
-        for raw_box in boxes:
-            left, top, right, bottom = raw_box
-            pad = max(2, int(min(base.size) * 0.0018))
-            left = max(0, int(left) - pad)
-            top = max(0, int(top) - pad)
-            right = min(base.width - 1, int(right) + pad)
-            bottom = min(base.height - 1, int(bottom) + pad)
+        for left, top, right, bottom in boxes:
+            left = max(0, left - pad)
+            top = max(0, top - pad)
+            right = min(base.width - 1, right + pad)
+            bottom = min(base.height - 1, bottom + pad)
             if right <= left or bottom <= top:
                 continue
 
-            padded_boxes.append((left, top, right, bottom))
-
             if status == "FAIL":
-                # Red fill = defect, field color outline = field identity.
+                # Strong enough to notice, but still translucent so the artwork
+                # remains readable underneath.
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
-                    radius=max(3, pad),
-                    fill=(218, 54, 51, 105),
+                    radius=max(4, pad),
+                    fill=(218, 54, 51, 92),
                     outline=rgb + (255,),
-                    width=max(2, pad),
+                    width=max(2, int(min_dim * 0.0014)),
                 )
-                error_pad = max(2, pad + 1)
                 draw.rounded_rectangle(
-                    (max(0, left - error_pad), max(0, top - error_pad),
-                     min(base.width - 1, right + error_pad),
-                     min(base.height - 1, bottom + error_pad)),
-                    radius=max(3, error_pad),
-                    outline=(218, 54, 51, 255),
-                    width=max(2, pad // 2),
+                    (max(0, left - 2), max(0, top - 2), min(base.width - 1, right + 2), min(base.height - 1, bottom + 2)),
+                    radius=max(4, pad + 1),
+                    outline=(218, 54, 51, 235),
+                    width=max(2, int(min_dim * 0.0009)),
                 )
             else:
                 draw.rounded_rectangle(
                     (left, top, right, bottom),
-                    radius=max(3, pad),
-                    fill=rgb + (96,),
-                    outline=rgb + (255,),
-                    width=max(2, pad),
+                    radius=max(4, pad),
+                    fill=rgb + (54,),
+                    outline=rgb + (230,),
+                    width=max(2, int(min_dim * 0.0011)),
                 )
 
-        if not padded_boxes or field_name in annotated_fields:
-            continue
-
-        # Anchor the annotation to the complete compared region for block fields.
-        if _visual_field_uses_block_mapping(field_name, expected_value, pdf_output):
-            annotation_box = (
-                min(box[0] for box in padded_boxes),
-                min(box[1] for box in padded_boxes),
-                max(box[2] for box in padded_boxes),
-                max(box[3] for box in padded_boxes),
-            )
-        else:
-            annotation_box = padded_boxes[0]
-
-        annotations.append({
-            "field": field_name,
-            "status": status,
-            "rgb": rgb,
-            "box": annotation_box,
-            "number": number_by_field.get(field_name, 0),
-        })
-        annotated_fields.add(field_name)
-
-    # One compact label per field. NEVER display failure reasons here.
-    used_label_rects = []
-    for item in annotations:
-        box = item["box"]
-        field_name = item["field"]
-        status = item["status"]
-        rgb = item["rgb"]
-        number = item["number"]
-
-        label_text = f"{number}. {field_name} • {status}"
-        font = bold_font or regular_font
-        tw, th = _text_size(draw, label_text, font)
-
-        max_label_w = max(210, int(base.width * 0.38))
-        label_w = min(tw + 26, max_label_w)
-        label_h = th + 16
-
-        label_x, label_y = _place_label_above_or_below(
-            box, label_w, label_h, base.width, base.height, used_label_rects
+        # One small number marker per field; no large labels are painted over the artwork.
+        anchor_box = (
+            min(box[0] for box in boxes),
+            min(box[1] for box in boxes),
+            max(box[2] for box in boxes),
+            max(box[3] for box in boxes),
         )
-        used_label_rects.append(
-            (label_x, label_y, label_x + label_w, label_y + label_h)
+        cx, cy = _visual_marker_position(
+            anchor_box,
+            radius,
+            base.width,
+            base.height,
+            marker_occupied,
+        )
+        marker_rect = (cx - radius, cy - radius, cx + radius, cy + radius)
+        marker_occupied.append(marker_rect)
+
+        marker_color = (218, 54, 51) if status == "FAIL" else rgb
+        draw.ellipse(
+            marker_rect,
+            fill=(255, 255, 255, 245),
+            outline=marker_color + (255,),
+            width=max(2, int(min_dim * 0.0011)),
         )
 
-        box_cx = int((box[0] + box[2]) / 2)
-        if label_y + label_h <= box[1]:
-            label_anchor = (int(label_x + label_w / 2), int(label_y + label_h))
-            target_anchor = (box_cx, box[1])
-        elif label_y >= box[3]:
-            label_anchor = (int(label_x + label_w / 2), int(label_y))
-            target_anchor = (box_cx, box[3])
-        elif label_x + label_w <= box[0]:
-            label_anchor = (int(label_x + label_w), int(label_y + label_h / 2))
-            target_anchor = (box[0], int((box[1] + box[3]) / 2))
-        else:
-            label_anchor = (int(label_x), int(label_y + label_h / 2))
-            target_anchor = (box[2], int((box[1] + box[3]) / 2))
-
-        connector_color = (218, 54, 51) if status == "FAIL" else rgb
-        draw.line(
-            (label_anchor[0], label_anchor[1], target_anchor[0], target_anchor[1]),
-            fill=connector_color + (235,),
-            width=max(2, int(min(base.size) * 0.00095)),
-        )
-
-        label_outline = (218, 54, 51) if status == "FAIL" else rgb
-        draw.rounded_rectangle(
-            (label_x, label_y, label_x + label_w, label_y + label_h),
-            radius=max(5, int(min(base.size) * 0.0025)),
-            fill=(255, 255, 255, 246),
-            outline=label_outline + (255,),
-            width=max(2, int(min(base.size) * 0.0012)),
-        )
-
-        bar_w = max(5, int(label_w * 0.02))
-        draw.rounded_rectangle(
-            (label_x, label_y, label_x + bar_w, label_y + label_h),
-            radius=max(2, int(bar_w * 0.35)),
-            fill=rgb + (255,),
-        )
-
+        label = str(number_by_field.get(field_name, ""))
+        font = _load_visual_fonts()[1] or _load_visual_fonts()[0]
+        tw, th = _text_size(draw, label, font)
         draw.text(
-            (label_x + bar_w + 8, label_y + 6),
-            label_text,
-            fill=(20, 28, 40, 255),
+            (int(cx - tw / 2), int(cy - th / 2 - 1)),
+            label,
+            fill=marker_color + (255,),
             font=font,
         )
 
-    return Image.alpha_composite(base, overlay).convert("RGB")
+        annotated.append({
+            "field": field_name,
+            "status": status,
+            "number": number_by_field.get(field_name, 0),
+            "boxes": boxes,
+        })
 
-def _visual_image_bytes(image):
-    if image is None:
-        return None
-    return _image_to_png_bytes(image)
+    result = Image.alpha_composite(base, overlay).convert("RGB")
+    # Keep the annotation metadata available to the UI without putting labels on
+    # the artwork itself. This function intentionally returns only an image so it
+    # remains compatible with the existing Excel-report API.
+    return result
 
 def clean_pdf_line(line):
     if not line:
@@ -2198,27 +2825,73 @@ def extract_standalone_numeric_runs_from_lines(lines):
 
 
 def _osz_numeric_words(page):
-    """Return standalone OCR integer tokens with their physical coordinates."""
+    """Return standalone integer OCR tokens in stored artwork-image coordinates."""
     result = []
-    for word in page.get("ocr_words", []) or []:
-        if not isinstance(word, dict):
+    sx, sy = _page_ocr_scale(page)
+    for raw_word in page.get("ocr_words", []) or []:
+        if not isinstance(raw_word, dict):
             continue
-        raw = str(word.get("text", "")).strip()
+        raw = str(raw_word.get("text", "")).strip()
         if not re.fullmatch(r"\d+", raw):
             continue
-        # Ignore implausibly tiny OCR fragments.
-        if int(word.get("width", 0) or 0) <= 0 or int(word.get("height", 0) or 0) <= 0:
+        word = _scaled_word(raw_word, sx, sy)
+        if word["width"] <= 0 or word["height"] <= 0:
             continue
+        left = int(word["left"])
+        top = int(word["top"])
+        width = int(word["width"])
+        height = int(word["height"])
         result.append({
             "value": raw,
-            "left": int(word.get("left", 0) or 0),
-            "top": int(word.get("top", 0) or 0),
-            "width": int(word.get("width", 0) or 0),
-            "height": int(word.get("height", 0) or 0),
-            "center_x": float(word.get("left", 0) or 0) + float(word.get("width", 0) or 0) / 2.0,
-            "center_y": float(word.get("top", 0) or 0) + float(word.get("height", 0) or 0) / 2.0,
+            "left": left,
+            "top": top,
+            "width": width,
+            "height": height,
+            "center_x": left + width / 2.0,
+            "center_y": top + height / 2.0,
         })
     return result
+
+
+def _visual_find_osz_field_boxes(page, field_name, actual_value="", expected_value=""):
+    """Map standalone OSZ/OSZ_N values to their exact numeric token boxes."""
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    match = re.search(r"(?:osz)(\d+)$", compact)
+    if not match:
+        return []
+    index = int(match.group(1))
+    if index <= 0:
+        return []
+
+    candidates = extract_osz_sequence_candidates(page)
+    if not candidates:
+        return []
+
+    expected_num = normalize_numeric(expected_value)
+    actual_num = normalize_numeric(actual_value)
+
+    ranked = []
+    for candidate in candidates:
+        items = candidate.get("items", [])
+        if len(items) < index:
+            continue
+        item = items[index - 1]
+        value = normalize_numeric(item.get("value", ""))
+        score = float(candidate.get("score", 0.0))
+        if actual_num is not None and value == actual_num:
+            score += 45.0
+        if expected_num is not None and value == expected_num:
+            score += 35.0
+        # Prefer a genuinely long sequence over short random numeric runs.
+        score += min(35.0, len(items) * 2.5)
+        ranked.append((score, item))
+
+    if not ranked:
+        return []
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    item = ranked[0][1]
+    return [_boxes_from_words([item])[0]] if _boxes_from_words([item]) else []
 
 
 def _score_osz_sequence(items, orientation):
@@ -6276,19 +6949,147 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Full artwork pages are shown below. OCR-detected comparison text is highlighted directly on the original artwork."
+                "Visual evidence is mapped from the same comparison result used for PASS/FAIL. "
+                "Only numbered markers are placed on the artwork; field details remain outside the artwork."
             )
-            for page in visual_pages:
-                page_num = page.get("page")
-                page_report = report[report["PDF PAGE"] == page_num] if "PDF PAGE" in report.columns else report.iloc[0:0]
-                highlighted = build_highlighted_page_image(
-                    page,
-                    page_report,
-                    field_colors=field_colors,
+
+            page_numbers = [int(page.get("page", 0)) for page in visual_pages]
+            if len(page_numbers) > 1:
+                selected_visual_page = st.selectbox(
+                    "Artwork Page",
+                    options=page_numbers,
+                    index=0,
+                    format_func=lambda value: f"Artwork Page {value}",
+                    key=f"of_visual_page_selector_{st.session_state['of_reset_id']}",
                 )
+            else:
+                selected_visual_page = page_numbers[0]
+
+            selected_visual_page_data = next(
+                (page for page in visual_pages if int(page.get("page", 0)) == int(selected_visual_page)),
+                visual_pages[0],
+            )
+            page_report = report[report["PDF PAGE"] == selected_visual_page] if "PDF PAGE" in report.columns else report.iloc[0:0]
+
+            visual_zoom = st.slider(
+                "Visual scale",
+                min_value=50,
+                max_value=150,
+                value=90,
+                step=5,
+                format="%d%%",
+                key=f"of_visual_zoom_{st.session_state['of_reset_id']}",
+            )
+
+            highlighted = build_highlighted_page_image(
+                selected_visual_page_data,
+                page_report,
+                field_colors=field_colors,
+            )
+
+            visual_col, findings_col = st.columns([2.25, 1], gap="large")
+
+            with visual_col:
                 if highlighted is not None:
-                    st.markdown(f"**Artwork Page {page_num}**")
-                    st.image(highlighted, width=620)
+                    display_image = highlighted
+                    if visual_zoom != 100:
+                        new_width = max(200, int(display_image.width * visual_zoom / 100.0))
+                        new_height = max(200, int(display_image.height * visual_zoom / 100.0))
+                        display_image = display_image.resize(
+                            (new_width, new_height),
+                            Image.Resampling.LANCZOS,
+                        )
+                    st.image(display_image, width="stretch")
+
+                    st.caption(
+                        "Numbered markers correspond to the Field / Status entries in the Visual Findings panel."
+                    )
+                else:
+                    st.warning("Visual evidence could not be rendered for this artwork page.")
+
+            with findings_col:
+                st.markdown("### Visual Findings")
+
+                page_checks = []
+                for _, row in page_report.iterrows():
+                    status = str(row.get("STATUS", "")).strip().upper()
+                    if status not in {"PASS", "FAIL"}:
+                        continue
+                    field = str(row.get("FIELD", "")).strip()
+                    if not field:
+                        continue
+
+                    expected = str(row.get("ORDER FORM DATA", "") or "").strip()
+                    actual = str(row.get("PDF OUTPUT", "") or "").strip()
+                    evidence = _visual_find_field_boxes(
+                        selected_visual_page_data,
+                        field,
+                        expected,
+                        actual,
+                        status,
+                    )
+                    page_checks.append({
+                        "field": field,
+                        "status": status,
+                        "number": next((i + 1 for i, f in enumerate(report_fields) if f == field), ""),
+                        "expected": expected,
+                        "actual": actual,
+                        "difference": str(row.get("DIFFERENCE", "") or "").strip(),
+                        "has_visual": bool(evidence),
+                    })
+
+                if not page_checks:
+                    st.info("No PASS/FAIL checks are associated with this page.")
+                else:
+                    # FAIL first, then PASS, while retaining field order within each status.
+                    page_checks.sort(key=lambda item: (0 if item["status"] == "FAIL" else 1, item["number"]))
+
+                    for item in page_checks:
+                        field = item["field"]
+                        status = item["status"]
+                        rgb = field_colors.get(field, FIELD_VISUAL_COLORS[0])
+                        status_label = "FAIL" if status == "FAIL" else "PASS"
+                        marker = "🔴" if status == "FAIL" else "🟢"
+                        evidence_label = "visual mapped" if item["has_visual"] else "visual location unavailable"
+
+                        with st.container(border=True):
+                            st.markdown(
+                                f"**{item['number']}. {field}**  {marker} **{status_label}**",
+                                unsafe_allow_html=False,
+                            )
+                            st.caption(evidence_label)
+
+                            if status == "FAIL":
+                                st.markdown(
+                                    f"**Expected:** {item['expected'] or '—'}\n\n"
+                                    f"**Found:** {item['actual'] or '—'}\n\n"
+                                    f"**Difference:** {item['difference'] or '—'}"
+                                )
+                            else:
+                                st.markdown(
+                                    f"**Matched:** {item['actual'] or item['expected'] or '—'}"
+                                )
+
+                    mapped_count = sum(1 for item in page_checks if item["has_visual"])
+                    st.caption(
+                        f"Visual evidence coverage: {mapped_count}/{len(page_checks)} PASS/FAIL field(s) mapped on this page."
+                    )
+
+            # Compact legend below the viewer.
+            legend_items = []
+            for field in report_fields:
+                if field in set(page_report.get("FIELD", [])):
+                    color = field_colors.get(field, FIELD_VISUAL_COLORS[0])
+                    legend_items.append(
+                        f'<span style="display:inline-flex;align-items:center;margin-right:12px;">'
+                        f'<span style="display:inline-block;width:10px;height:10px;border-radius:50%;'
+                        f'background:{color};margin-right:5px;"></span>{field}</span>'
+                    )
+            if legend_items:
+                st.markdown(
+                    "<div style='margin-top:8px;line-height:1.8;'>" + "".join(legend_items) + "</div>",
+                    unsafe_allow_html=True,
+                )
 
         with st.expander("ℹ️ How this validation works"):
             st.write(
