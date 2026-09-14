@@ -29,7 +29,6 @@ try:
     from .order_form_output_check import (
         AUTO_DETECT_ENGINE_VERSION as TOOL1_ENGINE_VERSION,
         _apply_tool_css as _apply_tool1_css,
-        _visual_find_field_boxes,
         build_report,
         check_field,
         extract_output_pages,
@@ -46,7 +45,6 @@ except Exception:
     from order_form_output_check import (
         AUTO_DETECT_ENGINE_VERSION as TOOL1_ENGINE_VERSION,
         _apply_tool_css as _apply_tool1_css,
-        _visual_find_field_boxes,
         build_report,
         check_field,
         extract_output_pages,
@@ -60,7 +58,7 @@ except Exception:
         auto_detect_fields,
     )
 
-TOOL3_VERSION = "2026-09-13-TOOL3-UX-EVIDENCE-LOCKED-TRUE-OVERLAY-V5"
+TOOL3_VERSION = "2026-09-14-TOOL3-FIVE-STAGE-WIZARD-TOOL1-LINKED-V6"
 
 # -------------------------------- palette ----------------------------------
 BLUE = "#2563eb"
@@ -686,10 +684,23 @@ def _visual_boxes_for_result(output_page, row):
         if scalar_contains:
             return scalar_contains[:1]
 
-    try:
-        boxes = _visual_find_field_boxes(output_page, field, expected, actual, status)
-    except Exception:
-        boxes=[]
+    # Final semantic fallback: search the Tool 1-reported actual value using the
+    # current page's PDF text/OCR coordinates. We intentionally do not maintain
+    # a second field-matching engine here.
+    semantic_targets = []
+    if actual and actual.casefold() not in {"not found", "-", "—"}:
+        semantic_targets.append(actual)
+    if expected and expected.casefold() not in {"not found", "-", "—"}:
+        semantic_targets.append(expected)
+
+    boxes = []
+    for target in semantic_targets:
+        boxes = _direct_text_boxes(output_page, target)
+        if boxes:
+            break
+        boxes = _ocr_contains_scalar_boxes(output_page, target)
+        if boxes:
+            break
     cleaned=[]
     for b in boxes or []:
         try:
@@ -720,37 +731,52 @@ def _merge_evidence_boxes(boxes, gap=10):
     return out
 
 
+def _visible_text_exact(reference, actual):
+    """Exact visible-text equality for STATIC classification.
+
+    Unlike Tool 1's case-insensitive validation, ORG STATIC classification is
+    intentionally strict: case and punctuation are part of the visible baseline.
+    """
+    def canon(value):
+        value = unicodedata.normalize("NFKC", str(value or "")).strip()
+        value = re.sub(r"\s+", " ", value)
+        return value
+    return bool(canon(reference)) and canon(reference) == canon(actual)
+
+
 def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
-    """Create one variable evidence object per Tool 1 result and lock it."""
+    """Build one visual evidence object per Tool 1 result.
+
+    Decision order:
+      1. Tool 1 decides whether the Order Form field is PASS/FAIL.
+      2. If the same visible Output occurrence exactly matches the registered ORG
+         occurrence in case + punctuation + wording + position, it is STATIC.
+      3. Otherwise it is VARIABLE and Tool 3 applies ORG presentation rules.
+      4. Physical Output/ORG evidence is locked so later fields cannot reuse it.
+    """
     rows_by_page = _result_rows_by_page(report)
     all_evidence = []
+
     for idx, out_page in enumerate(output_pages):
-        page_no = int(out_page.get("page", idx+1))
+        page_no = int(out_page.get("page", idx + 1))
         page_rows = rows_by_page.get(page_no, [])
-        locked_out = []
-        locked_org = set()
         org_page = org_pages[idx] if idx < len(org_pages) else None
         reg = _register(org_page, out_page) if org_page else None
         reg_org_blocks = _registered_org_blocks(org_page, reg) if reg else []
+        output_blocks = _blocks(out_page)
+
+        locked_out = []
+        locked_org = set()
 
         for seq, row in enumerate(page_rows, start=1):
-            field = str(row.get("FIELD", ""))
-            status = str(row.get("STATUS", ""))
-            if not field or status not in {"PASS", "FAIL"}:
+            field = str(row.get("FIELD", "")).strip()
+            base_status = str(row.get("STATUS", "")).strip()
+            if not field or base_status not in {"PASS", "FAIL"}:
                 continue
-            boxes = _merge_evidence_boxes(_visual_boxes_for_result(out_page, row), gap=10)
 
-            # Do not visually count the same physical occurrence twice. Tool 1 may
-            # legitimately return multiple Excel columns with the same semantic
-            # value (for example canonical + helper composition columns). The first
-            # field claims the physical evidence; later overlapping fields become
-            # linked aliases rather than creating another highlight.
-            overlap_alias = bool(boxes and locked_out and all(_intersects_locked(box, locked_out, threshold=.45) for box in boxes))
-            if overlap_alias:
-                boxes = []
-            else:
-                for box in boxes:
-                    locked_out.append(box)
+            expected = str(row.get("ORDER FORM DATA", "") or "")
+            actual = str(row.get("PDF OUTPUT", "") or "")
+            boxes = _merge_evidence_boxes(_visual_boxes_for_result(out_page, row), gap=10)
 
             combined_box = None
             if boxes:
@@ -759,50 +785,170 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
                     max(b[2] for b in boxes), max(b[3] for b in boxes)
                 )
 
+            # Find the registered ORG region nearest to the Tool 1 evidence.
             org_idx = None
             org_block = None
             if combined_box and reg_org_blocks:
                 org_idx, org_block = _block_near_box(reg_org_blocks, combined_box, locked_org)
+
+            # Find the exact Output block corresponding to the evidence box.
+            output_block = None
+            if combined_box and output_blocks:
+                out_idx, output_block = _block_near_box(output_blocks, combined_box)
+                if output_block is None:
+                    output_block = {
+                        "text": actual or expected,
+                        "bbox": combined_box,
+                        "cx": (combined_box[0] + combined_box[2]) / 2,
+                        "cy": (combined_box[1] + combined_box[3]) / 2,
+                    }
+
+            # ---------------------------------------------------------------
+            # STATIC FIRST
+            # ---------------------------------------------------------------
+            static_exact = False
+            static_score = None
+            if org_block and output_block and _visible_text_exact(org_block.get("text", ""), output_block.get("text", "")):
+                try:
+                    static_score = _exact_static_score(
+                        org_block,
+                        output_block,
+                        max(1, int(out_page.get("image_width", 1))),
+                        max(1, int(out_page.get("image_height", 1))),
+                    )
+                except Exception:
+                    static_score = None
+                static_exact = static_score is not None
+
+            if static_exact:
+                status = "STATIC"
+                classification = "STATIC"
+                presentation_status = "PASS"
+                presentation_reason = "Output exactly follows the ORG wording, case and punctuation at the registered location."
+                difference = "Static ORG match."
+                shared_evidence = False
+                evidence_boxes = boxes
+                locked = bool(boxes) or org_idx is not None
+
+                if evidence_boxes:
+                    for b in evidence_boxes:
+                        locked_out.append(b)
                 if org_idx is not None:
                     locked_org.add(org_idx)
 
-            # HTL/Other presentation checks happen here because Tool 1 answers
-            # variable-data truth, while Tool 3 answers ORG presentation truth.
-            presentation_status, presentation_reason = _presentation_for_variable(
-                org_block, str(row.get("PDF OUTPUT", "")), product_type
+                all_evidence.append({
+                    "page": page_no,
+                    "field": field,
+                    "field_type": get_field_type(field),
+                    "region": get_field_region(field),
+                    "expected": expected,
+                    "actual": actual,
+                    "base_status": base_status,
+                    "status": status,
+                    "classification": classification,
+                    "difference": difference,
+                    "match_type": row.get("MATCH TYPE", row.get("match_type", "")),
+                    "boxes": evidence_boxes,
+                    "shared_evidence": shared_evidence,
+                    "org_index": org_idx,
+                    "org_block": org_block,
+                    "output_block": output_block,
+                    "locked": locked,
+                    "source": "Tool 1 + ORG exact",
+                    "sequence": seq,
+                    "presentation_status": presentation_status,
+                    "presentation_reason": presentation_reason,
+                })
+                continue
+
+            # ---------------------------------------------------------------
+            # VARIABLE / SHARED EVIDENCE
+            # ---------------------------------------------------------------
+            overlap_alias = bool(
+                boxes and locked_out and
+                all(_intersects_locked(box, locked_out, threshold=.45) for box in boxes)
             )
-            final_status = status
-            difference = str(row.get("DIFFERENCE", "—") or "—")
+            evidence_boxes = [] if overlap_alias else boxes
+            if evidence_boxes:
+                for b in evidence_boxes:
+                    locked_out.append(b)
+
             if overlap_alias:
-                difference = (difference if difference != "—" else "") + " Shared physical evidence is locked to another detected Order Form field."
-                difference = difference.strip()
-            if status == "PASS" and product_type in {"HTL", "Other"}:
-                if presentation_status == "FAIL":
-                    final_status = "FAIL"
-                    difference = (difference + " " + presentation_reason).strip()
-                elif presentation_status == "REVIEW":
-                    final_status = "REVIEW"
-                    difference = presentation_reason
+                # If a second field points at the same physical occurrence, it is
+                # linked to the existing evidence instead of drawing a second tag.
+                shared_owner = None
+                for previous in reversed(all_evidence):
+                    if previous.get("page") != page_no:
+                        continue
+                    for pb in previous.get("boxes", []):
+                        if any(_iou(pb, nb) >= .45 for nb in boxes):
+                            shared_owner = previous.get("field")
+                            break
+                    if shared_owner:
+                        break
+                difference_prefix = f"Shared evidence with {shared_owner}. " if shared_owner else "Shared physical evidence. "
+            else:
+                difference_prefix = ""
+
+            combined_for_org = None
+            if evidence_boxes:
+                combined_for_org = (
+                    min(b[0] for b in evidence_boxes), min(b[1] for b in evidence_boxes),
+                    max(b[2] for b in evidence_boxes), max(b[3] for b in evidence_boxes)
+                )
+            elif combined_box:
+                combined_for_org = combined_box
+
+            # Find the ORG block without consuming already-locked ORG evidence.
+            org_idx = None
+            org_block = None
+            if combined_for_org and reg_org_blocks:
+                org_idx, org_block = _block_near_box(reg_org_blocks, combined_for_org, locked_org)
+
+            presentation_status, presentation_reason = _presentation_for_variable(
+                org_block, actual, product_type
+            )
+            final_status = base_status
+            difference = str(row.get("DIFFERENCE", "—") or "—")
+            if presentation_status == "FAIL" and base_status == "PASS" and product_type in {"HTL", "Other"}:
+                final_status = "FAIL"
+                difference = (difference + " " + presentation_reason).strip()
+            elif presentation_status == "REVIEW" and base_status == "PASS" and product_type in {"HTL", "Other"}:
+                final_status = "REVIEW"
+                difference = presentation_reason
+
+            if difference_prefix:
+                difference = difference_prefix + difference
+
+            locked = bool(evidence_boxes) or org_idx is not None
+            if org_idx is not None:
+                locked_org.add(org_idx)
 
             all_evidence.append({
                 "page": page_no,
                 "field": field,
                 "field_type": get_field_type(field),
                 "region": get_field_region(field),
-                "expected": str(row.get("ORDER FORM DATA", "") or ""),
-                "actual": str(row.get("PDF OUTPUT", "") or ""),
-                "base_status": status,
+                "expected": expected,
+                "actual": actual,
+                "base_status": base_status,
                 "status": final_status,
+                "classification": "VARIABLE",
                 "difference": difference,
                 "match_type": row.get("MATCH TYPE", row.get("match_type", "")),
-                "boxes": boxes,
+                "boxes": evidence_boxes,
                 "shared_evidence": overlap_alias,
+                "shared_owner": shared_owner if overlap_alias else None,
                 "org_index": org_idx,
                 "org_block": org_block,
-                "locked": bool(boxes) or org_idx is not None,
+                "output_block": output_block,
+                "locked": locked,
                 "source": "Tool 1",
                 "sequence": seq,
+                "presentation_status": presentation_status,
+                "presentation_reason": presentation_reason,
             })
+
     return all_evidence
 
 
@@ -852,20 +998,37 @@ def _presentation_for_variable(org_block, actual, product_type):
 
 
 def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence):
+    """Classify remaining ORG blocks after variable/static field evidence is locked."""
     locked_output = defaultdict(list)
     locked_org = defaultdict(set)
-    for ev in variable_evidence:
-        for b in ev.get("boxes", []):
-            locked_output[ev["page"]].append(b)
-        if ev.get("org_index") is not None:
-            locked_org[ev["page"]].add(ev["org_index"])
-
     static_matches = []
-    unaccounted = []
     registrations = []
+    unaccounted = []
+
+    # First lock evidence that was itself proven to be an exact ORG STATIC field.
+    for ev in variable_evidence:
+        if ev.get("classification") != "STATIC":
+            continue
+        page_no = int(ev.get("page", 1))
+        for b in ev.get("boxes", []):
+            locked_output[page_no].append(b)
+        if ev.get("org_index") is not None:
+            locked_org[page_no].add(ev["org_index"])
+        if ev.get("org_block") and ev.get("output_block"):
+            static_matches.append({
+                "page": page_no,
+                "org": ev["org_block"],
+                "output": ev["output_block"],
+                "org_index": ev.get("org_index"),
+                "output_index": ev.get("output_block", {}).get("index"),
+                "status": "STATIC",
+                "classification": "STATIC",
+                "score": 1.0,
+                "field": ev.get("field"),
+            })
 
     for idx, out_page in enumerate(output_pages):
-        page_no = int(out_page.get("page", idx+1))
+        page_no = int(out_page.get("page", idx + 1))
         org_page = org_pages[idx] if idx < len(org_pages) else None
         if not org_page:
             continue
@@ -873,6 +1036,7 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
         if not reg:
             continue
         registrations.append((page_no, reg))
+
         matches = _match_static(
             org_page,
             out_page,
@@ -881,10 +1045,16 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
             locked_org.get(page_no, set()),
         )
         for m in matches:
+            # Avoid duplicate ORG index records if the same exact static evidence
+            # was already claimed by a variable field classified as STATIC.
+            if m.get("org_index") in locked_org.get(page_no, set()):
+                continue
             static_matches.append({
                 "page": page_no,
                 "org": m["org"],
                 "output": m["output"],
+                "org_index": m.get("org_index"),
+                "output_index": m.get("output_index"),
                 "status": "STATIC",
                 "classification": "STATIC",
                 "score": m["score"],
@@ -892,27 +1062,26 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
             locked_output[page_no].append(m["output"]["bbox"])
             locked_org[page_no].add(m["org_index"])
 
-        # Remaining ORG blocks are candidates for missing/unaccounted only if the
-        # same registered position is not occupied by any variable evidence or
-        # static evidence. We deliberately ignore tiny/metadata noise blocks.
         org_blocks = _registered_org_blocks(org_page, reg)
         out_blocks = _blocks(out_page)
-        static_org_idx = {m["org_index"] for m in matches}
-        variable_org_idx = locked_org.get(page_no, set()) - static_org_idx
+        static_org_idx = set(locked_org.get(page_no, set()))
         for oi, ob in enumerate(org_blocks):
-            if oi in static_org_idx or oi in variable_org_idx or len(ob["compact"]) < 2:
+            if oi in static_org_idx or len(ob.get("compact", "")) < 2:
                 continue
-            nearby = False
+
+            occupied = False
             for ub in out_blocks:
                 if _intersects_locked(ub["bbox"], locked_output.get(page_no, []), threshold=.10):
-                    nearby = True
+                    occupied = True
                     break
-            if nearby:
+            if occupied:
                 continue
-            # Only flag meaningful OCR blocks that are clearly inside the ORG
-            # content boundary. This prevents white-margin noise being called missing.
+
             obb = ob["bbox"]
-            if reg["output_bbox"][0] <= obb[0] <= reg["output_bbox"][2] and reg["output_bbox"][1] <= obb[1] <= reg["output_bbox"][3]:
+            if (
+                reg["output_bbox"][0] <= obb[0] <= reg["output_bbox"][2]
+                and reg["output_bbox"][1] <= obb[1] <= reg["output_bbox"][3]
+            ):
                 unaccounted.append({
                     "page": page_no,
                     "field": "ORG Element",
@@ -923,6 +1092,7 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                     "org": ob,
                     "output": None,
                 })
+
     return static_matches, unaccounted, registrations
 
 
@@ -952,7 +1122,7 @@ def _draw_visual_evidence(page, variable_evidence, static_matches, selected_fiel
         draw.rounded_rectangle(tuple(map(int,b)), radius=4, fill=_rgba(YELLOW,70), outline=_rgba(YELLOW,235), width=2)
         entries.append((b, f"S{idx}", "STATIC", YELLOW))
 
-    vars_page = [x for x in variable_evidence if x["page"] == page_no and x.get("status") in {"PASS","FAIL","REVIEW"}]
+    vars_page = [x for x in variable_evidence if x["page"] == page_no and x.get("classification", "VARIABLE") == "VARIABLE" and x.get("status") in {"PASS","FAIL","REVIEW"}]
     number_map = {x["field"]: i+1 for i,x in enumerate(variable_evidence)}
     occupied = []
     for ev in vars_page:
@@ -1174,10 +1344,11 @@ def _render_field_browser(all_fields, selected_fields, evidence, key_prefix):
 
 
 def _overall(evidence, static_matches, unaccounted):
-    fails=sum(1 for e in evidence if e["status"]=="FAIL")
-    reviews=sum(1 for e in evidence if e["status"]=="REVIEW")
+    variable = [e for e in evidence if e.get("classification") == "VARIABLE"]
+    fails=sum(1 for e in variable if e["status"]=="FAIL")
+    reviews=sum(1 for e in variable if e["status"]=="REVIEW")
     overall="FAIL" if fails or unaccounted else "REVIEW" if reviews else "PASS"
-    return overall, len(static_matches), sum(1 for e in evidence if e["status"] in {"PASS","FAIL","REVIEW"}), fails, reviews, len(unaccounted)
+    return overall, len(static_matches), len([e for e in variable if e["status"] in {"PASS","FAIL","REVIEW"}]), fails, reviews, len(unaccounted)
 
 
 def _evidence_dataframe(evidence, static_matches, unaccounted):
@@ -1185,9 +1356,9 @@ def _evidence_dataframe(evidence, static_matches, unaccounted):
     for e in evidence:
         org=e.get("org_block",{}).get("text", "Not mapped") if e.get("org_block") else "Not mapped"
         rows.append({
-            "PDF PAGE":e["page"],"Element / Field":e["field"],"Type":"VARIABLE","ORG Spec":org,
+            "PDF PAGE":e["page"],"Element / Field":e["field"],"Type":e.get("classification", "VARIABLE"),"ORG Spec":org,
             "Output":e["actual"],"Order Form":e["expected"],"Status":e["status"],
-            "Evidence Locked":"YES" if e.get("locked") else "NO","Source":"Tool 1","Notes":e["difference"],
+            "Evidence Locked":"YES" if e.get("locked") else "NO","Source":e.get("source", "Tool 1"),"Notes":e["difference"],
         })
     for m in static_matches:
         rows.append({
@@ -1248,229 +1419,624 @@ def _build_excel_report(result):
 
 
 # ============================================================================
-# Main
+# ============================================================================
+# WIZARD UI HELPERS
+# ============================================================================
+
+
+def _safe_page_numbers(pages):
+    return [int(p.get("page", i + 1)) for i, p in enumerate(pages or [])]
+
+
+def _status_counts(evidence, static_matches, unaccounted):
+    variable = [e for e in evidence if e.get("classification") == "VARIABLE"]
+    return {
+        "static": len(static_matches),
+        "variable": len(variable),
+        "pass": sum(1 for e in variable if e.get("status") == "PASS"),
+        "fail": sum(1 for e in variable if e.get("status") == "FAIL"),
+        "review": sum(1 for e in variable if e.get("status") == "REVIEW"),
+        "unaccounted": len(unaccounted),
+    }
+
+
+def _run_tool3_pipeline(result, selected_fields=None):
+    """Re-run Tool 1 + Tool 3 enrichment without duplicating Tool 1 rules."""
+    selected = list(selected_fields if selected_fields is not None else result["selected_fields"])
+    df = result["df"]
+    output_pages = result["output_pages"]
+    org_pages = result["org_pages"]
+    product = result["product_type"]
+    mapping = result["mapping"]
+
+    report = _tool1_variable_results(df, output_pages, selected, product, mapping)
+    evidence = _build_variable_evidence(df, output_pages, org_pages, report, product)
+    static_matches, unaccounted, registrations = _classify_static_and_unaccounted(
+        org_pages, output_pages, evidence
+    )
+    summary = _overall(evidence, static_matches, unaccounted)
+    annotated_images = {
+        int(p.get("page", i + 1)): _draw_visual_evidence(
+            p, evidence, static_matches
+        )
+        for i, p in enumerate(output_pages)
+    }
+
+    result.update({
+        "selected_fields": selected,
+        "report": report,
+        "evidence": evidence,
+        "static_matches": static_matches,
+        "unaccounted": unaccounted,
+        "registrations": registrations,
+        "summary": summary,
+        "annotated_images": annotated_images,
+    })
+    return result
+
+
+def _prepare_run(order_file, org_file, output_file, product_type):
+    df = pd.read_csv(order_file) if str(order_file.name).lower().endswith(".csv") else load_excel(order_file)
+    if df.empty:
+        raise ValueError("The Order Form contains no usable data rows.")
+
+    org_pages = extract_output_pages(org_file)
+    output_pages = extract_output_pages(output_file)
+    if not org_pages:
+        raise ValueError("The ORG Spec could not be read.")
+    if not output_pages:
+        raise ValueError("The Output artwork could not be read.")
+
+    mapping = _page_row_mapping(df, output_pages)
+    detected = _tool1_auto_detect(df, output_pages, product_type, mapping)
+    all_fields = [f for f in get_available_fields(df) if not is_admin_field(f)]
+
+    result = {
+        "df": df,
+        "org_pages": org_pages,
+        "output_pages": output_pages,
+        "mapping": mapping,
+        "all_fields": all_fields,
+        "detected_fields": list(detected),
+        "selected_fields": list(detected),
+        "confirmed_fields": set(),
+        "product_type": product_type,
+        "files": {
+            "order": getattr(order_file, "name", "Order Form"),
+            "org": getattr(org_file, "name", "ORG Spec"),
+            "output": getattr(output_file, "name", "Output"),
+        },
+    }
+    return _run_tool3_pipeline(result, detected)
+
+
+def _render_field_detection_table(result, stage, show_full=True):
+    """Render a full scrollable field list without relying on Streamlit chips."""
+    fields = list(result.get("selected_fields", []))
+    evidence = {e["field"]: e for e in result.get("evidence", [])}
+    query = st.text_input(
+        "Search fields, family or value",
+        placeholder="Try: care, fiber, country, size, RN, barcode...",
+        key=f"t3_field_search_{stage}",
+    )
+    filtered = _filter_fields(fields, query)
+
+    if not filtered:
+        st.info("No selected fields match the current search.")
+        return
+
+    rows = []
+    for field in filtered:
+        ev = evidence.get(field)
+        classification = ev.get("classification", "VARIABLE") if ev else "VARIABLE"
+        status = ev.get("status", "AUTO") if ev else "AUTO"
+        if classification == "STATIC":
+            type_label = "STATIC"
+        else:
+            type_label = "VARIABLE"
+        rows.append({
+            "Field": field,
+            "Family": get_field_type(field),
+            "Region": get_field_region(field) or "—",
+            "Type": type_label,
+            "Status": status,
+            "Source": "AUTO" if field in result.get("detected_fields", []) else "MANUAL",
+            "Lock": "🔒" if ev and ev.get("locked") else "—",
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True,
+        height=430 if show_full else 280,
+        column_config={
+            "Field": st.column_config.TextColumn("Field", width="medium"),
+            "Family": st.column_config.TextColumn("Family", width="small"),
+            "Region": st.column_config.TextColumn("Region", width="small"),
+            "Type": st.column_config.TextColumn("Type", width="small"),
+            "Status": st.column_config.TextColumn("Status", width="small"),
+            "Source": st.column_config.TextColumn("Source", width="small"),
+            "Lock": st.column_config.TextColumn("Lock", width="small"),
+        },
+        key=f"t3_field_table_{stage}",
+    )
+
+
+def _render_stage_header(number, title, subtitle):
+    st.markdown(
+        f"<div class='t3-card' style='margin-bottom:10px'><div style='display:flex;align-items:center;gap:10px'>"
+        f"<div style='width:34px;height:34px;border-radius:50%;background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900'>{number}</div>"
+        f"<div><div class='t3-card-title' style='font-size:17px'>{html.escape(title)}</div>"
+        f"<div class='t3-card-sub'>{html.escape(subtitle)}</div></div></div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_visual_stage_preview(result, selected_field, selected_page, stage_key):
+    """Show Tool-1-style visual tagging for a selected field during Detect/Review."""
+    output_pages = result["output_pages"]
+    org_pages = result["org_pages"]
+    evidence = result.get("evidence", [])
+    static_matches = result.get("static_matches", [])
+    page_numbers = _safe_page_numbers(output_pages)
+    if not page_numbers:
+        return
+    if selected_page not in page_numbers:
+        selected_page = page_numbers[0]
+    idx = page_numbers.index(selected_page)
+    out_page = output_pages[idx]
+    org_page = org_pages[idx] if idx < len(org_pages) else None
+    annotated = _draw_visual_evidence(out_page, evidence, static_matches, selected_field=selected_field)
+    reg = _register(org_page, out_page) if org_page else None
+    raw_org = reg["org_image"] if reg else (Image.open(io.BytesIO(org_page["image_bytes"])).convert("RGB") if org_page and org_page.get("image_bytes") else None)
+    registered_org = _registered_org_image(reg) if reg else raw_org
+    out_img = Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB")
+
+    selected_ev = next((e for e in evidence if e["page"] == selected_page and e["field"] == selected_field), None)
+    focus = None
+    if selected_ev and selected_ev.get("boxes"):
+        boxes = selected_ev["boxes"]
+        focus = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+
+    st.components.v1.html(
+        _viewer_html(raw_org, registered_org, out_img, annotated or out_img, focus_box=focus, height=520),
+        height=540,
+        scrolling=False,
+    )
+
+    if selected_ev:
+        st.markdown(
+            f"<div class='t3-role'><b>{html.escape(selected_field)}</b> • "
+            f"{_status_badge(selected_ev.get('status','INFO'))} &nbsp; "
+            f"{_status_badge(selected_ev.get('classification','VARIABLE'))} &nbsp; "
+            f"{'🔒 Evidence locked' if selected_ev.get('locked') else 'Evidence needs review'}<br>"
+            f"<b>Order Form:</b> {html.escape(str(selected_ev.get('expected','')))}<br>"
+            f"<b>Output:</b> {html.escape(str(selected_ev.get('actual','')))}<br>"
+            f"<b>Finding:</b> {html.escape(str(selected_ev.get('difference','—')))}</div>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_navigation(back_step=None, next_label="Next", next_key=None, next_disabled=False):
+    left, right = st.columns([1, 1])
+    with left:
+        if back_step is not None:
+            if st.button("← Back", width="stretch", key=f"{next_key}_back"):
+                st.session_state["t3_stage"] = back_step
+                st.rerun()
+    with right:
+        if st.button(f"{next_label} →", type="primary", width="stretch", key=next_key, disabled=next_disabled):
+            return True
+    return False
+
+
+# ============================================================================
+# Main — five-stage wizard
 # ============================================================================
 
 
 def main():
     _tool3_css()
-    if "t3_reset_id" not in st.session_state: st.session_state["t3_reset_id"]=0
-    if "t3_result" not in st.session_state: st.session_state["t3_result"]=None
-    if "t3_selected_fields" not in st.session_state: st.session_state["t3_selected_fields"]=[]
-    if "t3_focus_field" not in st.session_state: st.session_state["t3_focus_field"]=None
-    if "t3_mapping" not in st.session_state: st.session_state["t3_mapping"]={}
+
+    if "t3_reset_id" not in st.session_state:
+        st.session_state["t3_reset_id"] = 0
+    if "t3_stage" not in st.session_state:
+        st.session_state["t3_stage"] = 1
+    if "t3_result" not in st.session_state:
+        st.session_state["t3_result"] = None
+    if "t3_focus_field" not in st.session_state:
+        st.session_state["t3_focus_field"] = None
+    if "t3_confirmed_fields" not in st.session_state:
+        st.session_state["t3_confirmed_fields"] = set()
+
     if st.session_state.get("t3_version") != TOOL3_VERSION:
-        st.session_state["t3_result"]=None; st.session_state["t3_selected_fields"]=[]; st.session_state["t3_focus_field"]=None; st.session_state["t3_mapping"]={}; st.session_state["t3_version"]=TOOL3_VERSION
+        st.session_state["t3_stage"] = 1
+        st.session_state["t3_result"] = None
+        st.session_state["t3_focus_field"] = None
+        st.session_state["t3_confirmed_fields"] = set()
+        st.session_state["t3_version"] = TOOL3_VERSION
 
-    reset=st.session_state["t3_reset_id"]
+    reset = st.session_state["t3_reset_id"]
+    stage = int(st.session_state["t3_stage"])
+
     _render_top()
-    has_inputs=bool(st.session_state.get("t3_result"))
-    _render_stepper(4 if has_inputs else 1)
+    _render_stepper(stage)
 
-    # ------------------------------- upload cards -----------------------------
-    c1,c2,c3,c4=st.columns([1.2,1.2,1.2,1.0],gap="small")
-    with c1:
-        st.markdown("<div class='t3-card'><div class='t3-upload-icon'>📊</div><div class='t3-card-title'>1. Order Form</div><div class='t3-card-sub'>Source of variable data</div>",unsafe_allow_html=True)
-        order_file=st.file_uploader("Order Form",type=["xlsx","xls","csv"],label_visibility="collapsed",key=f"t3_order_{reset}")
-        if order_file: st.markdown(f"<div class='t3-fileline'>{html.escape(order_file.name)} ✓</div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-role'><b>Used for:</b> FIB / WC / RN / Size / COO / identifiers and other variable fields.</div></div>",unsafe_allow_html=True)
-    with c2:
-        st.markdown("<div class='t3-card'><div class='t3-upload-icon'>📐</div><div class='t3-card-title'>2. ORG Spec</div><div class='t3-card-sub'>Approved content + presentation baseline</div>",unsafe_allow_html=True)
-        org_file=st.file_uploader("ORG Spec",type=["pdf","jpg","jpeg","png"],label_visibility="collapsed",key=f"t3_org_{reset}")
-        if org_file: st.markdown(f"<div class='t3-fileline'>{html.escape(org_file.name)} ✓</div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-role'><b>Used for:</b> static content, wording, case, punctuation, position and layout reference.</div></div>",unsafe_allow_html=True)
-    with c3:
-        st.markdown("<div class='t3-card'><div class='t3-upload-icon'>🖼️</div><div class='t3-card-title'>3. Output</div><div class='t3-card-sub'>Final artwork to validate</div>",unsafe_allow_html=True)
-        output_file=st.file_uploader("Output",type=["pdf","jpg","jpeg","png"],label_visibility="collapsed",key=f"t3_output_{reset}")
-        if output_file: st.markdown(f"<div class='t3-fileline'>{html.escape(output_file.name)} ✓</div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-role'><b>Checked against:</b> ORG presentation + Tool 1 Order Form validation.</div></div>",unsafe_allow_html=True)
-    with c4:
-        st.markdown("<div class='t3-card'><div class='t3-card-title'>Product Type</div><div class='t3-card-sub'>Controls variable-data presentation rules</div>",unsafe_allow_html=True)
-        product=st.radio("Product Type",["PFL","HTL","Other"],horizontal=False,key=f"t3_product_{reset}")
-        ready=bool(order_file and org_file and output_file)
-        run=st.button("▶  Analyze & Run QC",type="primary",width="stretch",disabled=not ready,key=f"t3_run_{reset}")
-        st.markdown("<div class='t3-role'><b>PFL:</b> Order Form presentation. <b>HTL / Other:</b> ORG presentation baseline.</div></div>",unsafe_allow_html=True)
+    # ------------------------------------------------------------------
+    # Stage-specific input surface
+    # ------------------------------------------------------------------
+    if stage == 1:
+        st.markdown("<div class='t3-section-title'>Project Inputs</div>", unsafe_allow_html=True)
+        c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.05, .95], gap="small")
 
-    if run:
-        try:
-            with st.spinner("Linking Tool 1 comparison engine, analyzing ORG baseline, registering artwork and locking evidence…"):
-                df = pd.read_csv(order_file) if str(order_file.name).lower().endswith(".csv") else load_excel(order_file)
-                if df.empty: raise ValueError("The Order Form contains no usable data rows.")
-                org_pages=extract_output_pages(org_file); output_pages=extract_output_pages(output_file)
-                if not org_pages: raise ValueError("The ORG Spec could not be read.")
-                if not output_pages: raise ValueError("The Output artwork could not be read.")
-                mapping=_page_row_mapping(df,output_pages)
-                detected=_tool1_auto_detect(df,output_pages,product,mapping)
-                all_fields=[f for f in get_available_fields(df) if not is_admin_field(f)]
-                report=_tool1_variable_results(df,output_pages,detected,product,mapping)
-                evidence=_build_variable_evidence(df,output_pages,org_pages,report,product)
-                static_matches,unaccounted,registrations=_classify_static_and_unaccounted(org_pages,output_pages,evidence)
-                summary=_overall(evidence,static_matches,unaccounted)
-                annotated_images={}
-                for idx,p in enumerate(output_pages):
-                    page_no=int(p.get("page",idx+1))
-                    annotated_images[page_no]=_draw_visual_evidence(p,evidence,static_matches)
-                st.session_state["t3_result"]={
-                    "df":df,"org_pages":org_pages,"output_pages":output_pages,"mapping":mapping,
-                    "all_fields":all_fields,"detected_fields":detected,"selected_fields":detected,
-                    "report":report,"evidence":evidence,"static_matches":static_matches,"unaccounted":unaccounted,
-                    "registrations":registrations,"summary":summary,"annotated_images":annotated_images,
-                    "product_type":product,
-                    "files":{"order":order_file.name,"org":org_file.name,"output":output_file.name},
-                }
-                st.session_state["t3_selected_fields"]=detected
-                st.session_state["t3_focus_field"]=None
-            st.success(f"QC analysis completed using Tool 1 engine {TOOL1_ENGINE_VERSION}.")
+        with c1:
+            st.markdown("<div class='t3-card'><div class='t3-upload-icon'>📊</div><div class='t3-card-title'>Order Form</div><div class='t3-card-sub'>Source of variable data</div>", unsafe_allow_html=True)
+            order_file = st.file_uploader("Order Form", type=["xlsx", "xls", "csv"], label_visibility="collapsed", key=f"t3_order_{reset}")
+            if order_file:
+                st.markdown(f"<div class='t3-fileline'>{html.escape(order_file.name)} ✓</div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Used for:</b> variable fields such as FIB, WC, RN, COO, Size, Brand, Barcode, etc.</div></div>", unsafe_allow_html=True)
+
+        with c2:
+            st.markdown("<div class='t3-card'><div class='t3-upload-icon'>📐</div><div class='t3-card-title'>ORG Spec</div><div class='t3-card-sub'>Approved content + presentation baseline</div>", unsafe_allow_html=True)
+            org_file = st.file_uploader("ORG Spec", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed", key=f"t3_org_{reset}")
+            if org_file:
+                st.markdown(f"<div class='t3-fileline'>{html.escape(org_file.name)} ✓</div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Used for:</b> wording, case, punctuation, position, layout and static reference.</div></div>", unsafe_allow_html=True)
+
+        with c3:
+            st.markdown("<div class='t3-card'><div class='t3-upload-icon'>🖼️</div><div class='t3-card-title'>Output</div><div class='t3-card-sub'>Final artwork to validate</div>", unsafe_allow_html=True)
+            output_file = st.file_uploader("Output", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed", key=f"t3_output_{reset}")
+            if output_file:
+                st.markdown(f"<div class='t3-fileline'>{html.escape(output_file.name)} ✓</div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Checked against:</b> ORG baseline + Tool 1 Order Form validation.</div></div>", unsafe_allow_html=True)
+
+        with c4:
+            st.markdown("<div class='t3-card'><div class='t3-card-title'>Product Type</div><div class='t3-card-sub'>Controls variable-data presentation behavior</div>", unsafe_allow_html=True)
+            product = st.radio("Product Type", ["PFL", "HTL", "Other"], horizontal=True, key=f"t3_product_{reset}")
+            st.markdown("<div class='t3-role'><b>PFL:</b> Order Form presentation. <b>HTL / Other:</b> ORG presentation baseline.</div></div>", unsafe_allow_html=True)
+
+        ready = bool(order_file and org_file and output_file)
+        if not ready:
+            st.info("Upload Order Form, ORG Spec and Output to start the five-stage QC workflow.")
+    else:
+        result_preview = st.session_state.get("t3_result")
+        if not result_preview:
+            st.session_state["t3_stage"] = 1
             st.rerun()
-        except Exception as exc:
-            st.error(f"QC could not be started: {exc}")
+            return
+        product = result_preview["product_type"]
+        order_name = result_preview["files"].get("order", "Order Form")
+        org_name = result_preview["files"].get("org", "ORG Spec")
+        output_name = result_preview["files"].get("output", "Output")
+        st.markdown(
+            f"<div class='t3-card' style='margin-bottom:10px'><div style='display:flex;gap:7px;flex-wrap:wrap;align-items:center'>"
+            f"<span class='t3-badge' style='background:#dcfce7;color:#15803d'>✓ Order Form</span><span style='font-size:9px;color:#64748b'>{html.escape(order_name)}</span>"
+            f"<span style='color:#cbd5e1'>•</span><span class='t3-badge' style='background:#e0e7ff;color:#4338ca'>✓ ORG Spec</span><span style='font-size:9px;color:#64748b'>{html.escape(org_name)}</span>"
+            f"<span style='color:#cbd5e1'>•</span><span class='t3-badge' style='background:#dbeafe;color:#1e40af'>✓ Output</span><span style='font-size:9px;color:#64748b'>{html.escape(output_name)}</span>"
+            f"<span style='margin-left:auto' class='t3-badge' style='background:#eff6ff;color:#1d4ed8'>Product: {html.escape(product)}</span>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        order_file = org_file = output_file = None
+        ready = True
 
-    result=st.session_state.get("t3_result")
-    if not result:
-        st.markdown("<div class='t3-hero-result'><div class='t3-hero-title'>Ready for QC</div><div class='t3-hero-sub'>Upload the Order Form, ORG Spec and Output. The tool will detect relevant Order Form fields using Tool 1, then register ORG to Output and prevent evidence from being counted twice.</div></div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-bottom-note'>Unified engine = one source of truth • Variable evidence is locked before static classification • Overlay uses one registered coordinate space</div>",unsafe_allow_html=True)
+    # ------------------------------------------------------------------
+    # STAGE 1 — Upload / initialize
+    # ------------------------------------------------------------------
+    if stage == 1:
+        _render_stage_header(1, "Upload Files & Select Product Type", "Provide the three source files and choose the product type before analysis starts.")
+        st.markdown(
+            "<div class='t3-hero-result'><div class='t3-hero-title'>What happens next?</div>"
+            "<div class='t3-hero-sub'>Tool 1 will detect relevant Order Form fields. Tool 3 will then analyze ORG structure, compare Output, lock evidence, and prepare the visual QC workspace.</div></div>",
+            unsafe_allow_html=True,
+        )
+        if _render_navigation(next_label="Start Auto Detect", next_key=f"t3_stage1_next_{reset}"):
+            try:
+                with st.spinner("Preparing files and running Tool 1 Auto Detect…"):
+                    result = _prepare_run(order_file, org_file, output_file, product)
+                    st.session_state["t3_result"] = result
+                    st.session_state["t3_confirmed_fields"] = set()
+                    st.session_state["t3_stage"] = 2
+                    st.session_state["t3_focus_field"] = result["selected_fields"][0] if result["selected_fields"] else None
+                st.rerun()
+            except Exception as exc:
+                st.error(f"QC setup could not be completed: {exc}")
         return
 
-    # ------------------------------- field review -----------------------------
-    df=result["df"]; org_pages=result["org_pages"]; output_pages=result["output_pages"]
-    page_numbers=[int(p.get("page",i+1)) for i,p in enumerate(output_pages)]
+    result = st.session_state.get("t3_result")
+    if not result:
+        st.session_state["t3_stage"] = 1
+        st.rerun()
+        return
 
-    st.markdown("<div class='t3-section-title'>2. Auto Detect Fields</div>",unsafe_allow_html=True)
-    st.markdown(f"<div class='t3-section-note'>Tool 1 detected <b>{len(result['detected_fields'])}</b> fields. Review them before comparison. Search by field name, family or semantic type.</div>",unsafe_allow_html=True)
-    result["selected_fields"]=_render_field_browser(result["all_fields"],result.get("selected_fields",result["detected_fields"]),result["evidence"],f"t3_fields_{reset}")
-    st.session_state["t3_selected_fields"]=result["selected_fields"]
+    # ------------------------------------------------------------------
+    # STAGE 2 — Auto Detect + visual tagging
+    # ------------------------------------------------------------------
+    if stage == 2:
+        _render_stage_header(2, "Auto Detect Fields", "Review what Tool 1 detected and see the exact artwork regions before confirming them.")
+        counts = _status_counts(result["evidence"], result["static_matches"], result["unaccounted"])
+        stats = st.columns(4)
+        with stats[0]: st.markdown(f"<div class='t3-mini-stat'><b>{len(result['detected_fields'])}</b><span>Fields detected</span></div>", unsafe_allow_html=True)
+        with stats[1]: st.markdown(f"<div class='t3-mini-stat'><b>{sum(1 for e in result['evidence'] if e.get('locked'))}</b><span>Evidence mapped</span></div>", unsafe_allow_html=True)
+        with stats[2]: st.markdown(f"<div class='t3-mini-stat'><b>{counts['fail']}</b><span>Current fails</span></div>", unsafe_allow_html=True)
+        with stats[3]: st.markdown(f"<div class='t3-mini-stat'><b>{counts['review']}</b><span>Review items</span></div>", unsafe_allow_html=True)
 
-    # If the user edits the selection, rebuild all dependent result objects using
-    # Tool 1 and the same evidence/locking pipeline.
-    if result["selected_fields"] != result["detected_fields"]:
-        if st.button("↻ Recalculate Selected Fields",key=f"t3_recalc_{reset}"):
-            with st.spinner("Re-running Tool 1 comparison for the selected fields…"):
-                report=_tool1_variable_results(df,output_pages,result["selected_fields"],result["product_type"],result["mapping"])
-                evidence=_build_variable_evidence(df,output_pages,org_pages,report,result["product_type"])
-                static_matches,unaccounted,registrations=_classify_static_and_unaccounted(org_pages,output_pages,evidence)
-                result["report"]=report; result["evidence"]=evidence; result["static_matches"]=static_matches; result["unaccounted"]=unaccounted; result["registrations"]=registrations; result["summary"]=_overall(evidence,static_matches,unaccounted)
-                result["detected_fields"]=result["selected_fields"]
-                result["annotated_images"]={int(p.get('page',i+1)):_draw_visual_evidence(p,evidence,static_matches) for i,p in enumerate(output_pages)}
-                st.rerun()
-
-    st.markdown("<div class='t3-section-title'>3. Page Mapping</div>",unsafe_allow_html=True)
-    with st.expander("▾  Page Mapping",expanded=len(output_pages)>1):
-        opts=list(range(len(df))); labels=[f"Excel Row {i+2}" for i in opts]
-        for i,p in enumerate(output_pages):
-            pn=int(p.get("page",i+1)); old=int(result["mapping"].get(pn,min(i,len(df)-1)))
-            result["mapping"][pn]=st.selectbox(f"PDF Page {pn}",opts,index=max(0,min(old,len(df)-1)),format_func=lambda x,labels=labels:labels[x],key=f"t3_map_{reset}_{pn}")
-
-    # ------------------------------ comparison area --------------------------
-    overall,static_count,var_count,fail_count,review_count,unaccounted_count=result["summary"]
-    st.markdown("<div class='t3-section-title'>4. Comparison</div>",unsafe_allow_html=True)
-    tabs=st.tabs(["👁 Comparison View","☷ Details","▥ Summary"])
-
-    with tabs[0]:
-        top1,top2,top3=st.columns([1.1,2.2,1.0],gap="small")
-        with top1: selected_page=st.selectbox("Output Page",page_numbers,key=f"t3_view_page_{reset}")
-        with top2:
-            st.markdown(f"<div class='t3-mini-stat'><b>{overall}</b><span>{var_count} variable • {fail_count} fail • {static_count} static • {review_count} review</span></div>",unsafe_allow_html=True)
-        with top3:
-            if st.button("↻ Refresh View",key=f"t3_refresh_{reset}"):
-                result["annotated_images"]={int(p.get('page',i+1)):_draw_visual_evidence(p,result['evidence'],result['static_matches'],st.session_state.get('t3_focus_field')) for i,p in enumerate(output_pages)}
-                st.rerun()
-
-        idx=page_numbers.index(selected_page); out_page=output_pages[idx]; org_page=org_pages[idx] if idx<len(org_pages) else None
-        reg=_register(org_page,out_page) if org_page else None
-        raw_org=reg["org_image"] if reg else (Image.open(io.BytesIO(org_page["image_bytes"])).convert("RGB") if org_page and org_page.get("image_bytes") else None)
-        registered_org=_registered_org_image(reg) if reg else raw_org
-        out_img=Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB")
-        annotated=result["annotated_images"].get(selected_page)
-        focus=None
-        focus_field=st.session_state.get("t3_focus_field")
-        if focus_field:
-            for e in result["evidence"]:
-                if e["page"]==selected_page and e["field"]==focus_field and e.get("boxes"):
-                    focus=(min(b[0] for b in e["boxes"]),min(b[1] for b in e["boxes"]),max(b[2] for b in e["boxes"]),max(b[3] for b in e["boxes"]))
-                    break
-        st.components.v1.html(_viewer_html(raw_org,registered_org,out_img,annotated or out_img,focus_box=focus),height=700,scrolling=False)
-        if reg:
-            note=f"Registered ✓  Scale {reg['scale']:.3f}  X Offset {reg['tx']:.1f}  Y Offset {reg['ty']:.1f}"
-            if reg.get('warning'): note+=f"  •  {reg['warning']}"
-            st.caption(note)
-
-        left,right=st.columns([2.0,1.0],gap="small")
+        left, right = st.columns([1.15, 1.85], gap="small")
         with left:
-            st.markdown("<div class='t3-section-title'>Selected Finding</div>",unsafe_allow_html=True)
-            ev_page=[e for e in result["evidence"] if e["page"]==selected_page and e["status"] in {"PASS","FAIL","REVIEW"}]
-            if not ev_page:
-                st.info("No variable findings for this page.")
+            _render_field_detection_table(result, 2, show_full=True)
+            selected_options = result["selected_fields"]
+            if selected_options:
+                selected_field = st.selectbox("Inspect detected field", selected_options, index=max(0, selected_options.index(st.session_state.get("t3_focus_field")) if st.session_state.get("t3_focus_field") in selected_options else 0), key=f"t3_detect_field_{reset}")
+                st.session_state["t3_focus_field"] = selected_field
             else:
-                focus_current=st.session_state.get("t3_focus_field")
-                chosen=next((e for e in ev_page if e["field"]==focus_current),ev_page[0])
-                if focus_current!=chosen["field"]: st.session_state["t3_focus_field"]=chosen["field"]
-                cA,cB,cC=st.columns([1.1,1.1,1.4])
-                with cA:
-                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>{html.escape(chosen['field'])}</div><div style='margin-top:5px'>{_status_badge(chosen['status'])}</div><div class='t3-card-sub' style='margin-top:6px'>Type: {html.escape(chosen['field_type'])}<br>Region: {html.escape(str(chosen['region'] or '—'))}<br>Source: Tool 1<br>{'🔒 Evidence locked' if chosen['locked'] else 'Evidence not safely located'}{' • shared' if chosen.get('shared_evidence') else ''}</div></div>",unsafe_allow_html=True)
-                with cB:
-                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Values Comparison</div><div class='t3-card-sub' style='margin-top:7px'><b>Order Form</b><br>{html.escape(chosen['expected'])}<br><br><b>Output</b><br>{html.escape(chosen['actual'])}</div></div>",unsafe_allow_html=True)
-                with cC:
-                    reason=chosen['difference'] or 'No discrepancy.'
-                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Why did it {chosen['status'].lower()}?</div><div class='t3-card-sub' style='margin-top:7px'>{html.escape(reason)}</div></div>",unsafe_allow_html=True)
-                if chosen.get("boxes"):
-                    st.markdown(f"<div class='t3-role'><b>Visual Evidence:</b> Page {selected_page} • {len(chosen['boxes'])} evidence region(s) locked. Click a finding on the right to focus the viewer.</div>",unsafe_allow_html=True)
+                selected_field = None
+                st.warning("Auto Detect did not find a usable populated field. You can add fields manually in Step 3.")
+
         with right:
-            st.markdown("<div class='t3-section-title'>Findings</div>",unsafe_allow_html=True)
-            filter_choice=st.radio("Findings",["All","Fail","Review","Pass"],horizontal=True,key=f"t3_find_filter_{reset}_{selected_page}")
-            filtered=[e for e in ev_page if filter_choice=="All" or e["status"].lower()==filter_choice.lower()]
-            for e in filtered:
-                selected = e["field"]==st.session_state.get("t3_focus_field")
-                col=st.columns([4.0,1.0])
+            if selected_field:
+                page_numbers = _safe_page_numbers(result["output_pages"])
+                page = st.selectbox("Artwork Page", page_numbers, key=f"t3_detect_page_{reset}")
+                _render_visual_stage_preview(result, selected_field, page, "detect")
+            else:
+                st.info("Select a field to see its visual tag on the artwork.")
+
+        st.markdown(
+            "<div class='t3-role'><b>Visual review:</b> the highlight shows the evidence used by the comparison engine. Green/field-color = usable match, red = mismatch, amber = presentation/review issue, yellow = exact ORG static evidence.</div>",
+            unsafe_allow_html=True,
+        )
+
+        back, next_col = st.columns([1,1])
+        with back:
+            if st.button("← Back to Upload", width="stretch", key=f"t3_stage2_back_{reset}"):
+                st.session_state["t3_stage"] = 1
+                st.rerun()
+        with next_col:
+            if st.button("Review & Edit Fields →", type="primary", width="stretch", key=f"t3_stage2_next_{reset}"):
+                st.session_state["t3_stage"] = 3
+                st.rerun()
+        return
+
+    # ------------------------------------------------------------------
+    # STAGE 3 — Review / edit / confirm detected fields
+    # ------------------------------------------------------------------
+    if stage == 3:
+        _render_stage_header(3, "Review & Edit Detected Fields", "Confirm, remove or add fields. Selected evidence remains locked so another field cannot reuse it.")
+        left, right = st.columns([1.3, 1.7], gap="small")
+
+        with left:
+            st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Detected Fields ({len(result['selected_fields'])})</div><div class='t3-card-sub'>The full list is scrollable. Search by field name, family or semantic meaning.</div></div>", unsafe_allow_html=True)
+            current = st.multiselect(
+                "Fields participating in QC",
+                result["all_fields"],
+                default=[f for f in result["selected_fields"] if f in result["all_fields"]],
+                key=f"t3_review_multiselect_{reset}",
+            )
+            st.caption(f"Selected: {len(current)} fields • Auto detected: {len(result['detected_fields'])}")
+            _render_field_detection_table({**result, "selected_fields": current}, 3, show_full=True)
+            if current != result["selected_fields"]:
+                st.info("Field selection has changed. The comparison will be recalculated when you continue.")
+
+            page_numbers = _safe_page_numbers(result["output_pages"])
+            mapping_changed = False
+            with st.expander("▾ Page Mapping", expanded=len(page_numbers) > 1):
+                opts = list(range(len(result["df"])))
+                labels = [f"Excel Row {i + 2}" for i in opts]
+                for i, pn in enumerate(page_numbers):
+                    old = int(result["mapping"].get(pn, min(i, len(result["df"]) - 1)))
+                    chosen = st.selectbox(
+                        f"PDF Page {pn}", opts,
+                        index=max(0, min(old, len(opts) - 1)),
+                        format_func=lambda x, labels=labels: labels[x],
+                        key=f"t3_review_map_{reset}_{pn}",
+                    )
+                    if chosen != old:
+                        mapping_changed = True
+                    result["mapping"][pn] = chosen
+
+        with right:
+            inspect_fields = current or result["selected_fields"]
+            if inspect_fields:
+                focus_default = st.session_state.get("t3_focus_field")
+                idx_default = inspect_fields.index(focus_default) if focus_default in inspect_fields else 0
+                selected_field = st.selectbox("Inspect selected field", inspect_fields, index=idx_default, key=f"t3_review_field_{reset}")
+                st.session_state["t3_focus_field"] = selected_field
+                page_numbers = _safe_page_numbers(result["output_pages"])
+                selected_page = st.selectbox("Artwork Page", page_numbers, key=f"t3_review_page_{reset}")
+                _render_visual_stage_preview(result, selected_field, selected_page, "review")
+                ev = next((e for e in result["evidence"] if e["field"] == selected_field and e["page"] == selected_page), None)
+                confirm_key = f"t3_confirm_{reset}_{selected_page}_{selected_field}"
+                confirmed = st.checkbox("I confirm this detected field/evidence is correct", value=(selected_field in st.session_state["t3_confirmed_fields"]), key=confirm_key)
+                if confirmed:
+                    st.session_state["t3_confirmed_fields"].add(selected_field)
+                else:
+                    st.session_state["t3_confirmed_fields"].discard(selected_field)
+                if ev:
+                    st.markdown(f"<div class='t3-role'><b>Evidence state:</b> {'🔒 Confirmed + locked' if selected_field in st.session_state['t3_confirmed_fields'] else 'Review pending'}<br><b>Classification:</b> {html.escape(ev.get('classification','VARIABLE'))}<br><b>Result:</b> {_status_badge(ev.get('status','INFO'))}</div>", unsafe_allow_html=True)
+            else:
+                st.warning("No fields selected. Add or select at least one field before continuing.")
+
+        back, next_col = st.columns([1,1])
+        with back:
+            if st.button("← Back to Auto Detect", width="stretch", key=f"t3_stage3_back_{reset}"):
+                st.session_state["t3_stage"] = 2
+                st.rerun()
+        with next_col:
+            if st.button("Proceed to Comparison →", type="primary", width="stretch", disabled=not bool(current), key=f"t3_stage3_next_{reset}"):
+                with st.spinner("Re-running Tool 1 validation for the confirmed field set…"):
+                    result["selected_fields"] = list(current)
+                    _run_tool3_pipeline(result, current)
+                    result["confirmed_fields"] = set(st.session_state.get("t3_confirmed_fields", set()))
+                    st.session_state["t3_result"] = result
+                    st.session_state["t3_stage"] = 4
+                    st.rerun()
+        return
+
+    # ------------------------------------------------------------------
+    # STAGE 4 — comparison workspace
+    # ------------------------------------------------------------------
+    if stage == 4:
+        _render_stage_header(4, "Comparison View", "Inspect the registered ORG ↔ Output artwork, click findings, and verify field evidence.")
+        overall, static_count, var_count, fail_count, review_count, unaccounted_count = result["summary"]
+        page_numbers = _safe_page_numbers(result["output_pages"])
+
+        controls = st.columns([.8, 1.1, 1.2, .9])
+        with controls[0]:
+            selected_page = st.selectbox("Page", page_numbers, key=f"t3_cmp_page_{reset}")
+        with controls[1]:
+            filter_choice = st.selectbox("Findings", ["All", "FAIL", "REVIEW", "PASS", "STATIC"], key=f"t3_cmp_filter_{reset}")
+        with controls[2]:
+            st.markdown(f"<div class='t3-mini-stat'><b>{overall}</b><span>{static_count} Static • {var_count} Variable • {fail_count} Fail</span></div>", unsafe_allow_html=True)
+        with controls[3]:
+            if st.button("↻ Recalculate", width="stretch", key=f"t3_recalc_{reset}"):
+                with st.spinner("Re-running Tool 1 + Tool 3 classification…"):
+                    _run_tool3_pipeline(result, result["selected_fields"])
+                    st.rerun()
+
+        idx = page_numbers.index(selected_page)
+        out_page = result["output_pages"][idx]
+        org_page = result["org_pages"][idx] if idx < len(result["org_pages"]) else None
+        reg = _register(org_page, out_page) if org_page else None
+        raw_org = reg["org_image"] if reg else None
+        registered_org = _registered_org_image(reg) if reg else raw_org
+        out_img = Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB")
+        focus_field = st.session_state.get("t3_focus_field")
+        annotated = _draw_visual_evidence(out_page, result["evidence"], result["static_matches"], selected_field=focus_field)
+
+        focus_box = None
+        if focus_field:
+            ev_focus = next((e for e in result["evidence"] if e["field"] == focus_field and e["page"] == selected_page), None)
+            if ev_focus and ev_focus.get("boxes"):
+                bxs = ev_focus["boxes"]
+                focus_box = (min(b[0] for b in bxs), min(b[1] for b in bxs), max(b[2] for b in bxs), max(b[3] for b in bxs))
+
+        st.components.v1.html(_viewer_html(raw_org, registered_org, out_img, annotated or out_img, focus_box=focus_box, height=680), height=700, scrolling=False)
+        if reg:
+            st.caption(f"Registered ✓ • Scale {reg['scale']:.3f} • X {reg['tx']:.1f} • Y {reg['ty']:.1f}" + (f" • {reg['warning']}" if reg.get('warning') else ""))
+
+        viewer_left, viewer_right = st.columns([2.0, 1.0], gap="small")
+        page_evidence = [e for e in result["evidence"] if e["page"] == selected_page]
+        if filter_choice == "FAIL":
+            display_findings = [e for e in page_evidence if e.get("status") == "FAIL"]
+        elif filter_choice == "REVIEW":
+            display_findings = [e for e in page_evidence if e.get("status") == "REVIEW"]
+        elif filter_choice == "PASS":
+            display_findings = [e for e in page_evidence if e.get("status") == "PASS"]
+        elif filter_choice == "STATIC":
+            display_findings = [e for e in page_evidence if e.get("classification") == "STATIC"]
+        else:
+            display_findings = page_evidence
+
+        with viewer_right:
+            st.markdown("<div class='t3-card-title'>Findings</div>", unsafe_allow_html=True)
+            find_search = st.text_input("Search findings", placeholder="field, family or value...", key=f"t3_find_search_{reset}")
+            if find_search.strip():
+                q = _norm(find_search)
+                display_findings = [e for e in display_findings if q in _norm(e["field"]) or q in _norm(e.get("actual", "")) or q in _norm(e.get("expected", "")) or q in _norm(e.get("field_type", ""))]
+            if not display_findings:
+                st.info("No findings match this filter.")
+            for e in display_findings:
+                selected = e["field"] == focus_field
+                col = st.columns([4.3, 1.0])
                 with col[0]:
-                    if st.button(f"{e['field']}",key=f"t3_focus_{reset}_{selected_page}_{e['field']}",width="stretch"):
-                        st.session_state["t3_focus_field"]=e["field"]; st.rerun()
-                with col[1]: st.markdown(_status_badge(e["status"]),unsafe_allow_html=True)
-                st.markdown(f"<div class='t3-finding-detail'>{html.escape(e['actual'][:90]) if e['actual'] else 'Not found'} {' 🔒' if e['locked'] else ''}</div>",unsafe_allow_html=True)
-            if len(result["evidence"])>len(filtered): st.markdown(f"<div class='t3-search-note'>Showing {len(filtered)} findings on this filter.</div>",unsafe_allow_html=True)
+                    if st.button(f"{e['field']}", width="stretch", key=f"t3_find_{reset}_{selected_page}_{e['field']}"):
+                        st.session_state["t3_focus_field"] = e["field"]
+                        st.rerun()
+                with col[1]:
+                    st.markdown(_status_badge(e.get("status", e.get("classification", "INFO"))), unsafe_allow_html=True)
+                st.markdown(f"<div class='t3-finding-detail'>{html.escape(str(e.get('actual',''))[:95])} {'🔒' if e.get('locked') else ''}</div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Click a finding</b> to focus and zoom toward its locked evidence. Static findings are shown separately from variable findings.</div>", unsafe_allow_html=True)
 
-        # Static & unaccounted quick view
-        st.markdown("<div class='t3-section-title'>ORG Baseline Findings</div>",unsafe_allow_html=True)
-        org_static=[m for m in result["static_matches"] if m["page"]==selected_page]
-        org_missing=[m for m in result["unaccounted"] if m["page"]==selected_page]
-        a,b=st.columns(2)
-        with a:
-            st.markdown(f"<div class='t3-card'><div class='t3-card-title'>STATIC • {len(org_static)}</div><div class='t3-card-sub' style='margin-top:5px'>ORG and Output match in registered position. Locked so variable fields cannot reuse the same occurrence.</div></div>",unsafe_allow_html=True)
-        with b:
-            st.markdown(f"<div class='t3-card'><div class='t3-card-title'>UNACCOUNTED • {len(org_missing)}</div><div class='t3-card-sub' style='margin-top:5px'>Only genuine ORG elements without a mapped Output counterpart are shown here.</div></div>",unsafe_allow_html=True)
+        with viewer_left:
+            chosen = next((e for e in page_evidence if e["field"] == focus_field), None)
+            if chosen:
+                st.markdown("<div class='t3-section-title'>Selected Finding</div>", unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([1.0, 1.1, 1.2])
+                with c1:
+                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>{html.escape(chosen['field'])}</div><div style='margin-top:5px'>{_status_badge(chosen.get('classification','VARIABLE'))} {_status_badge(chosen.get('status','INFO'))}</div><div class='t3-card-sub' style='margin-top:6px'>Family: {html.escape(chosen.get('field_type',''))}<br>Region: {html.escape(str(chosen.get('region') or '—'))}<br>{'🔒 Evidence locked' if chosen.get('locked') else 'Evidence not locked'}</div></div>", unsafe_allow_html=True)
+                with c2:
+                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Values</div><div class='t3-card-sub' style='margin-top:6px'><b>Order Form</b><br>{html.escape(chosen.get('expected',''))}<br><br><b>Output</b><br>{html.escape(chosen.get('actual',''))}</div></div>", unsafe_allow_html=True)
+                with c3:
+                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Why?</div><div class='t3-card-sub' style='margin-top:6px'>{html.escape(chosen.get('difference','—'))}</div></div>", unsafe_allow_html=True)
+            else:
+                st.info("Select a finding on the right to inspect its evidence and reason.")
 
-    with tabs[1]:
-        st.markdown("<div class='t3-section-title'>Technical Details</div>",unsafe_allow_html=True)
-        d1,d2,d3,d4,d5=st.columns(5)
-        for col,val,label in [(d1,len(result['all_fields']),'Available fields'),(d2,len(result['selected_fields']),'Selected fields'),(d3,static_count,'Static elements'),(d4,fail_count,'Issues'),(d5,unaccounted_count,'Unaccounted')]:
-            with col: st.markdown(f"<div class='t3-mini-stat'><b>{val}</b><span>{label}</span></div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-section-title'>Tool Link</div>",unsafe_allow_html=True)
-        st.markdown(f"<div class='t3-card'><div class='t3-card-sub'>Order Form comparison engine: <b>{html.escape(TOOL1_ENGINE_VERSION)}</b><br>Auto Detect, specialized field matchers and PASS/FAIL decisions come from Tool 1. Tool 3 adds ORG classification, presentation checks, evidence locking and visual comparison.</div></div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-section-title'>Registration</div>",unsafe_allow_html=True)
-        reg_rows=[]
-        for p,rr in result["registrations"]: reg_rows.append({"Page":p,"Scale":round(rr['scale'],4),"Scale X":round(rr['scale_x'],4),"Scale Y":round(rr['scale_y'],4),"X Offset":round(rr['tx'],1),"Y Offset":round(rr['ty'],1),"Aspect Delta":round(rr['aspect_delta'],4),"Warning":rr['warning']})
-        st.dataframe(pd.DataFrame(reg_rows),width="stretch",hide_index=True,key=f"t3_reg_{reset}")
-        st.markdown("<div class='t3-section-title'>Full Evidence Table</div>",unsafe_allow_html=True)
-        st.dataframe(_evidence_dataframe(result["evidence"],result["static_matches"],result["unaccounted"]),width="stretch",hide_index=True,height=420,key=f"t3_evdf_{reset}")
+        back, next_col = st.columns([1,1])
+        with back:
+            if st.button("← Back to Review", width="stretch", key=f"t3_stage4_back_{reset}"):
+                st.session_state["t3_stage"] = 3
+                st.rerun()
+        with next_col:
+            if st.button("View QC Results →", type="primary", width="stretch", key=f"t3_stage4_next_{reset}"):
+                st.session_state["t3_stage"] = 5
+                st.rerun()
+        return
 
-    with tabs[2]:
-        st.markdown("<div class='t3-section-title'>QC Summary</div>",unsafe_allow_html=True)
-        hero=RED_BG if overall=="FAIL" else ORANGE_BG if overall=="REVIEW" else GREEN_BG
-        hero_fg=RED if overall=="FAIL" else ORANGE if overall=="REVIEW" else GREEN
-        st.markdown(f"<div class='t3-hero-result' style='background:{hero};border-color:{hero_fg}55'><div class='t3-hero-title' style='color:{hero_fg}'>{overall}</div><div class='t3-hero-sub'>{static_count} static • {var_count} variable • {fail_count} issues • {review_count} review • {unaccounted_count} unaccounted</div></div>",unsafe_allow_html=True)
-        metrics=st.columns(5)
-        for col,val,label in [(metrics[0],static_count,'Static'),(metrics[1],var_count,'Variable'),(metrics[2],sum(1 for e in result['evidence'] if e['status']=='PASS'),'Pass'),(metrics[3],fail_count,'Fail'),(metrics[4],review_count,'Review')]:
-            with col: st.markdown(f"<div class='t3-mini-stat'><b>{val}</b><span>{label}</span></div>",unsafe_allow_html=True)
-        if fail_count or review_count or unaccounted_count:
-            st.markdown("<div class='t3-section-title'>Issues Requiring Attention</div>",unsafe_allow_html=True)
-            issues=[e for e in result['evidence'] if e['status'] in {'FAIL','REVIEW'}]
+    # ------------------------------------------------------------------
+    # STAGE 5 — final QC result / report
+    # ------------------------------------------------------------------
+    if stage == 5:
+        _render_stage_header(5, "QC Results", "Review the final decision, investigate issues and download the complete QC report.")
+        overall, static_count, var_count, fail_count, review_count, unaccounted_count = result["summary"]
+        hero_bg, hero_fg = (RED_BG, RED) if overall == "FAIL" else (ORANGE_BG, ORANGE) if overall == "REVIEW" else (GREEN_BG, GREEN)
+        st.markdown(
+            f"<div class='t3-hero-result' style='background:{hero_bg};border-color:{hero_fg}55'>"
+            f"<div class='t3-hero-title' style='font-size:22px;color:{hero_fg}'>{overall}</div>"
+            f"<div class='t3-hero-sub'>{static_count} Static • {var_count} Variable • {fail_count} Fail • {review_count} Review • {unaccounted_count} Unaccounted</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        metrics = st.columns(5)
+        metric_values = [(static_count, "Static"), (var_count, "Variable"), (sum(1 for e in result["evidence"] if e.get("classification") == "VARIABLE" and e.get("status") == "PASS"), "Pass"), (fail_count, "Fail"), (review_count, "Review")]
+        for col, (value, label) in zip(metrics, metric_values):
+            with col:
+                st.markdown(f"<div class='t3-mini-stat'><b>{value}</b><span>{label}</span></div>", unsafe_allow_html=True)
+
+        issues = [e for e in result["evidence"] if e.get("classification") == "VARIABLE" and e.get("status") in {"FAIL", "REVIEW"}]
+        if issues or result["unaccounted"]:
+            st.markdown("<div class='t3-section-title'>Issues Requiring Attention</div>", unsafe_allow_html=True)
             for e in issues:
-                st.markdown(f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between'><div class='t3-field-name'>{html.escape(e['field'])}</div>{_status_badge(e['status'])}</div><div class='t3-field-sub'>Page {e['page']} • {html.escape(e['difference'])}</div></div>",unsafe_allow_html=True)
-            for u in result['unaccounted']:
-                st.markdown(f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between'><div class='t3-field-name'>ORG Element</div>{_status_badge('MISSING / UNACCOUNTED')}</div><div class='t3-field-sub'>Page {u['page']} • {html.escape(u['expected'])}</div></div>",unsafe_allow_html=True)
-        st.markdown("<div class='t3-section-title'>Download</div>",unsafe_allow_html=True)
-        report_bytes=_build_excel_report(result)
-        st.download_button("⬇ Download QC Excel Report",data=report_bytes,file_name="ORG_OrderForm_Output_QC_Report.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",width="stretch",key=f"t3_download_{reset}")
-        st.markdown("<div class='t3-bottom-note'>Unified engine from Tool 1 • Locked evidence • Registered Overlay • Static / Variable / Review separated clearly</div>",unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>{html.escape(e['field'])}</div>{_status_badge(e['status'])}</div><div class='t3-field-sub'>Page {e['page']} • Expected: {html.escape(e['expected'])} • Found: {html.escape(e['actual'])}<br>{html.escape(e['difference'])}</div></div>",
+                    unsafe_allow_html=True,
+                )
+            for u in result["unaccounted"]:
+                st.markdown(
+                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>ORG Element</div>{_status_badge('MISSING / UNACCOUNTED')}</div><div class='t3-field-sub'>Page {u['page']} • {html.escape(u['expected'])}<br>{html.escape(u['difference'])}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.success("No unresolved variable failures, presentation failures, reviews or unaccounted ORG elements were found.")
+
+        st.markdown("<div class='t3-section-title'>Download QC Report</div>", unsafe_allow_html=True)
+        report_bytes = _build_excel_report(result)
+        st.download_button(
+            "⬇ Download QC Excel Report",
+            data=report_bytes,
+            file_name="ORG_OrderForm_Output_QC_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key=f"t3_download_{reset}",
+        )
+
+        st.markdown(
+            f"<div class='t3-role'><b>Engine:</b> Tool 1 {html.escape(TOOL1_ENGINE_VERSION)}<br>"
+            f"Tool 3 adds ORG baseline, static/variable classification, presentation checks, evidence locking, registration and visual reporting.</div>",
+            unsafe_allow_html=True,
+        )
+
+        back, new_col = st.columns([1,1])
+        with back:
+            if st.button("← Back to Comparison", width="stretch", key=f"t3_stage5_back_{reset}"):
+                st.session_state["t3_stage"] = 4
+                st.rerun()
+        with new_col:
+            if st.button("＋ Start New QC", width="stretch", key=f"t3_new_{reset}"):
+                st.session_state["t3_reset_id"] += 1
+                st.session_state["t3_stage"] = 1
+                st.session_state["t3_result"] = None
+                st.session_state["t3_focus_field"] = None
+                st.session_state["t3_confirmed_fields"] = set()
+                st.rerun()
 
 
 if __name__ == "__main__":
