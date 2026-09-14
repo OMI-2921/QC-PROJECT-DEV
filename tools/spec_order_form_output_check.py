@@ -58,28 +58,28 @@ except Exception:
         auto_detect_fields,
     )
 
-TOOL3_VERSION = "2026-09-14-TOOL3-FIVE-STAGE-WIZARD-TOOL1-LINKED-V6"
+TOOL3_VERSION = "2026-09-14-TOOL3-FIVE-STAGE-WIZARD-TOOL1-LINKED-V7-DARK-VISUAL-PROBE"
 
 # -------------------------------- palette ----------------------------------
-BLUE = "#2563eb"
-BLUE_DARK = "#0f4fbf"
-CYAN = "#06b6d4"
-PAGE_BG = "#f4f8fc"
-CARD_BG = "#ffffff"
-CARD_BORDER = "#d9e4f0"
-TEXT = "#12233a"
-MUTED = "#64748b"
+BLUE = "#3b82f6"
+BLUE_DARK = "#60a5fa"
+CYAN = "#22d3ee"
+PAGE_BG = "#07111f"
+CARD_BG = "#0b1627"
+CARD_BORDER = "#21364f"
+TEXT = "#e7f0fb"
+MUTED = "#8fa3ba"
 GREEN = "#16a34a"
-GREEN_BG = "#dcfce7"
+GREEN_BG = "#123b2a"
 RED = "#dc2626"
-RED_BG = "#fee2e2"
+RED_BG = "#4a1d22"
 ORANGE = "#ea580c"
-ORANGE_BG = "#ffedd5"
+ORANGE_BG = "#4a2a12"
 PURPLE = "#9333ea"
-PURPLE_BG = "#f3e8ff"
+PURPLE_BG = "#31154d"
 YELLOW = "#eab308"
-YELLOW_BG = "#fef9c3"
-GRAY_BG = "#eef2f7"
+YELLOW_BG = "#4a3a08"
+GRAY_BG = "#152235"
 
 FIELD_COLORS = {
     "CARE": "#0891b2",
@@ -131,97 +131,108 @@ def _status_badge(status):
 
 
 def _tool3_css():
-    # Do not allow Tool 1's dark dashboard CSS to control this screen. Tool 3
-    # intentionally has its own clean workspace matching the approved mockup.
     st.markdown(
         f"""
         <style>
+        @keyframes t3Pulse {{
+            0%,100% {{ box-shadow:0 0 0 0 rgba(59,130,246,.16), 0 0 0 rgba(34,211,238,0); }}
+            50% {{ box-shadow:0 0 0 4px rgba(59,130,246,.07), 0 0 24px rgba(34,211,238,.16); }}
+        }}
+        @keyframes t3Shimmer {{
+            0% {{ background-position:0% 50%; }}
+            50% {{ background-position:100% 50%; }}
+            100% {{ background-position:0% 50%; }}
+        }}
         html, body, [data-testid="stAppViewContainer"], [data-testid="stApp"],
         [data-testid="stMain"], .stApp, .main, .block-container {{
             background:{PAGE_BG} !important;
             color:{TEXT} !important;
         }}
         [data-testid="stHeader"] {{ background:{PAGE_BG} !important; }}
-        .block-container {{ max-width:1560px !important; padding-top:0.8rem !important; padding-bottom:2rem !important; }}
-        .stApp, .stApp p, .stApp label, .stApp span, .stApp div {{ color:{TEXT}; }}
+        .block-container {{ max-width:1560px !important; padding-top:.8rem !important; padding-bottom:2rem !important; }}
+        .stApp, .stApp p, .stApp label, .stApp span, .stApp div, .stApp small {{ color:{TEXT}; }}
+        [data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {{ color:{TEXT} !important; }}
+        .stCaption, [data-testid="stCaptionContainer"] {{ color:{MUTED} !important; }}
 
-        .t3-topbar {{
-            display:flex; align-items:center; gap:14px; padding:6px 4px 14px 4px;
-            border-bottom:1px solid {CARD_BORDER}; margin-bottom:16px;
-        }}
-        .t3-logo {{
-            width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center;
-            color:white !important; font-size:21px; font-weight:900;
-            background:linear-gradient(135deg,#1d4ed8,#06b6d4); box-shadow:0 4px 15px rgba(37,99,235,.20);
-        }}
+        .t3-topbar {{ display:flex; align-items:center; gap:14px; padding:7px 4px 14px 4px; border-bottom:1px solid {CARD_BORDER}; margin-bottom:16px; }}
+        .t3-logo {{ width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center; color:white !important; font-size:21px; font-weight:900; background:linear-gradient(135deg,#2563eb,#06b6d4,#2563eb); background-size:180% 180%; animation:t3Shimmer 7s ease infinite; box-shadow:0 4px 18px rgba(37,99,235,.22); }}
         .t3-title {{ font-size:28px; font-weight:850; line-height:1.05; color:{TEXT} !important; }}
         .t3-subtitle {{ font-size:11px; color:{MUTED} !important; margin-top:4px; }}
-        .t3-top-pills {{ margin-left:auto; display:flex; gap:7px; align-items:center; }}
-        .t3-top-pill {{ background:#ffffff; border:1px solid {CARD_BORDER}; border-radius:999px; padding:7px 11px; font-size:10px; color:{MUTED} !important; }}
+        .t3-top-pills {{ margin-left:auto; display:flex; gap:7px; align-items:center; flex-wrap:wrap; }}
+        .t3-top-pill {{ background:#0d1c2f; border:1px solid {CARD_BORDER}; border-radius:999px; padding:7px 11px; font-size:10px; color:#aac0d8 !important; }}
 
-        .t3-stepper {{
-            display:grid; grid-template-columns:repeat(5,1fr); gap:7px; margin:2px 0 14px 0;
-        }}
-        .t3-step {{ background:#fff; border:1px solid {CARD_BORDER}; border-radius:10px; padding:8px 10px; }}
-        .t3-step.active {{ border-color:#93c5fd; background:#eff6ff; }}
-        .t3-step.done {{ background:#f0fdf4; border-color:#bbf7d0; }}
-        .t3-step-num {{ font-size:9px; font-weight:800; color:{BLUE}; }}
-        .t3-step-name {{ font-size:11px; font-weight:800; margin-top:2px; }}
+        .t3-stepper {{ display:grid; grid-template-columns:repeat(5,1fr); gap:7px; margin:2px 0 14px 0; }}
+        .t3-step {{ background:#0b1729; border:1px solid {CARD_BORDER}; border-radius:10px; padding:8px 10px; position:relative; overflow:hidden; }}
+        .t3-step.active {{ border-color:#2563eb; background:linear-gradient(90deg,#0d1e35,#102640); animation:t3Pulse 3.3s ease-in-out infinite; }}
+        .t3-step.done {{ background:#0e201b; border-color:#1d5a45; }}
+        .t3-step-num {{ font-size:9px; font-weight:800; color:{BLUE_DARK}; }}
+        .t3-step-name {{ font-size:11px; font-weight:800; margin-top:2px; color:{TEXT} !important; }}
         .t3-step-note {{ font-size:8px; color:{MUTED} !important; margin-top:2px; }}
 
-        .t3-card {{ background:{CARD_BG}; border:1px solid {CARD_BORDER}; border-radius:12px; padding:13px; box-shadow:0 1px 2px rgba(15,23,42,.03); }}
+        .t3-card {{ background:{CARD_BG}; border:1px solid {CARD_BORDER}; border-radius:12px; padding:13px; box-shadow:0 8px 24px rgba(0,0,0,.12); }}
         .t3-card-title {{ font-size:13px; font-weight:820; color:{TEXT} !important; }}
         .t3-card-sub {{ font-size:9px; color:{MUTED} !important; line-height:1.45; }}
         .t3-upload-icon {{ font-size:22px; margin-bottom:5px; }}
-        .t3-fileline {{ font-size:9px; color:#334155 !important; margin-top:7px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-        .t3-role {{ margin-top:7px; background:#f8fbff; border:1px solid #e2ebf5; border-radius:8px; padding:7px; font-size:8px; color:{MUTED} !important; line-height:1.45; }}
+        .t3-fileline {{ font-size:9px; color:#c7d8ea !important; margin-top:7px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+        .t3-role {{ margin-top:7px; background:#0e1c2f; border:1px solid #1e3550; border-radius:8px; padding:7px; font-size:8px; color:{MUTED} !important; line-height:1.45; }}
         .t3-role b {{ color:{TEXT} !important; }}
-
         .t3-section-title {{ font-size:14px; font-weight:850; margin:13px 0 7px 0; color:{TEXT} !important; }}
         .t3-section-note {{ font-size:9px; color:{MUTED} !important; margin-bottom:7px; }}
-        .t3-mini-stat {{ background:#fff; border:1px solid {CARD_BORDER}; border-radius:9px; padding:9px 10px; }}
-        .t3-mini-stat b {{ display:block; font-size:19px; font-weight:850; }}
+        .t3-mini-stat {{ background:#0d1a2c; border:1px solid {CARD_BORDER}; border-radius:9px; padding:9px 10px; }}
+        .t3-mini-stat b {{ display:block; font-size:19px; font-weight:850; color:{TEXT} !important; }}
         .t3-mini-stat span {{ font-size:8px; color:{MUTED} !important; }}
         .t3-badge {{ display:inline-block; padding:3px 7px; border-radius:999px; font-size:8px; font-weight:850; white-space:nowrap; }}
-        .t3-lock {{ color:#0369a1; font-size:11px; }}
+        .t3-lock {{ color:#38bdf8; font-size:11px; }}
         .t3-search-note {{ font-size:8px; color:{MUTED} !important; margin-top:4px; }}
-        .t3-field-row {{ background:#fff; border:1px solid {CARD_BORDER}; border-radius:8px; padding:8px 9px; margin:4px 0; }}
-        .t3-field-name {{ font-size:10px; font-weight:800; }}
+        .t3-field-row {{ background:#0d1a2c; border:1px solid #1e3550; border-radius:8px; padding:8px 9px; margin:4px 0; }}
+        .t3-field-name {{ font-size:10px; font-weight:800; color:{TEXT} !important; }}
         .t3-field-sub {{ font-size:8px; color:{MUTED} !important; margin-top:2px; }}
-        .t3-finding {{ background:#fff; border:1px solid {CARD_BORDER}; border-radius:10px; padding:9px; margin-bottom:7px; }}
-        .t3-finding.selected {{ border-color:#60a5fa; box-shadow:0 0 0 2px #dbeafe; }}
+        .t3-finding {{ background:#0d1a2c; border:1px solid #20364f; border-radius:10px; padding:9px; margin-bottom:7px; }}
+        .t3-finding.selected {{ border-color:#3b82f6; box-shadow:0 0 0 2px rgba(59,130,246,.16); }}
         .t3-finding-head {{ display:flex; justify-content:space-between; gap:8px; align-items:center; }}
-        .t3-finding-field {{ font-size:10px; font-weight:850; }}
-        .t3-finding-detail {{ font-size:8px; color:#64748b !important; line-height:1.5; margin-top:5px; }}
-        .t3-lock-pill {{ font-size:8px; color:#0369a1 !important; background:#e0f2fe; border-radius:999px; padding:2px 6px; }}
-        .t3-hero-result {{ background:#eff6ff; border:1px solid #bfdbfe; border-radius:12px; padding:12px; }}
-        .t3-hero-title {{ font-size:11px; font-weight:850; }}
+        .t3-finding-field {{ font-size:10px; font-weight:850; color:{TEXT} !important; }}
+        .t3-finding-detail {{ font-size:8px; color:#8fa3ba !important; line-height:1.5; margin-top:5px; }}
+        .t3-lock-pill {{ font-size:8px; color:#7dd3fc !important; background:#0b3046; border-radius:999px; padding:2px 6px; }}
+        .t3-hero-result {{ background:linear-gradient(120deg,#0d2138,#0b1a2f,#102540); background-size:160% 160%; animation:t3Shimmer 9s ease infinite; border:1px solid #21446c; border-radius:12px; padding:12px; }}
+        .t3-hero-title {{ font-size:11px; font-weight:850; color:{TEXT} !important; }}
         .t3-hero-sub {{ font-size:8px; color:{MUTED} !important; margin-top:4px; line-height:1.45; }}
-        .t3-bottom-note {{ text-align:center; color:#94a3b8 !important; font-size:9px; margin-top:12px; }}
+        .t3-bottom-note {{ text-align:center; color:#6f849b !important; font-size:9px; margin-top:12px; }}
 
-        [data-baseweb="select"] > div {{ background:#fff !important; border:1px solid #bfd0e2 !important; border-radius:8px !important; min-height:36px !important; }}
+        [data-baseweb="select"] > div {{ background:#0c192b !important; border:1px solid #284563 !important; border-radius:8px !important; min-height:36px !important; }}
         [data-baseweb="select"] input, [data-baseweb="select"] span {{ color:{TEXT} !important; }}
-        [role="option"] {{ background:#fff !important; color:{TEXT} !important; }}
-        [role="option"]:hover {{ background:#eff6ff !important; }}
-        [data-baseweb="tag"] {{ background:#dbeafe !important; color:#1e40af !important; }}
-        [data-baseweb="tag"] span {{ color:#1e40af !important; }}
-        [data-testid="stTextInput"] input {{ background:#fff !important; color:{TEXT} !important; border:1px solid #bfd0e2 !important; border-radius:8px !important; }}
-        [data-testid="stFileUploader"] {{ background:#fff !important; border:1px solid #cbd8e6 !important; border-radius:10px !important; padding:3px !important; }}
-        [data-testid="stFileUploaderDropzone"] {{ background:#f8fbff !important; border:1px dashed #aac4df !important; border-radius:8px !important; }}
+        [role="option"] {{ background:#0c192b !important; color:{TEXT} !important; }}
+        [role="option"]:hover {{ background:#143154 !important; }}
+        [data-baseweb="tag"] {{ background:#16365a !important; color:#bfdbfe !important; border:1px solid #2b5f92 !important; }}
+        [data-baseweb="tag"] span {{ color:#bfdbfe !important; }}
+        [data-testid="stTextInput"] input {{ background:#0c192b !important; color:{TEXT} !important; border:1px solid #284563 !important; border-radius:8px !important; }}
+        [data-testid="stTextInput"] input::placeholder {{ color:#6f849b !important; }}
+
+        [data-testid="stFileUploader"] {{ background:#0b1729 !important; border:1px solid #294663 !important; border-radius:10px !important; padding:3px !important; color:{TEXT} !important; }}
+        [data-testid="stFileUploaderDropzone"] {{ background:#0d1d31 !important; border:1px dashed #3a5f84 !important; border-radius:8px !important; color:{TEXT} !important; }}
+        [data-testid="stFileUploaderDropzoneInstructions"], [data-testid="stFileUploaderDropzoneInstructions"] * {{ color:#cfe0f2 !important; }}
+        [data-testid="stFileUploaderDropzone"] button {{ background:#173250 !important; color:#e5f1ff !important; border:1px solid #315d86 !important; }}
+        [data-testid="stFileUploaderDropzone"] button:hover {{ background:#21466f !important; }}
+
+        div.stButton > button {{ background:#0c192b !important; color:#d9e8f7 !important; border:1px solid #294663 !important; border-radius:8px !important; font-weight:750 !important; min-height:36px !important; box-shadow:none !important; }}
+        div.stButton > button:hover {{ border-color:#3b82f6 !important; background:#122845 !important; }}
+        div.stButton > button[kind="primary"] {{ background:linear-gradient(90deg,#2563eb,#4f46e5) !important; color:#fff !important; border:0 !important; box-shadow:0 6px 18px rgba(37,99,235,.22) !important; }}
+        div.stDownloadButton > button {{ background:linear-gradient(90deg,#2563eb,#4f46e5) !important; color:#fff !important; border:0 !important; border-radius:8px !important; font-weight:800 !important; }}
         [data-testid="stDataFrame"] {{ border:1px solid {CARD_BORDER} !important; border-radius:10px !important; }}
-        div.stButton > button {{ background:#fff !important; color:#1e3a5f !important; border:1px solid #b9cce0 !important; border-radius:8px !important; font-weight:750 !important; min-height:36px !important; box-shadow:none !important; }}
-        div.stButton > button:hover {{ border-color:#60a5fa !important; background:#eff6ff !important; }}
-        div.stButton > button[kind="primary"] {{ background:linear-gradient(90deg,#2563eb,#4f46e5) !important; color:#fff !important; border:0 !important; }}
-        div.stDownloadButton > button {{ background:#2563eb !important; color:#fff !important; border:0 !important; border-radius:8px !important; font-weight:800 !important; }}
-        [data-testid="stExpander"] {{ background:#fff !important; border:1px solid {CARD_BORDER} !important; border-radius:9px !important; }}
-        .stTabs [data-baseweb="tab-list"] {{ gap:5px; background:#eaf0f7; padding:4px; border-radius:8px; }}
-        .stTabs [data-baseweb="tab"] {{ background:transparent; border-radius:6px; font-size:10px; }}
-        .stTabs [aria-selected="true"] {{ background:#fff !important; box-shadow:0 1px 3px rgba(15,23,42,.08); }}
+        [data-testid="stExpander"] {{ background:#0b1729 !important; border:1px solid {CARD_BORDER} !important; border-radius:9px !important; }}
+        [data-testid="stExpander"] summary, [data-testid="stExpander"] summary * {{ color:{TEXT} !important; }}
+        .stTabs [data-baseweb="tab-list"] {{ gap:5px; background:#0b1729; padding:4px; border-radius:8px; }}
+        .stTabs [data-baseweb="tab"] {{ background:transparent; border-radius:6px; font-size:10px; color:#94a9bf !important; }}
+        .stTabs [aria-selected="true"] {{ background:#13263e !important; box-shadow:0 1px 3px rgba(0,0,0,.24); color:#e7f0fb !important; }}
+
+        .t3-evidence-panel {{ background:#091524; border:1px solid #26425f; border-radius:12px; padding:9px; }}
+        .t3-evidence-title {{ font-size:10px; font-weight:850; color:#d9e8f7 !important; margin-bottom:5px; }}
+        .t3-evidence-sub {{ font-size:8px; color:#7e95ac !important; margin-bottom:8px; }}
+        .t3-evidence-note {{ font-size:8px; color:#8fa3ba !important; margin-top:6px; line-height:1.45; }}
+        .t3-focus-tag {{ display:inline-flex; align-items:center; gap:5px; padding:4px 7px; border-radius:999px; background:#113253; color:#d7ebff !important; border:1px solid #2b5f92; font-size:8px; font-weight:850; }}
         </style>
         """,
         unsafe_allow_html=True,
     )
-
 
 def _render_stepper(active_step=3):
     steps = [
@@ -531,6 +542,25 @@ def _match_static(org_page, output_page, reg, locked_output_boxes, locked_org_in
 # ============================================================================
 # Tool 1-linked variable evidence
 # ============================================================================
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _extract_pages_cached(file_bytes, filename):
+    """Cache the expensive PDF/image extraction by bytes + filename.
+
+    Tool 1 remains the extraction/comparison authority; this cache only prevents
+    repeated OCR/render work when the wizard reruns between steps.
+    """
+    bio = io.BytesIO(file_bytes)
+    try:
+        bio.name = str(filename or "uploaded_file")
+    except Exception:
+        pass
+    return extract_output_pages(bio)
+
+
+def _extract_file_bytes(uploaded_file):
+    return uploaded_file.getvalue() if uploaded_file is not None else b""
 
 
 def _page_row_mapping(df, output_pages, mapping=None):
@@ -1326,15 +1356,16 @@ def _render_field_browser(all_fields, selected_fields, evidence, key_prefix):
             else:
                 selected_fields=current
             st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
-            for field in filtered:
-                ev=evidence_by_field.get(field)
-                status=ev["status"] if ev else "AUTO" if field in selected_fields else "INFO"
-                locked=bool(ev and ev.get("locked"))
-                detected="AUTO" if field in selected_fields and not search else ""
-                st.markdown(
-                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;align-items:center;gap:8px'><div><div class='t3-field-name'>✓ {html.escape(field)}</div><div class='t3-field-sub'>{html.escape(get_field_type(field))}{(' • '+html.escape(str(get_field_region(field)))) if get_field_region(field) else ''}</div></div><div style='display:flex;gap:5px;align-items:center'>{_status_badge(status)} {('<span class=\"t3-lock\">🔒</span>' if locked else '')}</div></div></div>",
-                    unsafe_allow_html=True,
-                )
+            with st.container(height=440, border=True):
+                for field in filtered:
+                    ev=evidence_by_field.get(field)
+                    status=ev["status"] if ev else ("AUTO" if field in selected_fields else "INFO")
+                    locked=bool(ev and ev.get("locked"))
+                    auto_badge=_status_badge("AUTO") if field in selected_fields else ""
+                    st.markdown(
+                        f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;align-items:center;gap:8px'><div><div class='t3-field-name'>✓ {html.escape(field)}</div><div class='t3-field-sub'>{html.escape(get_field_type(field))}{(' • '+html.escape(str(get_field_region(field)))) if get_field_region(field) else ''}</div></div><div style='display:flex;gap:5px;align-items:center'>{_status_badge(status)} {auto_badge} {('<span class=\"t3-lock\">🔒</span>' if locked else '')}</div></div></div>",
+                        unsafe_allow_html=True,
+                    )
     return selected_fields
 
 
@@ -1475,15 +1506,25 @@ def _run_tool3_pipeline(result, selected_fields=None):
     return result
 
 
-def _prepare_run(order_file, org_file, output_file, product_type):
-    df = pd.read_csv(order_file) if str(order_file.name).lower().endswith(".csv") else load_excel(order_file)
+def _prepare_detect_run(order_file, org_file, output_file, product_type):
+    """Fast Stage-1 preparation.
+
+    Only the Order Form + Output are extracted here because Tool 1 Auto Detect
+    does not need the ORG Spec. The expensive ORG analysis and full evidence
+    build are deliberately deferred until Step 2, preventing the old 'spinner
+    forever' feeling caused by doing the complete Tool 3 pipeline before the
+    user even sees what was detected.
+    """
+    order_bytes = _extract_file_bytes(order_file)
+    output_bytes = _extract_file_bytes(output_file)
+    if not order_bytes or not output_bytes:
+        raise ValueError("Order Form and Output are required before Auto Detect.")
+
+    df = pd.read_csv(io.BytesIO(order_bytes)) if str(order_file.name).lower().endswith(".csv") else load_excel(io.BytesIO(order_bytes))
     if df.empty:
         raise ValueError("The Order Form contains no usable data rows.")
 
-    org_pages = extract_output_pages(org_file)
-    output_pages = extract_output_pages(output_file)
-    if not org_pages:
-        raise ValueError("The ORG Spec could not be read.")
+    output_pages = _extract_pages_cached(output_bytes, output_file.name)
     if not output_pages:
         raise ValueError("The Output artwork could not be read.")
 
@@ -1491,9 +1532,9 @@ def _prepare_run(order_file, org_file, output_file, product_type):
     detected = _tool1_auto_detect(df, output_pages, product_type, mapping)
     all_fields = [f for f in get_available_fields(df) if not is_admin_field(f)]
 
-    result = {
+    return {
         "df": df,
-        "org_pages": org_pages,
+        "org_pages": [],
         "output_pages": output_pages,
         "mapping": mapping,
         "all_fields": all_fields,
@@ -1501,13 +1542,39 @@ def _prepare_run(order_file, org_file, output_file, product_type):
         "selected_fields": list(detected),
         "confirmed_fields": set(),
         "product_type": product_type,
+        "evidence_ready": False,
         "files": {
             "order": getattr(order_file, "name", "Order Form"),
             "org": getattr(org_file, "name", "ORG Spec"),
             "output": getattr(output_file, "name", "Output"),
         },
+        "source_bytes": {"org": _extract_file_bytes(org_file)},
     }
-    return _run_tool3_pipeline(result, detected)
+
+
+def _ensure_visual_evidence(result, selected_fields=None):
+    """Build full Tool-3 evidence once, after Auto Detect is visible.
+
+    This is intentionally separate from Stage 1 so upload/detection is responsive.
+    """
+    if result.get("evidence_ready") and selected_fields is None:
+        return result
+    selected = list(selected_fields if selected_fields is not None else result.get("selected_fields", []))
+    org_bytes = result.get("source_bytes", {}).get("org", b"")
+    if not org_bytes:
+        raise ValueError("The ORG Spec source is unavailable. Please start a new check.")
+    org_name = result.get("files", {}).get("org", "ORG Spec")
+    org_pages = _extract_pages_cached(org_bytes, org_name)
+    result["org_pages"] = org_pages
+    _run_tool3_pipeline(result, selected)
+    result["evidence_ready"] = True
+    return result
+
+
+def _prepare_run(order_file, org_file, output_file, product_type):
+    # Backward-compatible helper for callers/tests that still invoke _prepare_run.
+    result = _prepare_detect_run(order_file, org_file, output_file, product_type)
+    return _ensure_visual_evidence(result, result["selected_fields"])
 
 
 def _render_field_detection_table(result, stage, show_full=True):
@@ -1572,50 +1639,92 @@ def _render_stage_header(number, title, subtitle):
     )
 
 
+def _focus_image(image, boxes, label, color, subtitle=""):
+    """Draw only the selected field's evidence block — no noisy full-page tags."""
+    if image is None:
+        return None
+    out = image.convert("RGBA").copy()
+    overlay = Image.new("RGBA", out.size, (0,0,0,0))
+    draw = ImageDraw.Draw(overlay)
+    clean=[]
+    for b in boxes or []:
+        try:
+            l,t,r,bot=[float(x) for x in b]
+            if r>l and bot>t: clean.append((l,t,r,bot))
+        except Exception:
+            continue
+    if not clean:
+        return out.convert("RGB")
+    left=min(b[0] for b in clean); top=min(b[1] for b in clean); right=max(b[2] for b in clean); bottom=max(b[3] for b in clean)
+    pad=max(4, int(min(out.size)*0.012))
+    left=max(0,left-pad); top=max(0,top-pad); right=min(out.width,right+pad); bottom=min(out.height,bottom+pad)
+    rgba=_rgba(color,78); outline=_rgba(color,255)
+    draw.rounded_rectangle([left,top,right,bottom], radius=max(4,pad//2), fill=rgba, outline=outline, width=max(3,int(min(out.size)*.005)))
+    # Compact label above the block, deliberately outside the artwork text whenever possible.
+    try:
+        font=ImageFont.truetype("DejaVuSans-Bold.ttf", max(14,int(min(out.size)*.018)))
+    except Exception:
+        font=ImageFont.load_default()
+    text=str(label or "Evidence")
+    tb=draw.textbbox((0,0),text,font=font); tw=tb[2]-tb[0]; th=tb[3]-tb[1]
+    lx=max(4,min(out.width-tw-14,left)); ly=max(4,top-th-12)
+    draw.rounded_rectangle([lx,ly,lx+tw+12,ly+th+8],radius=6,fill=(7,17,31,235),outline=outline,width=2)
+    draw.text((lx+6,ly+4),text,fill=(245,250,255,255),font=font)
+    return Image.alpha_composite(out,overlay).convert("RGB")
+
+
 def _render_visual_stage_preview(result, selected_field, selected_page, stage_key):
-    """Show Tool-1-style visual tagging for a selected field during Detect/Review."""
-    output_pages = result["output_pages"]
-    org_pages = result["org_pages"]
-    evidence = result.get("evidence", [])
-    static_matches = result.get("static_matches", [])
-    page_numbers = _safe_page_numbers(output_pages)
-    if not page_numbers:
-        return
-    if selected_page not in page_numbers:
-        selected_page = page_numbers[0]
-    idx = page_numbers.index(selected_page)
-    out_page = output_pages[idx]
-    org_page = org_pages[idx] if idx < len(org_pages) else None
-    annotated = _draw_visual_evidence(out_page, evidence, static_matches, selected_field=selected_field)
-    reg = _register(org_page, out_page) if org_page else None
-    raw_org = reg["org_image"] if reg else (Image.open(io.BytesIO(org_page["image_bytes"])).convert("RGB") if org_page and org_page.get("image_bytes") else None)
-    registered_org = _registered_org_image(reg) if reg else raw_org
-    out_img = Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB")
+    """Show the selected field as a precise block on BOTH ORG and Output.
 
-    selected_ev = next((e for e in evidence if e["page"] == selected_page and e["field"] == selected_field), None)
-    focus = None
-    if selected_ev and selected_ev.get("boxes"):
-        boxes = selected_ev["boxes"]
-        focus = (min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes))
+    This intentionally avoids the old blurred/recreated full-page tag view.
+    The user sees the exact evidence rectangle for the chosen field in the two
+    coordinate-matched artworks.
+    """
+    output_pages=result.get("output_pages",[]); org_pages=result.get("org_pages",[]); evidence=result.get("evidence",[])
+    page_numbers=_safe_page_numbers(output_pages)
+    if not page_numbers: return
+    if selected_page not in page_numbers: selected_page=page_numbers[0]
+    idx=page_numbers.index(selected_page)
+    out_page=output_pages[idx]
+    org_page=org_pages[idx] if idx < len(org_pages) else None
+    ev=next((e for e in evidence if e.get("page")==selected_page and e.get("field")==selected_field),None)
 
-    st.components.v1.html(
-        _viewer_html(raw_org, registered_org, out_img, annotated or out_img, focus_box=focus, height=520),
-        height=540,
-        scrolling=False,
-    )
+    out_img=Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB") if out_page.get("image_bytes") else None
+    reg=_register(org_page,out_page) if org_page else None
+    org_img=_registered_org_image(reg) if reg else (Image.open(io.BytesIO(org_page["image_bytes"])).convert("RGB") if org_page and org_page.get("image_bytes") else None)
 
-    if selected_ev:
+    if ev:
+        color=RED if ev.get("status")=="FAIL" else ORANGE if ev.get("status")=="REVIEW" else YELLOW if ev.get("classification")=="STATIC" else _field_color(selected_field)
+        out_boxes=list(ev.get("boxes",[]))
+        if not out_boxes and ev.get("output_block"):
+            out_boxes=[ev["output_block"].get("bbox")]
+        org_boxes=[]
+        if ev.get("org_block") and ev["org_block"].get("bbox"):
+            org_boxes=[ev["org_block"]["bbox"]]
+        out_focus=_focus_image(out_img,out_boxes,f"{selected_field} • {ev.get('status','INFO')}",color)
+        org_focus=_focus_image(org_img,org_boxes,f"{selected_field} • ORG",color)
+    else:
+        out_focus=out_img; org_focus=org_img
+
+    a,b=st.columns(2,gap="small")
+    with a:
+        st.markdown("<div class='t3-evidence-panel'><div class='t3-evidence-title'>ORG SPEC — REGISTERED EVIDENCE</div><div class='t3-evidence-sub'>The selected field's nearest ORG reference region is boxed below.</div>",unsafe_allow_html=True)
+        if org_focus: st.image(org_focus, width="stretch")
+        else: st.info("No ORG evidence region could be safely mapped for this field.")
+        st.markdown("</div>",unsafe_allow_html=True)
+    with b:
+        st.markdown("<div class='t3-evidence-panel'><div class='t3-evidence-title'>OUTPUT — SELECTED EVIDENCE</div><div class='t3-evidence-sub'>This is the exact Output region used for the Tool 1 result.</div>",unsafe_allow_html=True)
+        if out_focus: st.image(out_focus, width="stretch")
+        else: st.info("No Output evidence region could be safely mapped for this field.")
+        st.markdown("</div>",unsafe_allow_html=True)
+
+    if ev:
+        lock='🔒 Evidence locked' if ev.get('locked') else '⚠ Evidence not locked'
         st.markdown(
-            f"<div class='t3-role'><b>{html.escape(selected_field)}</b> • "
-            f"{_status_badge(selected_ev.get('status','INFO'))} &nbsp; "
-            f"{_status_badge(selected_ev.get('classification','VARIABLE'))} &nbsp; "
-            f"{'🔒 Evidence locked' if selected_ev.get('locked') else 'Evidence needs review'}<br>"
-            f"<b>Order Form:</b> {html.escape(str(selected_ev.get('expected','')))}<br>"
-            f"<b>Output:</b> {html.escape(str(selected_ev.get('actual','')))}<br>"
-            f"<b>Finding:</b> {html.escape(str(selected_ev.get('difference','—')))}</div>",
-            unsafe_allow_html=True,
-        )
-
+            f"<div class='t3-role'><span class='t3-focus-tag'>⌖ {html.escape(selected_field)}</span> &nbsp; {_status_badge(ev.get('status','INFO'))} &nbsp; {_status_badge(ev.get('classification','VARIABLE'))} &nbsp; {lock}<br>"
+            f"<b>Order Form:</b> {html.escape(str(ev.get('expected','')))}<br>"
+            f"<b>Output:</b> {html.escape(str(ev.get('actual','')))}<br>"
+            f"<b>Finding:</b> {html.escape(str(ev.get('difference','—')))}</div>", unsafe_allow_html=True)
 
 def _render_navigation(back_step=None, next_label="Next", next_key=None, next_disabled=False):
     left, right = st.columns([1, 1])
@@ -1730,17 +1839,22 @@ def main():
             "<div class='t3-hero-sub'>Tool 1 will detect relevant Order Form fields. Tool 3 will then analyze ORG structure, compare Output, lock evidence, and prepare the visual QC workspace.</div></div>",
             unsafe_allow_html=True,
         )
-        if _render_navigation(next_label="Start Auto Detect", next_key=f"t3_stage1_next_{reset}"):
+        if _render_navigation(next_label="Start Auto Detect", next_key=f"t3_stage1_next_{reset}", next_disabled=not ready):
             try:
-                with st.spinner("Preparing files and running Tool 1 Auto Detect…"):
-                    result = _prepare_run(order_file, org_file, output_file, product)
-                    st.session_state["t3_result"] = result
-                    st.session_state["t3_confirmed_fields"] = set()
-                    st.session_state["t3_stage"] = 2
-                    st.session_state["t3_focus_field"] = result["selected_fields"][0] if result["selected_fields"] else None
+                with st.status("Preparing files and running Tool 1 Auto Detect…", expanded=True) as status:
+                    st.write("1/3 Reading Order Form…")
+                    # Fast path: load Order Form + Output only. ORG analysis is deferred.
+                    st.write("2/3 Reading Output artwork…")
+                    result = _prepare_detect_run(order_file, org_file, output_file, product)
+                    st.write("3/3 Running Tool 1 Auto Detect…")
+                    status.update(label=f"Auto Detect complete — {len(result.get('detected_fields', []))} field(s) detected", state="complete")
+                st.session_state["t3_result"] = result
+                st.session_state["t3_confirmed_fields"] = set()
+                st.session_state["t3_stage"] = 2
+                st.session_state["t3_focus_field"] = result["selected_fields"][0] if result["selected_fields"] else None
                 st.rerun()
             except Exception as exc:
-                st.error(f"QC setup could not be completed: {exc}")
+                st.error(f"QC Auto Detect could not be completed: {exc}")
         return
 
     result = st.session_state.get("t3_result")
@@ -1754,6 +1868,14 @@ def main():
     # ------------------------------------------------------------------
     if stage == 2:
         _render_stage_header(2, "Auto Detect Fields", "Review what Tool 1 detected and see the exact artwork regions before confirming them.")
+        if not result.get("evidence_ready"):
+            with st.status("Preparing field evidence…", expanded=True) as status:
+                st.write("1/3 Reading ORG Spec…")
+                st.write("2/3 Running Tool 1 field validation for detected fields…")
+                _ensure_visual_evidence(result, result.get("selected_fields", []))
+                st.write("3/3 Mapping each detected field to ORG and Output evidence…")
+                status.update(label="Field evidence ready", state="complete")
+            st.session_state["t3_result"] = result
         counts = _status_counts(result["evidence"], result["static_matches"], result["unaccounted"])
         stats = st.columns(4)
         with stats[0]: st.markdown(f"<div class='t3-mini-stat'><b>{len(result['detected_fields'])}</b><span>Fields detected</span></div>", unsafe_allow_html=True)
