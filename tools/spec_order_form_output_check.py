@@ -134,6 +134,15 @@ def _tool3_css():
     st.markdown(
         f"""
         <style>
+        :root, html, body, #root {{ color-scheme: dark !important; background-color: #07111f !important; }}
+        body {{ margin:0 !important; background:#07111f !important; }}
+        #root, .stApp, [data-testid="stApp"], [data-testid="stAppViewContainer"],
+        [data-testid="stMain"], [data-testid="stMainBlockContainer"],
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stMainBlockContainer"] > div {{
+            background:#07111f !important; background-color:#07111f !important; color:#e7f0fb !important;
+        }}
+        [data-testid="stHeader"], [data-testid="stToolbar"] {{ background:#07111f !important; }}
         @keyframes t3Pulse {{
             0%,100% {{ box-shadow:0 0 0 0 rgba(59,130,246,.16), 0 0 0 rgba(34,211,238,0); }}
             50% {{ box-shadow:0 0 0 4px rgba(59,130,246,.07), 0 0 24px rgba(34,211,238,.16); }}
@@ -197,6 +206,7 @@ def _tool3_css():
         .t3-hero-title {{ font-size:11px; font-weight:850; color:{TEXT} !important; }}
         .t3-hero-sub {{ font-size:8px; color:{MUTED} !important; margin-top:4px; line-height:1.45; }}
         .t3-bottom-note {{ text-align:center; color:#6f849b !important; font-size:9px; margin-top:12px; }}
+        .t3-nav-stage {{ text-align:center; color:#7ea6cf !important; font-size:9px; font-weight:850; padding-top:9px; letter-spacing:.8px; }}
 
         [data-baseweb="select"] > div {{ background:#0c192b !important; border:1px solid #284563 !important; border-radius:8px !important; min-height:36px !important; }}
         [data-baseweb="select"] input, [data-baseweb="select"] span {{ color:{TEXT} !important; }}
@@ -229,6 +239,12 @@ def _tool3_css():
         .t3-evidence-sub {{ font-size:8px; color:#7e95ac !important; margin-bottom:8px; }}
         .t3-evidence-note {{ font-size:8px; color:#8fa3ba !important; margin-top:6px; line-height:1.45; }}
         .t3-focus-tag {{ display:inline-flex; align-items:center; gap:5px; padding:4px 7px; border-radius:999px; background:#113253; color:#d7ebff !important; border:1px solid #2b5f92; font-size:8px; font-weight:850; }}
+        [data-testid="stBaseButton-secondary"], [data-testid="stBaseButton-primary"], .stButton button, .stDownloadButton button, .stFileUploader button, [data-testid="stFileUploaderDropzone"] button {{ color:#e7f0fb !important; background:#0c192b !important; border-color:#294663 !important; }}
+        [data-testid="stBaseButton-primary"], .stButton button[kind="primary"], .stDownloadButton button {{ background:linear-gradient(90deg,#2563eb,#4f46e5) !important; color:#fff !important; border:0 !important; }}
+        [data-testid="stFileUploaderDropzone"] {{ background:#0d1d31 !important; border:1px dashed #3a5f84 !important; }}
+        [data-testid="stFileUploaderDropzone"] *, [data-testid="stFileUploaderDropzoneInstructions"] *, [data-testid="stFileUploaderDropzoneInstructions"] span {{ color:#cfe0f2 !important; }}
+        [data-testid="stFileUploaderFileName"], [data-testid="stFileUploaderFile"] {{ color:#e7f0fb !important; background:#0b1729 !important; }}
+        .stRadio label, .stRadio label p, .stRadio label span, .stSelectbox label, .stTextInput label, .stFileUploader label {{ color:#e7f0fb !important; }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -247,6 +263,41 @@ def _render_stepper(active_step=3):
         state = "done" if idx < active_step else ("active" if idx == active_step else "")
         cells.append(f'<div class="t3-step {state}"><div class="t3-step-num">{num}</div><div class="t3-step-name">{html.escape(name)}</div><div class="t3-step-note">{html.escape(note)}</div></div>')
     st.markdown('<div class="t3-stepper">' + ''.join(cells) + '</div>', unsafe_allow_html=True)
+
+
+def _go_dashboard():
+    """Return to the main project dashboard."""
+    st.session_state["selected_tool"] = None
+    st.session_state["screen"] = "home"
+    st.session_state["t3_result"] = None
+    st.session_state["t3_focus_field"] = None
+    st.session_state["t3_confirmed_fields"] = set()
+    st.rerun()
+
+
+def _new_start(reset_id):
+    """Reset Tool 3 to Stage 1 and refresh uploader widget keys."""
+    st.session_state["t3_reset_id"] = int(reset_id) + 1
+    st.session_state["t3_stage"] = 1
+    st.session_state["t3_result"] = None
+    st.session_state["t3_focus_field"] = None
+    st.session_state["t3_confirmed_fields"] = set()
+    st.rerun()
+
+
+def _render_navigation(reset_id, stage):
+    left, center, right = st.columns([1.25, 1.0, 1.25], gap="small")
+    with left:
+        if st.button("← BACK TO DASHBOARD", key=f"t3_back_dashboard_{reset_id}", width="stretch"):
+            _go_dashboard()
+    with center:
+        st.markdown(
+            f"<div class='t3-nav-stage'>STEP {int(stage)} OF 5</div>",
+            unsafe_allow_html=True,
+        )
+    with right:
+        if st.button("↻ NEW START", key=f"t3_new_start_{reset_id}", width="stretch"):
+            _new_start(reset_id)
 
 
 def _render_top():
@@ -1769,6 +1820,7 @@ def main():
     stage = int(st.session_state["t3_stage"])
 
     _render_top()
+    _render_navigation(reset, stage)
     _render_stepper(stage)
 
     # ------------------------------------------------------------------
