@@ -1166,26 +1166,47 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                 continue
 
             if m.get("case_mismatch"):
-                # A Tool 1 variable field already owns its physical occurrence.
-                # Its existing presentation rule is authoritative (notably for
-                # PFL), so do not add a second ORG case failure for that same box.
-                claimed_by_variable = any(
-                    int(ev.get("page", 1)) == page_no
-                    and ev.get("classification") == "VARIABLE"
-                    and any(
-                        _iou(box, m["output"]["bbox"]) >= .45
-                        for box in (ev.get("boxes", []) or [])
-                    )
-                    for ev in variable_evidence
-                )
-                if claimed_by_variable:
-                    locked_output[page_no].append(m["output"]["bbox"])
-                    locked_org[page_no].add(m["org_index"])
-                    continue
-
                 org_text = m["org"].get("text", "")
                 output_text = m["output"].get("text", "")
-                case_mismatches.append({
+                case_reason = (
+                    f"ORG capitalization mismatch: ORG Spec uses {org_text!r}; "
+                    f"Output uses {output_text!r}."
+                )
+
+                # A case-only ORG mismatch can overlap a Tool 1 variable finding.
+                # Do not let the PFL Order-Form presentation rule hide it: attach
+                # the ORG failure to that existing finding, so the field itself
+                # changes to FAIL without counting the same occurrence twice.
+                variable_owners = []
+                for ev in variable_evidence:
+                    if (
+                        int(ev.get("page", 1)) != page_no
+                        or ev.get("classification") != "VARIABLE"
+                    ):
+                        continue
+                    overlap = max(
+                        (_iou(box, m["output"]["bbox"]) for box in (ev.get("boxes", []) or [])),
+                        default=0.0,
+                    )
+                    if overlap >= .45:
+                        variable_owners.append((overlap, ev))
+
+                if variable_owners:
+                    # Use the strongest geometric owner if multiple Tool 1 fields
+                    # report the same physical artwork occurrence.
+                    owner = max(variable_owners, key=lambda item: item[0])[1]
+                    owner["status"] = "FAIL"
+                    owner["org_case_mismatch"] = True
+                    owner["presentation_status"] = "FAIL"
+                    owner["presentation_reason"] = case_reason
+                    previous_difference = str(owner.get("difference", "") or "").strip()
+                    if case_reason not in previous_difference:
+                        if previous_difference in {"", "—", "-"}:
+                            owner["difference"] = case_reason
+                        else:
+                            owner["difference"] = previous_difference + " " + case_reason
+                else:
+                    case_mismatches.append({
                     "page": page_no,
                     "field": f"Static Case Mismatch #{len(case_mismatches) + 1}",
                     "field_type": "STATIC TEXT",
@@ -1194,10 +1215,7 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                     "actual": output_text,
                     "status": "FAIL",
                     "classification": "STATIC CASE MISMATCH",
-                    "difference": (
-                        f"Capitalization mismatch: ORG Spec uses {org_text!r}; "
-                        f"Output uses {output_text!r}."
-                    ),
+                    "difference": case_reason,
                     "org": m["org"],
                     "output": m["output"],
                     "org_block": m["org"],
