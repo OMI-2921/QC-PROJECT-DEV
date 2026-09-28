@@ -58,7 +58,7 @@ except Exception:
         auto_detect_fields,
     )
 
-TOOL3_VERSION = "2026-09-14-TOOL3-FIVE-STAGE-WIZARD-TOOL1-LINKED-V7-DARK-VISUAL-PROBE"
+TOOL3_VERSION = "2026-09-28-TOOL3-CASE-SENSITIVE-STATIC-V8"
 
 # -------------------------------- palette ----------------------------------
 BLUE = "#3b82f6"
@@ -117,6 +117,7 @@ def _status_badge(status):
         "VARIABLE": ("#dbeafe", BLUE_DARK),
         "MISSING / UNACCOUNTED": (PURPLE_BG, PURPLE),
         "LOCKED": ("#e0f2fe", "#0369a1"),
+        "STATIC CASE MISMATCH": (RED_BG, RED),
         "AUTO": ("#dcfce7", "#15803d"),
         "MANUAL": ("#e0e7ff", "#4338ca"),
         "INFO": (GRAY_BG, TEXT),
@@ -578,15 +579,31 @@ def _match_static(org_page, output_page, reg, locked_output_boxes, locked_org_in
                 continue
             score = _exact_static_score(ob, ub, page_w, page_h)
             if score is not None:
-                candidates.append((score, oi, ui))
+                # Prefer exact-case matches if more than one nearby occurrence
+                # has otherwise equivalent text.
+                exact_case = _visible_text_exact(ob.get("text", ""), ub.get("text", ""))
+                candidates.append((score, int(exact_case), oi, ui))
+    # Preserve the original location/size score as the primary selection rule;
+    # exact case is only a tie-breaker for otherwise equivalent candidates.
     candidates.sort(reverse=True)
     used_o = set(locked_org_indices); used_u = set()
     matches = []
-    for score, oi, ui in candidates:
+    for score, exact_case, oi, ui in candidates:
         if oi in used_o or ui in used_u:
             continue
         used_o.add(oi); used_u.add(ui)
-        matches.append({"org": org_blocks[oi], "output": out_blocks[ui], "org_index": oi, "output_index": ui, "score": score})
+        org_text = org_blocks[oi].get("text", "")
+        output_text = out_blocks[ui].get("text", "")
+        matches.append({
+            "org": org_blocks[oi],
+            "output": out_blocks[ui],
+            "org_index": oi,
+            "output_index": ui,
+            "score": score,
+            "case_mismatch": bool(
+                not exact_case and _visible_text_case_mismatch(org_text, output_text)
+            ),
+        })
     return matches
 
 
@@ -823,6 +840,22 @@ def _visible_text_exact(reference, actual):
         value = re.sub(r"\s+", " ", value)
         return value
     return bool(canon(reference)) and canon(reference) == canon(actual)
+
+
+def _visible_text_case_mismatch(reference, actual):
+    """Return True when the same alphanumeric text uses different letter case.
+
+    Punctuation and spacing are ignored only for identifying a capitalization
+    mismatch. The actual static matcher still applies its existing location and
+    text-similarity gates before this helper is used.
+    """
+    def compact_case_sensitive(value):
+        value = unicodedata.normalize("NFKC", str(value or ""))
+        return "".join(ch for ch in value if ch.isalnum())
+
+    ref = compact_case_sensitive(reference)
+    out = compact_case_sensitive(actual)
+    return bool(ref) and ref.casefold() == out.casefold() and ref != out
 
 
 def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
@@ -1083,6 +1116,7 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
     locked_output = defaultdict(list)
     locked_org = defaultdict(set)
     static_matches = []
+    case_mismatches = []
     registrations = []
     unaccounted = []
 
@@ -1126,20 +1160,68 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
             locked_org.get(page_no, set()),
         )
         for m in matches:
-            # Avoid duplicate ORG index records if the same exact static evidence
-            # was already claimed by a variable field classified as STATIC.
+            # Avoid duplicate ORG index records if the same evidence was already
+            # claimed by a variable field classified as STATIC.
             if m.get("org_index") in locked_org.get(page_no, set()):
                 continue
-            static_matches.append({
-                "page": page_no,
-                "org": m["org"],
-                "output": m["output"],
-                "org_index": m.get("org_index"),
-                "output_index": m.get("output_index"),
-                "status": "STATIC",
-                "classification": "STATIC",
-                "score": m["score"],
-            })
+
+            if m.get("case_mismatch"):
+                # A Tool 1 variable field already owns its physical occurrence.
+                # Its existing presentation rule is authoritative (notably for
+                # PFL), so do not add a second ORG case failure for that same box.
+                claimed_by_variable = any(
+                    int(ev.get("page", 1)) == page_no
+                    and ev.get("classification") == "VARIABLE"
+                    and any(
+                        _iou(box, m["output"]["bbox"]) >= .45
+                        for box in (ev.get("boxes", []) or [])
+                    )
+                    for ev in variable_evidence
+                )
+                if claimed_by_variable:
+                    locked_output[page_no].append(m["output"]["bbox"])
+                    locked_org[page_no].add(m["org_index"])
+                    continue
+
+                org_text = m["org"].get("text", "")
+                output_text = m["output"].get("text", "")
+                case_mismatches.append({
+                    "page": page_no,
+                    "field": f"Static Case Mismatch #{len(case_mismatches) + 1}",
+                    "field_type": "STATIC TEXT",
+                    "region": "ORG / Output",
+                    "expected": org_text,
+                    "actual": output_text,
+                    "status": "FAIL",
+                    "classification": "STATIC CASE MISMATCH",
+                    "difference": (
+                        f"Capitalization mismatch: ORG Spec uses {org_text!r}; "
+                        f"Output uses {output_text!r}."
+                    ),
+                    "org": m["org"],
+                    "output": m["output"],
+                    "org_block": m["org"],
+                    "output_block": m["output"],
+                    "org_index": m.get("org_index"),
+                    "output_index": m.get("output_index"),
+                    "boxes": [m["output"]["bbox"]],
+                    "locked": True,
+                    "score": m["score"],
+                })
+            else:
+                static_matches.append({
+                    "page": page_no,
+                    "org": m["org"],
+                    "output": m["output"],
+                    "org_index": m.get("org_index"),
+                    "output_index": m.get("output_index"),
+                    "status": "STATIC",
+                    "classification": "STATIC",
+                    "score": m["score"],
+                })
+
+            # Both exact static matches and casing failures consume the same
+            # physical ORG/Output occurrence so it cannot be counted twice.
             locked_output[page_no].append(m["output"]["bbox"])
             locked_org[page_no].add(m["org_index"])
 
@@ -1174,7 +1256,7 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                     "output": None,
                 })
 
-    return static_matches, unaccounted, registrations
+    return static_matches, case_mismatches, unaccounted, registrations
 
 
 # ============================================================================
@@ -1187,7 +1269,7 @@ def _rgba(hex_color, alpha):
     return tuple(int(value[i:i+2],16) for i in (0,2,4)) + (alpha,)
 
 
-def _draw_visual_evidence(page, variable_evidence, static_matches, selected_field=None):
+def _draw_visual_evidence(page, variable_evidence, static_matches, selected_field=None, case_mismatches=None):
     raw = page.get("image_bytes") if page else None
     if not raw:
         return None
@@ -1197,11 +1279,24 @@ def _draw_visual_evidence(page, variable_evidence, static_matches, selected_fiel
     entries = []
 
     page_no = int(page.get("page",1))
-    # Static first, but only where variable evidence did not already claim the region.
+    # Exact static matches remain yellow.
     for idx, m in enumerate([x for x in static_matches if x["page"] == page_no], start=1):
         b = m["output"]["bbox"]
         draw.rounded_rectangle(tuple(map(int,b)), radius=4, fill=_rgba(YELLOW,70), outline=_rgba(YELLOW,235), width=2)
         entries.append((b, f"S{idx}", "STATIC", YELLOW))
+
+    # Capitalization-only static differences are explicit red failures.
+    page_case_mismatches = [
+        x for x in (case_mismatches or []) if x.get("page") == page_no
+    ]
+    for idx, m in enumerate(page_case_mismatches, start=1):
+        b = m["output"]["bbox"]
+        bb = tuple(map(int, b))
+        if selected_field == m.get("field"):
+            draw.rounded_rectangle(bb, radius=5, fill=_rgba(RED,80), outline=_rgba(BLUE,255), width=4)
+        else:
+            draw.rounded_rectangle(bb, radius=4, fill=_rgba(RED,102), outline=_rgba(RED,245), width=2)
+        entries.append((b, f"C{idx}", m.get("field", "CASE MISMATCH"), RED))
 
     vars_page = [x for x in variable_evidence if x["page"] == page_no and x.get("classification", "VARIABLE") == "VARIABLE" and x.get("status") in {"PASS","FAIL","REVIEW"}]
     number_map = {x["field"]: i+1 for i,x in enumerate(variable_evidence)}
@@ -1425,15 +1520,15 @@ def _render_field_browser(all_fields, selected_fields, evidence, key_prefix):
 # ============================================================================
 
 
-def _overall(evidence, static_matches, unaccounted):
+def _overall(evidence, static_matches, unaccounted, case_mismatches=None):
     variable = [e for e in evidence if e.get("classification") == "VARIABLE"]
-    fails=sum(1 for e in variable if e["status"]=="FAIL")
+    fails=sum(1 for e in variable if e["status"]=="FAIL") + sum(1 for m in (case_mismatches or []) if m.get("status") == "FAIL")
     reviews=sum(1 for e in variable if e["status"]=="REVIEW")
     overall="FAIL" if fails or unaccounted else "REVIEW" if reviews else "PASS"
     return overall, len(static_matches), len([e for e in variable if e["status"] in {"PASS","FAIL","REVIEW"}]), fails, reviews, len(unaccounted)
 
 
-def _evidence_dataframe(evidence, static_matches, unaccounted):
+def _evidence_dataframe(evidence, static_matches, unaccounted, case_mismatches=None):
     rows=[]
     for e in evidence:
         org=e.get("org_block",{}).get("text", "Not mapped") if e.get("org_block") else "Not mapped"
@@ -1441,6 +1536,13 @@ def _evidence_dataframe(evidence, static_matches, unaccounted):
             "PDF PAGE":e["page"],"Element / Field":e["field"],"Type":e.get("classification", "VARIABLE"),"ORG Spec":org,
             "Output":e["actual"],"Order Form":e["expected"],"Status":e["status"],
             "Evidence Locked":"YES" if e.get("locked") else "NO","Source":e.get("source", "Tool 1"),"Notes":e["difference"],
+        })
+    for m in (case_mismatches or []):
+        rows.append({
+            "PDF PAGE":m["page"],"Element / Field":m.get("field", "Static Case Mismatch"),
+            "Type":"STATIC CASE MISMATCH","ORG Spec":m.get("expected", ""),
+            "Output":m.get("actual", ""),"Order Form":"—","Status":"FAIL",
+            "Evidence Locked":"YES","Source":"ORG","Notes":m.get("difference", "Capitalization differs."),
         })
     for m in static_matches:
         rows.append({
@@ -1467,7 +1569,7 @@ def _build_excel_report(result):
     labels=["Overall Result","Static Elements","Variable Elements","Issues","Manual Review","Unaccounted ORG Elements","Tool 1 Engine"]
     values=list(summary)+[TOOL1_ENGINE_VERSION]
     for i,(lab,val) in enumerate(zip(labels,values),start=3): ws.cell(i,1,lab); ws.cell(i,2,val)
-    comp=_evidence_dataframe(result["evidence"],result["static_matches"],result["unaccounted"])
+    comp=_evidence_dataframe(result["evidence"],result["static_matches"],result["unaccounted"],result.get("case_mismatches",[]))
     detail=wb.create_sheet("Field Comparison")
     if not comp.empty:
         for c,name in enumerate(comp.columns,1): detail.cell(1,c,name).fill=dark; detail.cell(1,c).font=white
@@ -1510,13 +1612,13 @@ def _safe_page_numbers(pages):
     return [int(p.get("page", i + 1)) for i, p in enumerate(pages or [])]
 
 
-def _status_counts(evidence, static_matches, unaccounted):
+def _status_counts(evidence, static_matches, unaccounted, case_mismatches=None):
     variable = [e for e in evidence if e.get("classification") == "VARIABLE"]
     return {
         "static": len(static_matches),
         "variable": len(variable),
         "pass": sum(1 for e in variable if e.get("status") == "PASS"),
-        "fail": sum(1 for e in variable if e.get("status") == "FAIL"),
+        "fail": sum(1 for e in variable if e.get("status") == "FAIL") + sum(1 for m in (case_mismatches or []) if m.get("status") == "FAIL"),
         "review": sum(1 for e in variable if e.get("status") == "REVIEW"),
         "unaccounted": len(unaccounted),
     }
@@ -1533,13 +1635,13 @@ def _run_tool3_pipeline(result, selected_fields=None):
 
     report = _tool1_variable_results(df, output_pages, selected, product, mapping)
     evidence = _build_variable_evidence(df, output_pages, org_pages, report, product)
-    static_matches, unaccounted, registrations = _classify_static_and_unaccounted(
+    static_matches, case_mismatches, unaccounted, registrations = _classify_static_and_unaccounted(
         org_pages, output_pages, evidence
     )
-    summary = _overall(evidence, static_matches, unaccounted)
+    summary = _overall(evidence, static_matches, unaccounted, case_mismatches)
     annotated_images = {
         int(p.get("page", i + 1)): _draw_visual_evidence(
-            p, evidence, static_matches
+            p, evidence, static_matches, case_mismatches=case_mismatches
         )
         for i, p in enumerate(output_pages)
     }
@@ -1549,6 +1651,7 @@ def _run_tool3_pipeline(result, selected_fields=None):
         "report": report,
         "evidence": evidence,
         "static_matches": static_matches,
+        "case_mismatches": case_mismatches,
         "unaccounted": unaccounted,
         "registrations": registrations,
         "summary": summary,
@@ -1928,7 +2031,7 @@ def main():
                 st.write("3/3 Mapping each detected field to ORG and Output evidence…")
                 status.update(label="Field evidence ready", state="complete")
             st.session_state["t3_result"] = result
-        counts = _status_counts(result["evidence"], result["static_matches"], result["unaccounted"])
+        counts = _status_counts(result["evidence"], result["static_matches"], result["unaccounted"], result.get("case_mismatches", []))
         stats = st.columns(4)
         with stats[0]: st.markdown(f"<div class='t3-mini-stat'><b>{len(result['detected_fields'])}</b><span>Fields detected</span></div>", unsafe_allow_html=True)
         with stats[1]: st.markdown(f"<div class='t3-mini-stat'><b>{sum(1 for e in result['evidence'] if e.get('locked'))}</b><span>Evidence mapped</span></div>", unsafe_allow_html=True)
@@ -2074,11 +2177,13 @@ def main():
         registered_org = _registered_org_image(reg) if reg else raw_org
         out_img = Image.open(io.BytesIO(out_page["image_bytes"])).convert("RGB")
         focus_field = st.session_state.get("t3_focus_field")
-        annotated = _draw_visual_evidence(out_page, result["evidence"], result["static_matches"], selected_field=focus_field)
+        annotated = _draw_visual_evidence(out_page, result["evidence"], result["static_matches"], selected_field=focus_field, case_mismatches=result.get("case_mismatches", []))
 
         focus_box = None
         if focus_field:
             ev_focus = next((e for e in result["evidence"] if e["field"] == focus_field and e["page"] == selected_page), None)
+            if ev_focus is None:
+                ev_focus = next((e for e in result.get("case_mismatches", []) if e.get("field") == focus_field and e.get("page") == selected_page), None)
             if ev_focus and ev_focus.get("boxes"):
                 bxs = ev_focus["boxes"]
                 focus_box = (min(b[0] for b in bxs), min(b[1] for b in bxs), max(b[2] for b in bxs), max(b[3] for b in bxs))
@@ -2089,6 +2194,9 @@ def main():
 
         viewer_left, viewer_right = st.columns([2.0, 1.0], gap="small")
         page_evidence = [e for e in result["evidence"] if e["page"] == selected_page]
+        page_evidence.extend(
+            e for e in result.get("case_mismatches", []) if e.get("page") == selected_page
+        )
         if filter_choice == "FAIL":
             display_findings = [e for e in page_evidence if e.get("status") == "FAIL"]
         elif filter_choice == "REVIEW":
@@ -2096,7 +2204,7 @@ def main():
         elif filter_choice == "PASS":
             display_findings = [e for e in page_evidence if e.get("status") == "PASS"]
         elif filter_choice == "STATIC":
-            display_findings = [e for e in page_evidence if e.get("classification") == "STATIC"]
+            display_findings = [e for e in page_evidence if e.get("classification") in {"STATIC", "STATIC CASE MISMATCH"}]
         else:
             display_findings = page_evidence
 
@@ -2128,7 +2236,8 @@ def main():
                 with c1:
                     st.markdown(f"<div class='t3-card'><div class='t3-card-title'>{html.escape(chosen['field'])}</div><div style='margin-top:5px'>{_status_badge(chosen.get('classification','VARIABLE'))} {_status_badge(chosen.get('status','INFO'))}</div><div class='t3-card-sub' style='margin-top:6px'>Family: {html.escape(chosen.get('field_type',''))}<br>Region: {html.escape(str(chosen.get('region') or '—'))}<br>{'🔒 Evidence locked' if chosen.get('locked') else 'Evidence not locked'}</div></div>", unsafe_allow_html=True)
                 with c2:
-                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Values</div><div class='t3-card-sub' style='margin-top:6px'><b>Order Form</b><br>{html.escape(chosen.get('expected',''))}<br><br><b>Output</b><br>{html.escape(chosen.get('actual',''))}</div></div>", unsafe_allow_html=True)
+                    expected_label = "ORG Spec" if chosen.get("classification") == "STATIC CASE MISMATCH" else "Order Form"
+                    st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Values</div><div class='t3-card-sub' style='margin-top:6px'><b>{expected_label}</b><br>{html.escape(chosen.get('expected',''))}<br><br><b>Output</b><br>{html.escape(chosen.get('actual',''))}</div></div>", unsafe_allow_html=True)
                 with c3:
                     st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Why?</div><div class='t3-card-sub' style='margin-top:6px'>{html.escape(chosen.get('difference','—'))}</div></div>", unsafe_allow_html=True)
             else:
@@ -2166,11 +2275,17 @@ def main():
                 st.markdown(f"<div class='t3-mini-stat'><b>{value}</b><span>{label}</span></div>", unsafe_allow_html=True)
 
         issues = [e for e in result["evidence"] if e.get("classification") == "VARIABLE" and e.get("status") in {"FAIL", "REVIEW"}]
-        if issues or result["unaccounted"]:
+        case_issues = [m for m in result.get("case_mismatches", []) if m.get("status") == "FAIL"]
+        if issues or case_issues or result["unaccounted"]:
             st.markdown("<div class='t3-section-title'>Issues Requiring Attention</div>", unsafe_allow_html=True)
             for e in issues:
                 st.markdown(
                     f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>{html.escape(e['field'])}</div>{_status_badge(e['status'])}</div><div class='t3-field-sub'>Page {e['page']} • Expected: {html.escape(e['expected'])} • Found: {html.escape(e['actual'])}<br>{html.escape(e['difference'])}</div></div>",
+                    unsafe_allow_html=True,
+                )
+            for m in case_issues:
+                st.markdown(
+                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>{html.escape(m.get('field', 'Static Case Mismatch'))}</div>{_status_badge('FAIL')}</div><div class='t3-field-sub'>Page {m['page']} • ORG Spec: {html.escape(m.get('expected', ''))} • Output: {html.escape(m.get('actual', ''))}<br>{html.escape(m.get('difference', 'Capitalization differs.'))}</div></div>",
                     unsafe_allow_html=True,
                 )
             for u in result["unaccounted"]:
