@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-13-COMPARISON-ENGINE-EVIDENCE-LINKED-VISUAL-14"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-28-ROBUST-SHARED-VALIDATOR-CONTENT-COO-CODE-FIX-V15"
 import pandas as pd
 import fitz
 import re
@@ -424,61 +424,68 @@ def get_field_region(field_name):
 
 
 def get_field_type(field_name):
-    field = normalize_text(field_name)
-    compact = field.replace(" ", "").replace("_", "").replace("-", "")
+    """Classify an Order Form column into the validator family that matches its artwork semantics.
 
-    # Explicit sequence fields such as OSZ1, OSZ2 ...
-    if re.fullmatch(r"osz\d+", compact):
+    The classification intentionally understands common schema prefixes such as varUPC,
+    varUPC1, varRN, varCA, varStyle, MIN_*, FIB_* and WC_* without hard-coding a single job.
+    """
+    raw_name = str(field_name or "")
+    field = normalize_text(raw_name)
+    compact = re.sub(r"[^a-z0-9]", "", raw_name.casefold())
+
+    # Explicit sequence fields such as OSZ1, OSZ2 / OS_Size_1, OS_Size_2.
+    if re.fullmatch(r"(?:osz|ossize)\d+", compact):
         return "OSZ"
 
+    # Symbols / custom-font keys.
     if "symbol" in compact or compact in {"caremark", "caresymbol", "washsymbol"}:
         return "SYMBOL"
 
-    # Barcode / GTIN family fields.  Keep this ahead of IDENTIFIER so UPC/EAN/GTIN
-    # columns get the barcode-specific normalization rather than identifier-prefix
-    # logic.  This does not affect ordinary item/style/supplier identifiers.
+    # Barcode / GTIN family, including common var* schema names.
     if (
         "barcode" in compact
         or "barcodenumber" in compact
-        or compact in {"upc", "upca", "ean", "ean8", "ean13", "ean14", "gtin", "gtin8", "gtin12", "gtin13", "gtin14", "jan", "isbn", "itf"}
-        or re.search(r"(?:^|(?:_|-|\s))(?:upc|ean|gtin|jan|isbn|itf)(?:\d+)?(?:$|(?:_|-|\s))", str(field_name).casefold())
+        or re.fullmatch(r"(?:var)?(?:upc|ean|gtin|jan|isbn|itf)(?:\d+)?", compact)
+        or re.match(r"^var(?:upc|ean|gtin|jan|isbn|itf)\d*$", compact)
     ):
         return "BARCODE"
 
+    # RN and CA registration numbers, including varRN / varCA / RN_Number / CA_Number.
     if (
-        compact == "rn"
-        or "rnno" in compact
-        or "rnnumber" in compact
+        compact in {"rn", "varrn", "rnno", "varrnno"}
+        or re.fullmatch(r"(?:var)?rn(?:no|number)?\d*", compact)
         or "registrationnumber" in compact
         or "companyrn" in compact
-        or compact.startswith("rn")
     ):
         return "RN"
 
-    # Canadian registration number fields are distinct from RN but use the
-    # same structured-number evidence. Keep CA_Number from being classified as
-    # generic text.
-    if compact in {"ca", "canumber", "caregistrationnumber", "registrationcanumber"} or "canumber" in compact:
+    if (
+        compact in {"ca", "varca", "canumber", "varcanumber"}
+        or re.fullmatch(r"(?:var)?ca(?:no|number|registrationnumber)?\d*", compact)
+        or "caregistrationnumber" in compact
+        or "registrationcanumber" in compact
+    ):
         return "CA"
 
-    if "productionmark" in compact or "prodmark" in compact or compact == "production":
+    if "productionmark" in compact or "prodmark" in compact or compact in {"production", "varproduction"}:
         return "PRODUCTION_MARK"
 
-    if compact == "iso" or compact.startswith("iso"):
-        return "IDENTIFIER"
-
+    # Common explicit identifiers. Treat Style as an identifier because it can be
+    # printed without a literal "Style:" label.
     if (
         "sku" in compact
         or "itemcode" in compact
         or "itemnumber" in compact
         or "itemno" in compact
         or "stylecode" in compact
-        or compact == "style"
+        or re.fullmatch(r"(?:var)?style(?:no|number|code)?\d*", compact)
         or "productcode" in compact
         or "supwsp" in compact
         or "supplier" in compact
         or "vendorid" in compact
         or "vendorcode" in compact
+        or compact == "iso"
+        or compact.startswith("iso")
     ):
         return "IDENTIFIER"
 
@@ -494,9 +501,7 @@ def get_field_type(field_name):
     ):
         return "QUANTITY"
 
-    # Country of Origin / Made-In field families.
-    # Recognize semantic schema conventions (not individual job columns), so
-    # fields such as MIN_EN / MIN_SP are handled without a hardcoded list.
+    # Country of Origin / Made-In.
     if (
         "coo" in compact
         or "countryoforigin" in compact
@@ -507,12 +512,12 @@ def get_field_type(field_name):
     ):
         return "COO"
 
-    # Fiber / Fabric / Content field families.
-    # Common production schemas use FIB_* as shorthand for visible fiber
-    # composition. This is intentionally a semantic family rule, not a list of
-    # individual field names.
+    # Visible combined composition fields such as varCombo1 are content fields.
+    # ComboEOD / ExclusiveOf are separate visible text fields and stay GENERAL.
     if (
-        "fiber" in compact
+        re.fullmatch(r"(?:var)?combo\d+", compact)
+        or (compact.startswith("combo") and "eod" not in compact)
+        or "fiber" in compact
         or "fibre" in compact
         or "fabric" in compact
         or "content" in compact
@@ -522,11 +527,11 @@ def get_field_type(field_name):
         or "fabrication" in compact
         or "material" in compact
         or compact.startswith("fib")
+        or (compact.startswith("garment") and "content" in compact)
     ):
         return "CONTENT"
 
-    # Care/wash instruction field families. WC_* is a common shorthand for
-    # wash-care text.
+    # Care / wash.
     if (
         "care" in compact
         or "wash" in compact
@@ -537,6 +542,7 @@ def get_field_type(field_name):
     ):
         return "CARE"
 
+    # Size families.
     if (
         "size" in compact
         or "sizeline" in compact
@@ -550,17 +556,16 @@ def get_field_type(field_name):
 
     if "brand" in compact:
         return "BRAND"
-
     if "color" in compact or "colour" in compact:
         return "COLOR"
-
     if "gender" in compact:
         return "GENDER"
-
     if "attribute" in compact or "technology" in compact or "feature" in compact:
         return "ATTRIBUTE"
 
     return "GENERAL"
+
+
 
 
 def is_admin_field(field_name):
@@ -851,6 +856,32 @@ def _image_to_png_bytes(image):
     output = BytesIO()
     image.save(output, format="PNG")
     return output.getvalue()
+
+
+def _visual_image_bytes(image):
+    """Safely convert an annotated artwork image to PNG bytes for Excel."""
+    if image is None:
+        return None
+    if isinstance(image, bytes):
+        return image
+    if isinstance(image, (bytearray, memoryview)):
+        return bytes(image)
+    if hasattr(image, "getvalue"):
+        try:
+            value = image.getvalue()
+            if value:
+                return value
+        except Exception:
+            pass
+    if not hasattr(image, "save"):
+        return None
+    buffer = BytesIO()
+    try:
+        image.save(buffer, format="PNG")
+        return buffer.getvalue()
+    except (OSError, ValueError, TypeError):
+        return None
+
 
 
 def get_output_page_count(file):
@@ -1564,53 +1595,6 @@ def _visual_find_text_occurrences(page, target, groups=None, min_score=0.80):
     return []
 
 
-def _visual_field_markers(field_name):
-    """Strong region anchors for field-specific visual evidence."""
-    compact = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
-    field_type = get_field_type(field_name)
-    region = get_field_region(field_name)
-
-    if field_type == "CONTENT":
-        if "fibspmexico" in compact:
-            return ["cr/ec/gt/pa/sv : cuerpo", "cr/ec/gt/pa/sv:", "cr/ec/gt/pa/sv", "cuerpo"], [
-                "mx :", "mx cuerpo", "machine wash", "laver", "lavar", "made in", "rn"
-            ]
-        if "fibmexico" in compact:
-            return ["mx : cuerpo", "mx cuerpo", "mx :", "mx:"], [
-                "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
-            ]
-        if "fibca" in compact:
-            return ["ca : extérieur", "ca : exterieur", "ca extérieur", "ca exterieur", "extérieur", "exterieur"], [
-                "mx :", "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
-            ]
-        if "fibsp" in compact:
-            return ["cr/ec/gt/pa/sv : cuerpo", "cr/ec/gt/pa/sv:", "cr/ec/gt/pa/sv", "cuerpo"], [
-                "mx :", "machine wash", "laver", "lavar", "made in", "rn"
-            ]
-        if "fiben" in compact:
-            return ["us : shell", "us shell", "shell:", "shell"], [
-                "ca :", "mx :", "cr/ec/gt/pa/sv", "machine wash", "laver", "lavar", "made in", "rn"
-            ]
-        return ["shell", "content"], ["machine wash", "laver", "lavar", "made in", "rn"]
-
-    if field_type == "CARE":
-        if region == "FR":
-            return ["laver à la machine", "laver a la machine", "laver"], ["machine wash", "lavar", "made in", "rn"]
-        if region == "SP":
-            return ["lavar a máquina", "lavar a maquina", "lavar"], ["machine wash", "laver", "made in", "rn"]
-        return ["machine wash", "wash"], ["laver", "lavar", "made in", "rn"]
-
-    if field_type == "COO":
-        if region == "FR":
-            return ["fabrique en"], ["made in", "hecho en", "rn", "ca"]
-        if region == "SP":
-            return ["hecho en"], ["made in", "fabrique en", "rn", "ca"]
-        return ["made in"], ["fabrique en", "hecho en", "rn", "ca"]
-
-    if field_type in {"RN", "CA"}:
-        return ["rn", "ca"], ["machine wash", "laver", "lavar", "made in"]
-
-    return [], []
 
 
 def _visual_find_direct_scalar_box(page, target):
@@ -1646,97 +1630,8 @@ def _visual_find_direct_scalar_box(page, target):
     return []
 
 
-def _visual_region_groups(page, field_name):
-    """Return the physically relevant OCR/PDF line groups for a semantic field."""
-    groups = _visual_all_groups(page)
-    if not groups:
-        return []
-
-    starts, stops = _visual_field_markers(field_name)
-    starts = [_visual_norm(x) for x in starts if _visual_norm(x)]
-    stops = [_visual_norm(x) for x in stops if _visual_norm(x)]
-    if not starts:
-        return []
-
-    start_idx = None
-    for idx, group in enumerate(groups):
-        line_text = _visual_norm(_visual_group_text(group))
-        if line_text and any(marker in line_text for marker in starts):
-            start_idx = idx
-            break
-    if start_idx is None:
-        return []
-
-    field_type = get_field_type(field_name)
-    selected = []
-    max_lines = 10 if field_type == "CONTENT" else 22 if field_type == "CARE" else 3
-
-    for idx in range(start_idx, min(len(groups), start_idx + max_lines)):
-        group = groups[idx]
-        line_text = _visual_norm(_visual_group_text(group))
-        if not line_text:
-            continue
-
-        if idx > start_idx:
-            # A region marker on the same line is handled below; a marker on a
-            # new line ends the current semantic region before that line.
-            if any(stop in line_text for stop in stops):
-                break
-
-        group_to_use = list(group)
-
-        # When multiple regional values share one physical OCR line, clip the
-        # group before the next region marker instead of highlighting the entire
-        # combined line. This is critical for CA/MX/CR-EC-GT-PA-SV content.
-        if idx >= start_idx and stops:
-            for wi, word in enumerate(group_to_use):
-                word_norm = _visual_norm(word.get("text", ""))
-                if not word_norm:
-                    continue
-                if any(stop == word_norm or stop in word_norm for stop in stops):
-                    if idx == start_idx and wi == 0:
-                        group_to_use = []
-                    else:
-                        group_to_use = group_to_use[:wi]
-                    break
-
-        if not group_to_use:
-            break
-
-        if field_type == "CONTENT" and idx > start_idx:
-            raw_line = _visual_group_text(group_to_use)
-            has_content = bool(re.search(r"\d{1,3}\s*%", raw_line)) or any(
-                material in _visual_norm(raw_line)
-                for material in (
-                    "polyester", "spandex", "elastane", "cotton", "nylon", "rayon",
-                    "viscose", "acrylic", "linen", "wool", "elastodiene", "polyamide"
-                )
-            )
-            if not has_content:
-                if idx == start_idx + 1 and selected:
-                    selected.append(group_to_use)
-                    continue
-                break
-
-        selected.append(group_to_use)
-
-        if field_type == "CONTENT" and len(selected) >= 8:
-            break
-        if field_type not in {"CONTENT", "CARE"} and len(selected) >= 3:
-            break
-
-    return selected
 
 
-def _visual_region_boxes(page, field_name, actual_value=""):
-    """Find a semantic region when exact text occurrence is insufficient."""
-    groups = _visual_region_groups(page, field_name)
-    if not groups:
-        return []
-    boxes = []
-    for group in groups:
-        boxes.extend(_boxes_from_words(group))
-    return boxes
 
 
 
@@ -2393,10 +2288,15 @@ def _visual_find_field_boxes(page, field_name, expected_value, actual_value, sta
             return boxes
 
     # ------------------------------------------------------------------
-    # 2. CONTENT / CARE use semantic regional anchors first. Exact phrase
-    #    search is only a fallback because several language fields may contain
-    #    identical material/care text.
+    # 2. CONTENT / CARE. Component content fields should highlight only the
+    #    exact material span; regional FIB/CARE fields can use the complete
+    #    semantic block.
     # ------------------------------------------------------------------
+    if field_type == "CONTENT" and _is_component_content_field(field_name):
+        exact_component = _visual_find_text_occurrences(page, actual_value, min_score=0.72)
+        if exact_component:
+            return exact_component
+
     if field_type in {"CONTENT", "CARE"}:
         region_groups = _visual_region_groups(page, field_name)
         if region_groups:
@@ -2478,6 +2378,7 @@ def _visual_find_field_boxes(page, field_name, expected_value, actual_value, sta
             return boxes
 
     return []
+
 
 def _merge_nearby_boxes(boxes, gap=8):
     """Merge boxes that overlap or are nearly adjacent on the same line."""
@@ -3356,29 +3257,12 @@ def find_exact_lines(expected, field_name, state, max_window=8):
 # =========================================================
 
 def extract_coo_value(text):
-    normalized = normalize_text(text)
-    if not normalized:
-        return None
+    components = extract_coo_components(text)
+    return components[0]["full"] if components else None
 
-    patterns = [
-        r"\bmade\s+in\s+([a-z][a-z\s\-]*)",
-        r"\bfabrique\s+en\s+([a-z][a-z\s\-]*)",
-        r"\bhecho\s+en\s+([a-z][a-z\s\-]*)",
-    ]
 
-    for pattern in patterns:
-        match = re.search(pattern, normalized)
-        if not match:
-            continue
-        full = match.group(0).strip()
-        full = re.split(
-            r"\b(?:rn|ca|sku|size|color|colour|wash|machine)\b",
-            full,
-            maxsplit=1
-        )[0].strip()
-        return full
 
-    return None
+
 
 
 def coo_language(text):
@@ -3390,6 +3274,109 @@ def coo_language(text):
     if "hecho en" in normalized:
         return "SP"
     return ""
+
+
+def _ascii_fold(text):
+    """Accent-insensitive comparison helper for multilingual labels."""
+    value = unicodedata.normalize("NFKD", str(text or ""))
+    return "".join(ch for ch in value if not unicodedata.combining(ch))
+
+
+def extract_coo_components(text):
+    """Return language-specific COO phrases and their normalized positions.
+
+    A single line may contain multiple COO languages, e.g.:
+    'Made in Vietnam/ Fabriqué au Vietnam'.  The returned spans are relative to
+    normalize_text(text), allowing the RN/CA-style span consumption model to keep
+    the three language components independently available.
+    """
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+
+    folded_raw = _ascii_fold(raw)
+    patterns = [
+        ("EN", r"\bmade\s+in\s+([a-z][a-z\s\-]*?)(?=\s*/\s*|\bfabrique\s+au\b|\bhecho\s+en\b|\brn\b|\bca\b|$)"),
+        ("FR", r"\bfabrique\s+au\s+([a-z][a-z\s\-]*?)(?=\s*/\s*|\bmade\s+in\b|\bhecho\s+en\b|\brn\b|\bca\b|$)"),
+        ("SP", r"\bhecho\s+en\s+([a-z][a-z\s\-]*?)(?=\s*/\s*|\bmade\s+in\b|\bfabrique\s+au\b|\brn\b|\bca\b|$)"),
+    ]
+
+    folded_norm = normalize_text(folded_raw)
+    found = []
+    for language, pattern in patterns:
+        for match in re.finditer(pattern, folded_raw, flags=re.IGNORECASE):
+            country = re.sub(r"\s+", " ", match.group(1)).strip()
+            if not country:
+                continue
+            display_start_raw = match.start()
+            display_end_raw = match.end()
+            display = raw[display_start_raw:display_end_raw].strip(" /")
+            full_norm_folded = normalize_text(_ascii_fold(display))
+            pos = folded_norm.find(full_norm_folded)
+            if pos < 0:
+                continue
+            found.append({
+                "language": language,
+                "country": country,
+                "full": full_norm_folded,
+                "display": display,
+                "start": pos,
+                "end": pos + len(full_norm_folded),
+            })
+
+    # Preserve physical reading order when multiple languages occur on one line.
+    found.sort(key=lambda item: (item["start"], item["language"]))
+    # Remove duplicate spans from overlapping regex alternatives.
+    unique = []
+    seen = set()
+    for item in found:
+        key = (item["language"], item["start"], item["end"], item["full"])
+        if key not in seen:
+            unique.append(item)
+            seen.add(key)
+    return unique
+
+
+def _is_component_content_field(field_name):
+    compact = re.sub(r"[^a-z0-9]", "", str(field_name or "").casefold())
+    return bool(
+        re.search(r"(?:garment|component|fabrication|material).*(?:content|fiber|fibre)\d*", compact)
+        or re.fullmatch(r"(?:var)?garment\d+content\d+[a-z]*", compact)
+    )
+
+
+def _find_content_component_span(line, expected):
+    """Find one component value inside a shared composition line."""
+    if not line:
+        return None
+    line_norm = str(line.get("norm", ""))
+    expected_norm = normalize_text(expected)
+    if not line_norm or not expected_norm:
+        return None
+
+    # Exact normalized phrase first.
+    pos = line_norm.find(expected_norm)
+    if pos >= 0:
+        return pos, pos + len(expected_norm), expected_norm
+
+    # Compact fallback for spacing/line-artifact differences.
+    target_compact = re.sub(r"[^a-z0-9]+", "", expected_norm)
+    if not target_compact:
+        return None
+
+    chars = []
+    for idx, ch in enumerate(line_norm):
+        if ch.isalnum():
+            chars.append((ch.casefold(), idx))
+    compact_actual = "".join(ch for ch, _ in chars)
+    start = compact_actual.find(target_compact)
+    if start < 0:
+        return None
+    end = start + len(target_compact) - 1
+    raw_start = chars[start][1]
+    raw_end = chars[end][1] + 1
+    return raw_start, raw_end, line_norm[raw_start:raw_end]
+
 
 
 def extract_rn_ca_components(text):
@@ -3457,20 +3444,25 @@ def extract_size_value(text):
 
 
 def extract_color_value(text):
+    """Extract a real Color/Colour-labelled value without matching prose such as 'colors'."""
     normalized = normalize_text(text)
     match = re.search(
-        r"\b(?:color|colour)\s*[:#-]?\s*([a-z][a-z\s\-/]*)",
+        r"\b(?:color|colour)\b\s*[:#-]?\s*([a-z][a-z\s\-/]*)",
         normalized,
-        re.IGNORECASE
+        re.IGNORECASE,
     )
     if not match:
         return None
     value = re.split(
-        r"\b(?:size|rn|ca|made|country|sku|style)\b",
+        r"\b(?:size|rn|ca|made|country|sku|style|wash|machine)\b",
         match.group(1),
-        maxsplit=1
+        maxsplit=1,
     )[0].strip()
-    return value or None
+    # Do not accept an empty/stop-word-only capture.
+    if not value or value in {"s", "of", "and", "the"}:
+        return None
+    return value
+
 
 
 def extract_gender_value(text):
@@ -3555,6 +3547,63 @@ def extract_content_values(text):
             values.append(candidate)
 
     return values
+
+
+
+def _find_component_content_evidence(state, expected):
+    """Find a component-level composition value without consuming the whole line."""
+    expected_values = extract_content_values(expected)
+    if not expected_values:
+        return None
+
+    # First use the literal percentage/material phrase from the Order Form.
+    target = expected_values[0]
+    target_norm = normalize_text(target)
+
+    # Search every line because component fields can share one bilingual line.
+    for line in state.get("lines", []):
+        if not line_is_available(line, state):
+            continue
+        span = _find_content_component_span(line, target)
+        if span:
+            start, end, actual_fragment = span
+            # Compare the semantic component, not merely its typography.
+            actual_values = extract_content_values(actual_fragment)
+            if actual_values and _composition_signature([target]) == _composition_signature(actual_values[:1]):
+                return {
+                    "line": line,
+                    "start": start,
+                    "end": end,
+                    "actual": actual_fragment,
+                    "status": "PASS",
+                    "difference": "—",
+                    "match_type": "CONTENT_COMPONENT_EXACT_SPAN",
+                }
+
+    # If the same material appears with a different percentage, this is a genuine
+    # field mismatch rather than NOT FOUND.
+    expected_sig = _composition_signature([target])
+    expected_material = _content_material_key(target)
+    for line in state.get("lines", []):
+        if not line_is_available(line, state):
+            continue
+        actual_values = extract_content_values(line.get("text", ""))
+        for actual in actual_values:
+            if _content_material_key(actual) == expected_material:
+                span = _find_content_component_span(line, actual)
+                if span:
+                    start, end, actual_fragment = span
+                    return {
+                        "line": line,
+                        "start": start,
+                        "end": end,
+                        "actual": actual_fragment,
+                        "status": "FAIL",
+                        "difference": f"Expected: {expected} | Found: {actual_fragment}",
+                        "match_type": "CONTENT_COMPONENT_MISMATCH",
+                    }
+    return None
+
 
 
 def normalize_composition(values):
@@ -4637,6 +4686,26 @@ def check_field(
     # CONTENT: structured composition region
     # -----------------------------------------------------
     if field_type == "CONTENT":
+        # Component-level fields (for example varGarment2Content1English) map to
+        # individual composition spans. They must not consume the entire bilingual
+        # composition line because several fields intentionally share that line.
+        if _is_component_content_field(field_name):
+            component = _find_component_content_evidence(state, expected)
+            if component:
+                consume_span(state, component["line"], component["start"], component["end"])
+                return {
+                    "status": component["status"],
+                    "pdf": component["actual"],
+                    "difference": component["difference"],
+                    "match_type": component["match_type"],
+                }
+            return {
+                "status": "NOT FOUND",
+                "pdf": "Not found",
+                "difference": "Expected composition component was not detected.",
+                "match_type": "NOT_FOUND",
+            }
+
         expected_values = extract_content_values(expected)
         region = find_content_region(state, field_name)
         if region:
@@ -4644,6 +4713,9 @@ def check_field(
             actual_values = extract_content_values(actual_text)
             if expected_values and actual_values:
                 if _composition_signature(expected_values) == _composition_signature(actual_values):
+                    # Do not consume the full region. Regional/language fields can
+                    # intentionally share a multilingual composition block, and a
+                    # later field must still be able to validate its own span.
                     return {
                         "status": "PASS",
                         "pdf": actual_text,
@@ -4651,12 +4723,10 @@ def check_field(
                         "match_type": "CONTENT_REGION_EXACT"
                     }
 
-                # A related composition region with meaningful components is a
-                # real FAIL, not NOT FOUND.
                 expected_materials = {_content_material_key(x) for x in expected_values}
                 actual_materials = {_content_material_key(x) for x in actual_values}
                 overlap = expected_materials & actual_materials
-                if overlap or len(actual_values) >= 1:
+                if overlap or actual_values:
                     return {
                         "status": "FAIL",
                         "pdf": actual_text,
@@ -4664,8 +4734,7 @@ def check_field(
                         "match_type": "CONTENT_REGION_MISMATCH"
                     }
 
-        # Fallback: search broader contiguous windows. This protects raster/OCR
-        # documents where the component heading itself is not recognized.
+        # Fallback: exact composition window without consuming its lines.
         available = [line for line in state["lines"] if line_is_available(line, state)]
         max_window = min(8, len(available))
         for size in range(1, max_window + 1):
@@ -4676,14 +4745,13 @@ def check_field(
                     continue
                 actual_text = join_lines(candidate)
                 actual_values = extract_content_values(actual_text)
-                if actual_values and expected_values:
-                    if _composition_signature(expected_values) == _composition_signature(actual_values):
-                            return {
-                            "status": "PASS",
-                            "pdf": actual_text,
-                            "difference": "—",
-                            "match_type": "CONTENT_EXACT"
-                        }
+                if actual_values and expected_values and _composition_signature(expected_values) == _composition_signature(actual_values):
+                    return {
+                        "status": "PASS",
+                        "pdf": actual_text,
+                        "difference": "—",
+                        "match_type": "CONTENT_EXACT"
+                    }
 
         return {
             "status": "NOT FOUND",
@@ -4797,64 +4865,55 @@ def check_field(
     # COO
     # -----------------------------------------------------
     if field_type == "COO":
-        expected_coo = extract_coo_value(expected)
-        expected_target = normalize_text(
-            expected_coo if expected_coo else expected
-        )
         expected_region = get_field_region(field_name)
+        expected_components = extract_coo_components(expected)
+        expected_target = expected_components[0]["full"] if expected_components else normalize_text(_ascii_fold(expected))
+        if not expected_target:
+            return {
+                "status": "NOT FOUND",
+                "pdf": "Not found",
+                "difference": "Expected COO is blank or not structured.",
+                "match_type": "NOT_FOUND",
+            }
 
-        # Prefer the requested language. Do not let English COO satisfy French
-        # COO merely because the country happens to be the same.
         candidates = []
         for line in state["lines"]:
             if not line_is_available(line, state):
                 continue
-            actual_coo = extract_coo_value(line["text"])
-            if not actual_coo:
-                continue
-            region = coo_language(line["text"])
-            candidates.append((line, actual_coo, region))
+            for comp in extract_coo_components(line["text"]):
+                candidates.append((line, comp))
 
         preferred = [
             item for item in candidates
-            if expected_region and item[2] == expected_region
+            if not expected_region or item[1]["language"] == expected_region
         ]
 
-        # When no language suffix is supplied, any COO language may be used.
-        search_candidates = preferred if preferred else (
-            candidates if not expected_region else []
-        )
-
-        for line, actual_coo, _region in search_candidates:
-            if normalize_text(actual_coo) == expected_target:
-                consume_lines(state, [line])
+        # Exact language-specific span PASS.
+        for line, comp in preferred:
+            if comp["full"] == expected_target:
+                consume_span(state, line, comp["start"], comp["end"])
                 return {
                     "status": "PASS",
-                    "pdf": line["text"],
+                    "pdf": comp["display"],
                     "difference": "—",
-                    "match_type": "COO_EXACT"
+                    "match_type": "COO_EXACT_SPAN",
                 }
 
-        # A same-language different COO is a genuine FAIL.
-        for line, actual_coo, _region in search_candidates:
-            consume_lines(state, [line])
+        # Same-language COO with a different country = real FAIL.
+        for line, comp in preferred:
+            consume_span(state, line, comp["start"], comp["end"])
             return {
                 "status": "FAIL",
-                "pdf": line["text"],
-                "difference": (
-                    f"Expected: {expected} | "
-                    f"Found: {actual_coo}"
-                ),
-                "match_type": "COO_MISMATCH"
+                "pdf": comp["display"],
+                "difference": f"Expected: {expected} | Found: {comp['display']}",
+                "match_type": "COO_MISMATCH_SPAN",
             }
 
         return {
             "status": "NOT FOUND",
             "pdf": "Not found",
-            "difference": (
-                "Expected COO was not detected in the requested language/region."
-            ),
-            "match_type": "NOT_FOUND"
+            "difference": "Expected COO was not detected in the requested language/region.",
+            "match_type": "NOT_FOUND",
         }
 
     # -----------------------------------------------------
@@ -4882,7 +4941,6 @@ def check_field(
                     "match_type": "GENDER_EXACT"
                 }
 
-            consume_lines(state, [line])
             return {
                 "status": "FAIL",
                 "pdf": line["text"],
@@ -4917,7 +4975,8 @@ def check_field(
         if "\n" in str(expected) or len(str(expected_size).split()) >= 2:
             block = find_size_block_match(expected, field_name, state)
             if block:
-                consume_lines(state, block["lines"])
+                # Do not consume ordinary size blocks. Multiple Order Form size
+                # aliases may legitimately point to the same printed size.
                 return {
                     "status": block["status"],
                     "pdf": block["pdf"],
@@ -4934,7 +4993,10 @@ def check_field(
                 continue
 
             if normalize_text(actual_size) == expected_size:
-                consume_lines(state, [line])
+                # Do not consume ordinary size lines: multiple Order Form aliases
+                # (Size_French / Size1 / Size3 / Size_Order) may intentionally
+                # refer to the same printed size block. OSZ sequence fields have
+                # their own controlled consumption logic.
                 return {
                     "status": "PASS",
                     "pdf": line["text"],
@@ -4961,7 +5023,6 @@ def check_field(
         )
         if exact:
             lines, match_info = exact
-            consume_match(state, match_info)
             pdf_value = match_info.get("actual") or join_lines(lines)
             return {
                 "status": "PASS",
@@ -5009,11 +5070,7 @@ def check_field(
     # -----------------------------------------------------
     if field_type == "COLOR":
         expected_color = normalize_text(expected)
-        expected_color = re.sub(
-            r"^(?:color|colour)\s*[:#-]?\s*",
-            "",
-            expected_color
-        ).strip()
+        expected_color = re.sub(r"^(?:color|colour)\s*[:#-]?\s*", "", expected_color).strip()
 
         for line in state["lines"]:
             if not line_is_available(line, state):
@@ -5023,7 +5080,6 @@ def check_field(
                 continue
 
             if normalize_text(actual_color) == expected_color:
-                consume_lines(state, [line])
                 return {
                     "status": "PASS",
                     "pdf": line["text"],
@@ -5031,18 +5087,19 @@ def check_field(
                     "match_type": "COLOR_EXACT"
                 }
 
-            consume_lines(state, [line])
             return {
                 "status": "FAIL",
                 "pdf": line["text"],
-                "difference": (
-                    f"Expected: {expected} | "
-                    f"Found: {actual_color}"
-                ),
+                "difference": f"Expected: {expected} | Found: {actual_color}",
                 "match_type": "COLOR_MISMATCH"
             }
 
-        return _generic_exact_field(expected, field_name, state)
+        return {
+            "status": "NOT FOUND",
+            "pdf": "Not found",
+            "difference": "A labeled Color/Colour value was not detected.",
+            "match_type": "NOT_FOUND"
+        }
 
     # -----------------------------------------------------
     # CARE
@@ -5118,6 +5175,24 @@ def check_field(
                 "match_type": identifier["match_type"]
             }
 
+        # Some BarTender sources such as varStyle are printed as a bare token
+        # without a literal 'Style:' label. Exact identifier-token matching is the
+        # correct fallback; it is still far safer than fuzzy text matching.
+        exact_token = re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-/]*", normalize_text(expected))
+        if exact_token:
+            for line in state["lines"]:
+                if not line_is_available(line, state):
+                    continue
+                match = re.search(r"(?<![A-Za-z0-9])" + re.escape(exact_token.group(0)) + r"(?![A-Za-z0-9])", line["norm"], re.IGNORECASE)
+                if match:
+                    consume_span(state, line, match.start(), match.end())
+                    return {
+                        "status": "PASS",
+                        "pdf": line["text"],
+                        "difference": "—",
+                        "match_type": "IDENTIFIER_BARE_TOKEN_EXACT",
+                    }
+
         return {
             "status": "NOT FOUND",
             "pdf": "Not found",
@@ -5128,11 +5203,36 @@ def check_field(
     # -----------------------------------------------------
     # GENERAL / BRAND / ATTRIBUTE / BATCH / QUANTITY
     # -----------------------------------------------------
+    compact_field = re.sub(r"[^a-z0-9]", "", str(field_name).casefold())
+    if any(token in compact_field for token in ("comboeod", "exclusiveof", "cpsia", "tracking")):
+        expected_norm = normalize_text(expected)
+        comparison_norm = normalize_text(state.get("comparison_text", ""))
+        if expected_norm and expected_norm in comparison_norm:
+            return {
+                "status": "PASS",
+                "pdf": expected,
+                "difference": "—",
+                "match_type": "GENERAL_PAGE_TEXT_EXACT",
+            }
+        expected_tokens = set(tokenize(expected))
+        actual_tokens = set(tokenize(comparison_norm))
+        common = expected_tokens & actual_tokens
+        if expected_tokens and len(common) >= max(3, int(len(expected_tokens) * 0.55)):
+            return {
+                "status": "FAIL",
+                "pdf": "Relevant text region found",
+                "difference": describe_text_difference(expected, comparison_norm),
+                "match_type": "GENERAL_PAGE_TEXT_MISMATCH",
+            }
+
     return _generic_exact_field(
         expected,
         field_name,
         state
     )
+
+
+
 
 
 def _generic_exact_field(expected, field_name, state):
@@ -5722,6 +5822,11 @@ def _auto_generic_field_allowed(field_name):
         "family",
         "compodsc",
         "lhcompodsc",
+        "combo",
+        "comboeod",
+        "exclusiveof",
+        "cpsia",
+        "tracking",
     )
     return any(token in compact for token in patterns)
 
@@ -5862,12 +5967,13 @@ def _auto_text_evidence(expected, field_name, text):
         return False
 
     if field_type == "COLOR":
-        if expected_norm in norm_text:
-            return True
-        lines = _auto_detect_lines({"ocr_text": text})
-        if not lines or len(expected_norm) < 4:
-            return False
-        return max(fuzz.ratio(expected_norm, line) for line in lines) >= 86
+        # A color must be attached to an explicit Color/Colour label.  Searching
+        # for a short token such as "HE" in page prose creates false positives.
+        for line in str(text or "").splitlines():
+            actual_color = extract_color_value(line)
+            if actual_color and normalize_text(actual_color) == expected_norm:
+                return True
+        return False
 
     if field_type == "GENDER":
         aliases = {
@@ -5982,81 +6088,38 @@ def auto_detect_fields(
     product_type,
     page_row_mapping=None
 ):
-    """
-    Controlled Auto Detect.
+    """Auto Detect using the same deterministic validator used by final comparison.
 
-    A field is selected only when:
-      1. it is populated in the mapped Order Form row,
-      2. its column belongs to an allowed artwork-variable family, and
-      3. its actual value has strong evidence in the mapped artwork.
-
-    Population alone is never enough.
+    Each candidate is tested against a fresh page state, so one detected field can
+    never hide a later field merely by consuming the shared page state. This is
+    crucial for multilingual COO/content, repeated size aliases, RN/CA on one line,
+    and multiple barcode/identifier fields.
     """
     available_fields = get_available_fields(df)
     allowed_types = {
-        "IDENTIFIER",
-        "BARCODE",
-        "BRAND",
-        "GENDER",
-        "SIZE",
-        "COLOR",
-        "COO",
-        "CONTENT",
-        "CARE",
-        "ATTRIBUTE",
-        "RN",
-        "CA",
-        "OSZ",
-        "SYMBOL",
-        "PRODUCTION_MARK",
-        "SYMBOL",
-        "GENERAL",
+        "IDENTIFIER", "BARCODE", "BRAND", "GENDER", "SIZE", "COLOR", "COO",
+        "CONTENT", "CARE", "ATTRIBUTE", "RN", "CA", "OSZ", "SYMBOL",
+        "PRODUCTION_MARK", "GENERAL",
     }
 
     candidates = []
     for field in available_fields:
         if is_admin_field(field):
             continue
-
         field_type = get_field_type(field)
         auto_type = _auto_semantic_type(field)
-
         if field_type not in allowed_types and not auto_type:
             continue
-
-        # GENERAL operational/database columns remain protected. A GENERAL field
-        # is allowed through Auto Detect only when the separate semantic family
-        # classifier recognizes it or the legacy generic whitelist recognizes it.
         if field_type == "GENERAL" and not auto_type and not _auto_generic_field_allowed(field):
             continue
 
-        compact = (
-            normalize_text(field)
-            .replace(" ", "")
-            .replace("_", "")
-            .replace("-", "")
-        )
-
-        # Internal/support codes are useful metadata but are not normally visible
-        # artwork fields. Keep them out of Auto Detect without changing manual
-        # field selection or the underlying comparison engine.
+        compact = re.sub(r"[^a-z0-9]", "", str(field).casefold())
         if compact in {"carecode", "caresuffixcode"}:
             continue
-
-        # Never auto-select translated/internal material columns.
         if any(token in compact for token in (
-            "p1mat",
-            "multi",
-            "translation",
-            "greek",
-            "arabic",
-            "turkish",
-            "indonesia",
-            "matfull",
-        )):
-            if not compact.startswith("compodsc"):
-                continue
-
+            "p1mat", "multi", "translation", "greek", "arabic", "turkish", "indonesia", "matfull"
+        )) and not compact.startswith("compodsc"):
+            continue
         candidates.append(field)
 
     if not candidates or not output_pages:
@@ -6065,7 +6128,6 @@ def auto_detect_fields(
     rows_to_check = []
     for page in output_pages:
         page_number = int(page.get("page", 1))
-
         if page_row_mapping is not None:
             if page_number not in page_row_mapping:
                 continue
@@ -6074,14 +6136,12 @@ def auto_detect_fields(
             row_index = 0
         else:
             row_index = page_number - 1
-
         if 0 <= row_index < len(df):
             rows_to_check.append((page, df.iloc[row_index]))
 
     if not rows_to_check:
         return []
 
-    # Prefer canonical composition descriptions before equivalent helper columns.
     candidates = sorted(
         enumerate(candidates),
         key=lambda item: (_auto_candidate_priority(item[1]), item[0])
@@ -6089,15 +6149,36 @@ def auto_detect_fields(
     candidates = [field for _idx, field in candidates]
 
     detected = []
-
     for field in candidates:
+        field_type = get_field_type(field)
         found = False
-
         for page, row in rows_to_check:
             value = row.get(field, "")
             if is_blank_value(value):
                 continue
 
+            # The same validator used by final comparison, but with a fresh state
+            # so this field's test cannot consume evidence needed by another field.
+            if field_type != "GENERAL":
+                try:
+                    state = build_page_state(page, product_type)
+                    result = check_field(
+                        str(value).strip(),
+                        field,
+                        state,
+                        osz_group_size=1,
+                    )
+                    if result.get("status") in {"PASS", "FAIL"}:
+                        found = True
+                        break
+                except Exception:
+                    # A single problematic column must not abort Auto Detect for
+                    # the remaining fields. Fall through to conservative evidence.
+                    pass
+
+            # GENERAL fields stay conservative and continue using the dedicated
+            # semantic evidence layer rather than turning all database columns into
+            # visible-artwork candidates.
             if _auto_text_evidence(
                 value,
                 field,
@@ -6106,19 +6187,13 @@ def auto_detect_fields(
                 found = True
                 break
 
-        if not found:
-            continue
+        if found:
+            detected.append(field)
 
-        # IMPORTANT: do not collapse different Order Form columns just because
-        # their values happen to be identical. Regional/language fields such as
-        # FIB_SP, FIB_Mexico and FIB_SP_Mexico may intentionally carry the same
-        # text today while still being separate selectable artwork fields.
-        detected.append(field)
-
-    # Return fields in their original Excel order.
     original_order = {str(column): idx for idx, column in enumerate(df.columns)}
     detected.sort(key=lambda field: original_order.get(field, 10**9))
     return detected
+
 
 
 # =========================================================
