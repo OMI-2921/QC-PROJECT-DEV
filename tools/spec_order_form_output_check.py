@@ -58,7 +58,7 @@ except Exception:
         auto_detect_fields,
     )
 
-TOOL3_VERSION = "2026-09-28-TOOL3-CASE-SENSITIVE-STATIC-V8"
+TOOL3_VERSION = "2026-09-28-TOOL3-FIELD-AWARE-ORG-REFERENCE-V9"
 
 # -------------------------------- palette ----------------------------------
 BLUE = "#3b82f6"
@@ -369,7 +369,7 @@ def _blocks(page):
             h = max(1.0, float(word.get("height", 0)))
             placed = None
             for line in reversed(lines[-4:]):
-                if abs(cy - line["cy"]) <= max(8.0, h * 0.48):
+                if abs(cy - line["cy"]) <= max(2.5, min(4.5, h * 0.38)):
                     placed = line
                     break
             if placed is None:
@@ -424,7 +424,7 @@ def _direct_text_boxes(page, target):
         placed=None
         for line in reversed(lines[-4:]):
             h=max(1.0,float(word.get("height",0)))
-            if abs(cy-line["cy"])<=max(8.0,h*.5): placed=line; break
+            if abs(cy-line["cy"])<=max(2.5,min(4.5,h*.38)): placed=line; break
         if placed is None:
             placed={"cy":cy,"words":[]}; lines.append(placed)
         placed["words"].append(word)
@@ -547,7 +547,7 @@ def _block_near_box(blocks, box, excluded=None):
 
 
 def _exact_static_score(org_block, out_block, page_w, page_h):
-    if org_block["norm"] != out_block["norm"] and org_block["compact"] != out_block["compact"]:
+    if _visible_compact(org_block.get("text", "")) != _visible_compact(out_block.get("text", "")):
         return None
     ox, oy = org_block["cx"], org_block["cy"]
     ux, uy = out_block["cx"], out_block["cy"]
@@ -573,39 +573,39 @@ def _match_static(org_page, output_page, reg, locked_output_boxes, locked_org_in
     for oi, ob in enumerate(org_blocks):
         if oi in locked_org_indices or len(ob["compact"]) < 2:
             continue
-        # Static means this exact ORG occurrence still has no variable evidence claim.
+        # A static candidate must have the same visible letters/digits.
+        # Case, punctuation and spacing differences are reported separately.
         for ui, ub in enumerate(out_blocks):
             if _intersects_locked(ub["bbox"], locked_output_boxes):
                 continue
             score = _exact_static_score(ob, ub, page_w, page_h)
             if score is not None:
-                # Prefer exact-case matches if more than one nearby occurrence
-                # has otherwise equivalent text.
                 exact_case = _visible_text_exact(ob.get("text", ""), ub.get("text", ""))
-                candidates.append((score, int(exact_case), oi, ui))
-    # Preserve the original location/size score as the primary selection rule;
-    # exact case is only a tie-breaker for otherwise equivalent candidates.
-    candidates.sort(reverse=True)
-    used_o = set(locked_org_indices); used_u = set()
+                mismatch_kind = _visible_text_difference_kind(
+                    ob.get("text", ""), ub.get("text", "")
+                )
+                candidates.append((score, int(exact_case), oi, ui, mismatch_kind))
+    # Preserve location/size as the primary selection; exact visible text is a
+    # tie-breaker for otherwise equivalent candidate pairs.
+    candidates.sort(key=lambda item: (item[0], item[1], -item[2], -item[3]), reverse=True)
+    used_o = set(locked_org_indices)
+    used_u = set()
     matches = []
-    for score, exact_case, oi, ui in candidates:
+    for score, exact_case, oi, ui, mismatch_kind in candidates:
         if oi in used_o or ui in used_u:
             continue
-        used_o.add(oi); used_u.add(ui)
-        org_text = org_blocks[oi].get("text", "")
-        output_text = out_blocks[ui].get("text", "")
+        used_o.add(oi)
+        used_u.add(ui)
         matches.append({
             "org": org_blocks[oi],
             "output": out_blocks[ui],
             "org_index": oi,
             "output_index": ui,
             "score": score,
-            "case_mismatch": bool(
-                not exact_case and _visible_text_case_mismatch(org_text, output_text)
-            ),
+            "case_mismatch": mismatch_kind is not None,
+            "mismatch_kind": mismatch_kind,
         })
     return matches
-
 
 # ============================================================================
 # Tool 1-linked variable evidence
@@ -829,33 +829,207 @@ def _merge_evidence_boxes(boxes, gap=10):
     return out
 
 
+def _visible_text_canon(value):
+    """Normalize Unicode and whitespace without changing case or punctuation."""
+    value = unicodedata.normalize("NFKC", str(value or "")).strip()
+    return re.sub(r"\s+", " ", value)
+
+
+def _visible_compact(value):
+    """Case-insensitive alphanumeric form that preserves non-ASCII letters."""
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    return "".join(ch.casefold() for ch in value if ch.isalnum())
+
+
 def _visible_text_exact(reference, actual):
     """Exact visible-text equality for STATIC classification.
 
-    Unlike Tool 1's case-insensitive validation, ORG STATIC classification is
-    intentionally strict: case and punctuation are part of the visible baseline.
+    Whitespace runs are normalized; letter case and punctuation remain part of
+    the approved visible baseline.
     """
-    def canon(value):
-        value = unicodedata.normalize("NFKC", str(value or "")).strip()
-        value = re.sub(r"\s+", " ", value)
-        return value
-    return bool(canon(reference)) and canon(reference) == canon(actual)
+    ref = _visible_text_canon(reference)
+    out = _visible_text_canon(actual)
+    return bool(ref) and ref == out
+
+
+def _visible_text_difference_kind(reference, actual):
+    """Identify case/formatting-only differences without masking wording changes."""
+    ref = _visible_text_canon(reference)
+    out = _visible_text_canon(actual)
+    if not ref or not out or ref == out:
+        return None
+    if ref.casefold() == out.casefold():
+        return "capitalization"
+    # Only classify formatting differences when all letters and digits remain
+    # identical. Different wording is handled as an unmatched ORG element.
+    if _visible_compact(ref) and _visible_compact(ref) == _visible_compact(out):
+        ref_letters = [ch for ch in ref if ch.isalpha()]
+        out_letters = [ch for ch in out if ch.isalpha()]
+        case_changed = (
+            len(ref_letters) == len(out_letters)
+            and any(a != b for a, b in zip(ref_letters, out_letters))
+        )
+        if case_changed:
+            return "capitalization and punctuation/spacing"
+        return "punctuation/spacing"
+    return None
 
 
 def _visible_text_case_mismatch(reference, actual):
-    """Return True when the same alphanumeric text uses different letter case.
+    """Backward-compatible boolean helper for case/formatting-only differences."""
+    return _visible_text_difference_kind(reference, actual) is not None
 
-    Punctuation and spacing are ignored only for identifying a capitalization
-    mismatch. The actual static matcher still applies its existing location and
-    text-similarity gates before this helper is used.
+
+def _org_reference_rank(field, org_block, expected, actual):
+    """Return a confidence tier only when an ORG block fits this field.
+
+    Direct value evidence wins. Otherwise, a field-family anchor is required;
+    proximity is used only to choose among already-compatible candidates.
     """
-    def compact_case_sensitive(value):
-        value = unicodedata.normalize("NFKC", str(value or ""))
-        return "".join(ch for ch in value if ch.isalnum())
+    text = str((org_block or {}).get("text", "") or "")
+    if not text.strip():
+        return None
 
-    ref = compact_case_sensitive(reference)
-    out = compact_case_sensitive(actual)
-    return bool(ref) and ref.casefold() == out.casefold() and ref != out
+    text_compact = _visible_compact(text)
+    field_key = re.sub(r"[^a-z0-9]+", "", str(field or "").casefold())
+    try:
+        field_type = re.sub(r"[^a-z0-9]+", "", str(get_field_type(field) or "").casefold())
+    except Exception:
+        field_type = ""
+
+    # Composite fields should not be paired with a single component line.
+    if any(x in field_key for x in ("comboeod", "comboeot", "combo1", "combo2")):
+        return None
+
+    # First, require a direct value match wherever one exists.
+    for value in (expected, actual):
+        value = str(value or "").strip()
+        if not value or value.casefold() in {"not found", "—", "-", "nan", "none"}:
+            continue
+        value_compact = _visible_compact(value)
+        if not value_compact:
+            continue
+        if len(value_compact) <= 3:
+            tokens = {
+                _visible_compact(token)
+                for token in re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+            }
+            if value_compact in tokens:
+                return 1000 + len(value_compact)
+        elif value_compact in text_compact:
+            return 1000 + min(len(value_compact), 200)
+
+    # Explicitly named content must never borrow an adjacent decoration/trimming
+    # or care line. Decoration and trimming are separate reference families.
+    if "exclusiveof1" in field_key or "decoration" in field_key or "eod" in field_key:
+        return 800 if (
+            "exclusiveofdecoration" in text_compact
+            or "decorationnoncomprise" in text_compact
+        ) else None
+    if "exclusiveof2" in field_key or "trimming" in field_key or "eot" in field_key:
+        return 800 if (
+            "exclusiveoftrimming" in text_compact
+            or "garniturenoncomprise" in text_compact
+        ) else None
+
+    is_coo = (
+        "coo" in field_key or "countryoforigin" in field_key
+        or field_type in {"coo", "countryoforigin", "origin"}
+    )
+    if is_coo:
+        return 700 if any(x in text_compact for x in ("madein", "fabrique", "hechoen", "madeat")) else None
+
+    is_upc = (
+        any(x in field_key for x in ("upc", "barcode", "ean", "gtin"))
+        or field_type in {"upc", "barcode", "ean", "gtin"}
+    )
+    if is_upc:
+        return 700 if any(x in text_compact for x in ("upc", "barcode", "ean", "gtin")) else None
+
+    is_rn = bool(re.search(r"(?:^|[a-z])rn(?:english|french|spanish|$)", field_key)) or field_type == "rn"
+    if is_rn:
+        return 700 if re.search(r"\brn\s*#?", text, flags=re.IGNORECASE) else None
+
+    is_ca = field_key.endswith("ca") or "canadarid" in field_key or field_type == "ca"
+    if is_ca:
+        return 700 if re.search(r"\bca\s*#?", text, flags=re.IGNORECASE) else None
+
+    is_size = "size" in field_key or "osz" in field_key or field_type in {"size", "osz"}
+    if is_size:
+        # Size values need a size-like token. Percentages, UPC groups and generic
+        # three-digit fragments are deliberately excluded.
+        size_pattern = (
+            r"(?<![\w%'’])(?:xxs|xxl|xs|xl|s|m|l|os|one\s*size|"
+            r"\d{1,3}\s?(?:m|mo|t|y|yr|yrs))(?![\w'’])"
+        )
+        return 600 if re.search(size_pattern, text, flags=re.IGNORECASE) else None
+
+    is_content = (
+        any(x in field_key for x in ("content", "fabric", "fiber", "fibre", "material"))
+        or field_type in {"content", "fabric", "fiber", "fibre"}
+    )
+    if is_content:
+        has_percent = bool(re.search(r"\d\s?%", text))
+        has_fiber = bool(re.search(
+            r"\b(cotton|polyester|elastane|spandex|nylon|viscose|rayon|acrylic|wool|coton|elasthanne)\b",
+            text, flags=re.IGNORECASE
+        ))
+        return 600 if has_percent or has_fiber else None
+
+    is_care = (
+        any(x in field_key for x in ("care", "wash", "iron", "bleach", "tumbledry"))
+        or field_type == "care"
+    )
+    if is_care:
+        return 600 if bool(re.search(
+            r"\b(wash|iron|bleach|tumble|dry|laver|repasser|sécher|secher|lavar|planchar)\b",
+            text, flags=re.IGNORECASE
+        )) else None
+
+    # CPSIA/tracking content may be replaced by a new order value. Restrict this
+    # fallback to visibly code-like ORG text and never confuse it with UPC/RN/CA.
+    is_tracking = any(x in field_key for x in ("cpsia", "tracking", "productionmark", "batch"))
+    if is_tracking and not any(x in text_compact for x in ("upc", "barcode", "rn", "ca")):
+        has_digits = bool(re.search(r"\d", text))
+        has_letters_or_placeholder = bool(re.search(r"[a-z]", text, flags=re.IGNORECASE))
+        has_grouped_digits = bool(re.search(r"\d{3,}(?:[- ]\d{2,})+", text))
+        if has_digits and (has_letters_or_placeholder or has_grouped_digits):
+            # Both common CPSIA and tracking-code shapes are valid candidates.
+            # The field's visual position chooses between those candidates.
+            return 630
+
+    # Unknown/ambiguous fields are not mapped by proximity alone.
+    return None
+
+
+def _org_reference_distance(block, box):
+    if not box:
+        return 0.0
+    cx = (box[0] + box[2]) / 2
+    cy = (box[1] + box[3]) / 2
+    bw = max(1.0, box[2] - box[0])
+    bh = max(1.0, box[3] - box[1])
+    dx = abs(float(block.get("cx", 0)) - cx) / max(1.0, bw * 2)
+    dy = abs(float(block.get("cy", 0)) - cy) / max(1.0, bh * 3)
+    size = abs(math.log(max(.05, float(block.get("width", 1))) / max(.05, bw)))
+    return dx + dy + .15 * size
+
+
+def _field_aware_org_reference(field, org_blocks, box, expected, actual):
+    """Map a variable field only to text with direct/semantic evidence."""
+    candidates = []
+    for idx, block in enumerate(org_blocks or []):
+        rank = _org_reference_rank(field, block, expected, actual)
+        if rank is None:
+            continue
+        distance = _org_reference_distance(block, box)
+        candidates.append((rank, -distance, idx, block))
+    if not candidates:
+        return None, None
+    # Evidence strength outranks proximity; proximity breaks ties only between
+    # candidates already proven to be compatible with this field.
+    _, _, idx, block = max(candidates, key=lambda item: (item[0], item[1]))
+    return idx, block
 
 
 def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
@@ -899,11 +1073,15 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
                     max(b[2] for b in boxes), max(b[3] for b in boxes)
                 )
 
-            # Find the registered ORG region nearest to the Tool 1 evidence.
+            # PFL variable data is governed by the Order Form, not by a nearby
+            # sample value in the ORG. For HTL/Other, map only when text/type
+            # evidence proves the ORG block is compatible with this field.
             org_idx = None
             org_block = None
             if combined_box and reg_org_blocks:
-                org_idx, org_block = _block_near_box(reg_org_blocks, combined_box, locked_org)
+                org_idx, org_block = _field_aware_org_reference(
+                    field, reg_org_blocks, combined_box, expected, actual
+                )
 
             # Find the exact Output block corresponding to the evidence box.
             output_block = None
@@ -922,7 +1100,12 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
             # ---------------------------------------------------------------
             static_exact = False
             static_score = None
-            if org_block and output_block and _visible_text_exact(org_block.get("text", ""), output_block.get("text", "")):
+            if (
+                str(product_type or "").upper() != "PFL"
+                and org_block
+                and output_block
+                and _visible_text_exact(org_block.get("text", ""), output_block.get("text", ""))
+            ):
                 try:
                     static_score = _exact_static_score(
                         org_block,
@@ -1013,11 +1196,9 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
             elif combined_box:
                 combined_for_org = combined_box
 
-            # Find the ORG block without consuming already-locked ORG evidence.
-            org_idx = None
-            org_block = None
-            if combined_for_org and reg_org_blocks:
-                org_idx, org_block = _block_near_box(reg_org_blocks, combined_for_org, locked_org)
+            # Keep the field-aware ORG reference selected above. Never replace it
+            # with an arbitrary nearest block: doing so can pair Style with CA,
+            # COO with Care, or UPC with RN merely because those items are nearby.
 
             presentation_status, presentation_reason = _presentation_for_variable(
                 org_block, actual, product_type
@@ -1035,8 +1216,6 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
                 difference = difference_prefix + difference
 
             locked = bool(evidence_boxes) or org_idx is not None
-            if org_idx is not None:
-                locked_org.add(org_idx)
 
             all_evidence.append({
                 "page": page_no,
@@ -1081,14 +1260,16 @@ def _case_mode(word):
 
 
 def _presentation_for_variable(org_block, actual, product_type):
+    # PFL variable data is checked against the Order Form; it does not require
+    # a guessed ORG reference to receive the existing PFL presentation PASS.
+    if product_type == "PFL":
+        return "PASS", "PFL uses Order Form presentation for variable data."
     if not org_block:
-        return "REVIEW", "No registered ORG reference region was safely mapped to this variable field."
+        return "REVIEW", "No field-compatible ORG reference was safely mapped to this variable field."
     org_text = org_block.get("text", "")
     actual = str(actual or "")
     if not org_text or not actual:
         return "REVIEW", "Insufficient presentation evidence."
-    if product_type == "PFL":
-        return "PASS", "PFL uses Order Form presentation for variable data."
     ref_words = re.findall(r"[A-Za-z]+", org_text)
     out_words = re.findall(r"[A-Za-z]+", actual)
     if ref_words and out_words:
@@ -1111,7 +1292,7 @@ def _presentation_for_variable(org_block, actual, product_type):
 # ============================================================================
 
 
-def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence):
+def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence, product_type=None):
     """Classify remaining ORG blocks after variable/static field evidence is locked."""
     locked_output = defaultdict(list)
     locked_org = defaultdict(set)
@@ -1168,16 +1349,22 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
             if m.get("case_mismatch"):
                 org_text = m["org"].get("text", "")
                 output_text = m["output"].get("text", "")
-                case_reason = (
-                    f"ORG capitalization mismatch: ORG Spec uses {org_text!r}; "
-                    f"Output uses {output_text!r}."
-                )
+                mismatch_kind = m.get("mismatch_kind") or "capitalization, punctuation, or spacing"
+                if mismatch_kind == "capitalization":
+                    case_reason = (
+                        f"ORG capitalization mismatch: ORG Spec uses {org_text!r}; "
+                        f"Output uses {output_text!r}."
+                    )
+                else:
+                    case_reason = (
+                        f"ORG visible-text formatting mismatch ({mismatch_kind}): "
+                        f"ORG Spec uses {org_text!r}; Output uses {output_text!r}."
+                    )
 
-                # A case-only ORG mismatch can overlap a Tool 1 variable finding.
-                # Do not let the PFL Order-Form presentation rule hide it: attach
-                # the ORG failure to that existing finding, so the field itself
-                # changes to FAIL without counting the same occurrence twice.
+                # Link a mismatch to a Tool 1 field only when both its visual
+                # evidence and its value actually correspond to the Output text.
                 variable_owners = []
+                output_compact = _visible_compact(output_text)
                 for ev in variable_evidence:
                     if (
                         int(ev.get("page", 1)) != page_no
@@ -1188,15 +1375,27 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                         (_iou(box, m["output"]["bbox"]) for box in (ev.get("boxes", []) or [])),
                         default=0.0,
                     )
-                    if overlap >= .45:
-                        variable_owners.append((overlap, ev))
+                    if overlap < .45:
+                        continue
+                    value_hits = []
+                    for value in (ev.get("actual", ""), ev.get("expected", "")):
+                        value_compact = _visible_compact(value)
+                        if len(value_compact) >= 5 and value_compact in output_compact:
+                            value_hits.append(len(value_compact))
+                    if value_hits:
+                        variable_owners.append((overlap, max(value_hits), ev))
 
-                if variable_owners:
-                    # Use the strongest geometric owner if multiple Tool 1 fields
-                    # report the same physical artwork occurrence.
-                    owner = max(variable_owners, key=lambda item: item[0])[1]
+                # For HTL/Other, the ORG presentation failure belongs to the
+                # corresponding mapped variable field. For PFL, preserve the
+                # independent Order Form -> Output PASS and report ORG text
+                # differences as their own findings.
+                if variable_owners and str(product_type or "").upper() != "PFL":
+                    owner = max(variable_owners, key=lambda item: (item[0], item[1]))[2]
                     owner["status"] = "FAIL"
                     owner["org_case_mismatch"] = True
+                    owner["org_block"] = m["org"]
+                    owner["org_index"] = m.get("org_index")
+                    owner["output_block"] = m["output"]
                     owner["presentation_status"] = "FAIL"
                     owner["presentation_reason"] = case_reason
                     previous_difference = str(owner.get("difference", "") or "").strip()
@@ -1206,37 +1405,51 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
                         else:
                             owner["difference"] = previous_difference + " " + case_reason
                 else:
+                    related_field = None
+                    if variable_owners:
+                        related_field = max(variable_owners, key=lambda item: (item[0], item[1]))[2].get("field")
                     case_mismatches.append({
-                    "page": page_no,
-                    "field": f"Static Case Mismatch #{len(case_mismatches) + 1}",
-                    "field_type": "STATIC TEXT",
-                    "region": "ORG / Output",
-                    "expected": org_text,
-                    "actual": output_text,
-                    "status": "FAIL",
-                    "classification": "STATIC CASE MISMATCH",
-                    "difference": case_reason,
-                    "org": m["org"],
-                    "output": m["output"],
-                    "org_block": m["org"],
-                    "output_block": m["output"],
-                    "org_index": m.get("org_index"),
-                    "output_index": m.get("output_index"),
-                    "boxes": [m["output"]["bbox"]],
-                    "locked": True,
-                    "score": m["score"],
-                })
+                        "page": page_no,
+                        "field": f"ORG Text Mismatch #{len(case_mismatches) + 1}",
+                        "related_field": related_field,
+                        "field_type": "STATIC TEXT",
+                        "region": "ORG / Output",
+                        "expected": org_text,
+                        "actual": output_text,
+                        "status": "FAIL",
+                        "classification": "STATIC TEXT MISMATCH",
+                        "difference": case_reason,
+                        "org": m["org"],
+                        "output": m["output"],
+                        "org_block": m["org"],
+                        "output_block": m["output"],
+                        "org_index": m.get("org_index"),
+                        "output_index": m.get("output_index"),
+                        "boxes": [m["output"]["bbox"]],
+                        "locked": True,
+                        "score": m["score"],
+                        "mismatch_kind": mismatch_kind,
+                    })
             else:
-                static_matches.append({
-                    "page": page_no,
-                    "org": m["org"],
-                    "output": m["output"],
-                    "org_index": m.get("org_index"),
-                    "output_index": m.get("output_index"),
-                    "status": "STATIC",
-                    "classification": "STATIC",
-                    "score": m["score"],
-                })
+                # Do not report an exact ORG/Output match twice when that
+                # physical Output occurrence is already a Tool 1 variable field.
+                overlaps_variable = any(
+                    int(ev.get("page", 1)) == page_no
+                    and ev.get("classification") == "VARIABLE"
+                    and any(_iou(box, m["output"]["bbox"]) >= .45 for box in (ev.get("boxes", []) or []))
+                    for ev in variable_evidence
+                )
+                if not overlaps_variable:
+                    static_matches.append({
+                        "page": page_no,
+                        "org": m["org"],
+                        "output": m["output"],
+                        "org_index": m.get("org_index"),
+                        "output_index": m.get("output_index"),
+                        "status": "STATIC",
+                        "classification": "STATIC",
+                        "score": m["score"],
+                    })
 
             # Both exact static matches and casing failures consume the same
             # physical ORG/Output occurrence so it cannot be counted twice.
@@ -1246,6 +1459,17 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence)
         org_blocks = _registered_org_blocks(org_page, reg)
         out_blocks = _blocks(out_page)
         static_org_idx = set(locked_org.get(page_no, set()))
+        # Variable ORG references are accounted for, but are not treated as
+        # exact static matches. This prevents sample values (e.g. an old UPC or
+        # country) from appearing as missing/unaccounted just because the
+        # Order Form correctly supplies updated variable data.
+        for ev in variable_evidence:
+            if (
+                int(ev.get("page", 1)) == page_no
+                and ev.get("classification") == "VARIABLE"
+                and ev.get("org_index") is not None
+            ):
+                static_org_idx.add(ev["org_index"])
         for oi, ob in enumerate(org_blocks):
             if oi in static_org_idx or len(ob.get("compact", "")) < 2:
                 continue
@@ -1546,19 +1770,25 @@ def _overall(evidence, static_matches, unaccounted, case_mismatches=None):
     return overall, len(static_matches), len([e for e in variable if e["status"] in {"PASS","FAIL","REVIEW"}]), fails, reviews, len(unaccounted)
 
 
-def _evidence_dataframe(evidence, static_matches, unaccounted, case_mismatches=None):
+def _evidence_dataframe(evidence, static_matches, unaccounted, case_mismatches=None, product_type=None):
     rows=[]
     for e in evidence:
-        org=e.get("org_block",{}).get("text", "Not mapped") if e.get("org_block") else "Not mapped"
+        if e.get("classification") == "VARIABLE" and str(product_type or "").upper() == "PFL":
+            org = "Not compared — PFL variable data is checked against the Order Form"
+        else:
+            org = e.get("org_block", {}).get("text", "Not safely mapped") if e.get("org_block") else "Not safely mapped"
         rows.append({
             "PDF PAGE":e["page"],"Element / Field":e["field"],"Type":e.get("classification", "VARIABLE"),"ORG Spec":org,
             "Output":e["actual"],"Order Form":e["expected"],"Status":e["status"],
             "Evidence Locked":"YES" if e.get("locked") else "NO","Source":e.get("source", "Tool 1"),"Notes":e["difference"],
         })
     for m in (case_mismatches or []):
+        mismatch_label = m.get("field", "ORG Text Mismatch")
+        if m.get("related_field"):
+            mismatch_label += f" (related field: {m['related_field']})"
         rows.append({
-            "PDF PAGE":m["page"],"Element / Field":m.get("field", "Static Case Mismatch"),
-            "Type":"STATIC CASE MISMATCH","ORG Spec":m.get("expected", ""),
+            "PDF PAGE":m["page"],"Element / Field":mismatch_label,
+            "Type":"STATIC TEXT MISMATCH","ORG Spec":m.get("expected", ""),
             "Output":m.get("actual", ""),"Order Form":"—","Status":"FAIL",
             "Evidence Locked":"YES","Source":"ORG","Notes":m.get("difference", "Capitalization differs."),
         })
@@ -1587,7 +1817,7 @@ def _build_excel_report(result):
     labels=["Overall Result","Static Elements","Variable Elements","Issues","Manual Review","Unaccounted ORG Elements","Tool 1 Engine"]
     values=list(summary)+[TOOL1_ENGINE_VERSION]
     for i,(lab,val) in enumerate(zip(labels,values),start=3): ws.cell(i,1,lab); ws.cell(i,2,val)
-    comp=_evidence_dataframe(result["evidence"],result["static_matches"],result["unaccounted"],result.get("case_mismatches",[]))
+    comp=_evidence_dataframe(result["evidence"],result["static_matches"],result["unaccounted"],result.get("case_mismatches",[]),result.get("product_type"))
     detail=wb.create_sheet("Field Comparison")
     if not comp.empty:
         for c,name in enumerate(comp.columns,1): detail.cell(1,c,name).fill=dark; detail.cell(1,c).font=white
@@ -1654,7 +1884,7 @@ def _run_tool3_pipeline(result, selected_fields=None):
     report = _tool1_variable_results(df, output_pages, selected, product, mapping)
     evidence = _build_variable_evidence(df, output_pages, org_pages, report, product)
     static_matches, case_mismatches, unaccounted, registrations = _classify_static_and_unaccounted(
-        org_pages, output_pages, evidence
+        org_pages, output_pages, evidence, product
     )
     summary = _overall(evidence, static_matches, unaccounted, case_mismatches)
     annotated_images = {
@@ -2222,7 +2452,7 @@ def main():
         elif filter_choice == "PASS":
             display_findings = [e for e in page_evidence if e.get("status") == "PASS"]
         elif filter_choice == "STATIC":
-            display_findings = [e for e in page_evidence if e.get("classification") in {"STATIC", "STATIC CASE MISMATCH"}]
+            display_findings = [e for e in page_evidence if e.get("classification") in {"STATIC", "STATIC CASE MISMATCH", "STATIC TEXT MISMATCH"}]
         else:
             display_findings = page_evidence
 
@@ -2302,8 +2532,9 @@ def main():
                     unsafe_allow_html=True,
                 )
             for m in case_issues:
+                related = f" • Related variable field: {html.escape(m['related_field'])}" if m.get("related_field") else ""
                 st.markdown(
-                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>{html.escape(m.get('field', 'Static Case Mismatch'))}</div>{_status_badge('FAIL')}</div><div class='t3-field-sub'>Page {m['page']} • ORG Spec: {html.escape(m.get('expected', ''))} • Output: {html.escape(m.get('actual', ''))}<br>{html.escape(m.get('difference', 'Capitalization differs.'))}</div></div>",
+                    f"<div class='t3-field-row'><div style='display:flex;justify-content:space-between;gap:8px'><div class='t3-field-name'>{html.escape(m.get('field', 'ORG Text Mismatch'))}</div>{_status_badge('FAIL')}</div><div class='t3-field-sub'>Page {m['page']}{related} • ORG Spec: {html.escape(m.get('expected', ''))} • Output: {html.escape(m.get('actual', ''))}<br>{html.escape(m.get('difference', 'Visible text differs.'))}</div></div>",
                     unsafe_allow_html=True,
                 )
             for u in result["unaccounted"]:
