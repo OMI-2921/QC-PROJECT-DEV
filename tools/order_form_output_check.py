@@ -2,7 +2,7 @@ import streamlit as st
 
 # Build marker used in Auto Detect cache keys so code updates cannot reuse
 # stale detected-field selections from an older engine version.
-AUTO_DETECT_ENGINE_VERSION = "2026-09-28-ROBUST-SHARED-VALIDATOR-CONTENT-COO-CODE-FIX-V15"
+AUTO_DETECT_ENGINE_VERSION = "2026-09-29-TEXT-LAYER-FIRST-SELECTIVE-OCR-V16"
 import pandas as pd
 import fitz
 import re
@@ -585,7 +585,7 @@ def _usable_text(text):
 
 
 def _text_quality_score(text):
-    """Score extracted artwork text so OCR can be preferred over weak PDF text layers."""
+    """Score extracted artwork text for source diagnostics and legacy pages."""
     text = str(text or "")
     if not text.strip():
         return 0
@@ -596,6 +596,34 @@ def _text_quality_score(text):
     numeric_runs = len(re.findall(r"(?<![A-Za-z0-9])\d+(?![A-Za-z0-9])", text))
 
     return alnum + useful_lines * 8 + numeric_runs * 3
+
+
+def _pdf_text_layer_is_readable(text):
+    """Return True when the PDF's native text layer is usable without OCR.
+
+    This intentionally uses a conservative, OCR-free test: non-empty text must
+    contain enough real alphanumeric content and must not be dominated by
+    replacement/control characters. A short but valid data line (for example a
+    numeric identifier) is still acceptable once it passes _usable_text.
+    """
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    if not _usable_text(value):
+        return False
+    if "\ufffd" in value:
+        return False
+
+    visible = [ch for ch in value if not ch.isspace()]
+    if not visible:
+        return False
+    suspicious = sum(
+        1 for ch in visible
+        if unicodedata.category(ch) in {"Cc", "Cs", "Cn"}
+    )
+    if suspicious / max(1, len(visible)) > 0.03:
+        return False
+
+    return True
 
 
 def _ocr_image_with_data(image):
@@ -903,11 +931,14 @@ def get_output_page_count(file):
 
 
 def extract_output_pages(file):
-    """
-    Extract artwork pages with OCR as the primary source.
+    """Extract artwork pages with native PDF text first and selective OCR.
 
-    Every page also stores the rendered full-page image and OCR word boxes so
-    the exact artwork can later be displayed with highlight overlays.
+    PDFs with a usable native text layer are compared using that layer directly;
+    OCR is not run on those pages. OCR is used only when the native text layer is
+    absent or clearly unusable. Raster image uploads continue to use OCR.
+
+    The rendered artwork image and native/OCR word coordinates are retained for
+    the existing visual-highlighting and Excel-report features.
     """
     name = str(getattr(file, "name", "")).casefold()
 
@@ -922,14 +953,14 @@ def extract_output_pages(file):
 
         try:
             for page_number, page in enumerate(document, start=1):
-                direct_text = page.get_text("text") or ""
+                direct_text = page.get_text("text", sort=True) or ""
                 image = _render_pdf_page(page)
 
-                # Keep original PDF word coordinates as a visual fallback for
-                # custom-font symbols. OCR may not recognize the glyph at all.
+                # Native PDF word coordinates are scaled into the rendered-image
+                # coordinate space used by the existing highlighting functions.
                 direct_words = []
                 try:
-                    pdf_words = page.get_text("words") or []
+                    pdf_words = page.get_text("words", sort=True) or []
                     sx = image.width / max(1.0, float(page.rect.width))
                     sy = image.height / max(1.0, float(page.rect.height))
                     for word in pdf_words:
@@ -945,37 +976,54 @@ def extract_output_pages(file):
                             "top": int(round(float(y0) * sy)),
                             "width": int(round((float(x1) - float(x0)) * sx)),
                             "height": int(round((float(y1) - float(y0)) * sy)),
+                            "block_num": int(word[5]) if len(word) > 5 else 0,
+                            "line_num": int(word[6]) if len(word) > 6 else 0,
+                            "word_num": int(word[7]) if len(word) > 7 else 0,
                         })
                 except Exception:
                     direct_words = []
+
+                # Key behavior change: trust readable native text and do not let
+                # OCR replace it. This prevents OCR case/character errors from
+                # driving field matching on editable/vector PDFs.
+                direct_is_readable = _pdf_text_layer_is_readable(direct_text)
                 ocr_text = ""
                 ocr_words = []
+                ocr_alt_text = ""
                 ocr_error = None
                 ocr_lang = ""
+                ocr_attempted = False
 
-                try:
-                    (
-                        ocr_text,
-                        ocr_words,
-                        ocr_lang,
-                        ocr_alt_text,
-                    ) = _ocr_image_with_data(image)
-                except Exception as exc:
-                    ocr_error = exc
-
-                ocr_scale = 1600 / max(1, image.width) if image.width < 1600 else 1.0
-
-                if _usable_text(ocr_text):
-                    text = ocr_text
-                    source_type = "ocr"
-                elif _usable_text(direct_text):
+                if direct_is_readable:
                     text = direct_text
                     source_type = "pdf_text"
                 else:
-                    detail = str(ocr_error) if ocr_error else "no usable text"
-                    raise RuntimeError(
-                        f"Page {page_number}: no readable artwork text was found. {detail}"
-                    )
+                    ocr_attempted = True
+                    try:
+                        (
+                            ocr_text,
+                            ocr_words,
+                            ocr_lang,
+                            ocr_alt_text,
+                        ) = _ocr_image_with_data(image)
+                    except Exception as exc:
+                        ocr_error = exc
+
+                    if _usable_text(ocr_text):
+                        text = ocr_text
+                        source_type = "ocr"
+                    elif direct_text.strip():
+                        # Keep weak native text available for diagnostics and
+                        # specialized direct-text fallbacks even if OCR fails.
+                        text = direct_text
+                        source_type = "pdf_text_fallback"
+                    else:
+                        detail = str(ocr_error) if ocr_error else "no usable text"
+                        raise RuntimeError(
+                            f"Page {page_number}: no readable artwork text was found. {detail}"
+                        )
+
+                ocr_scale = 1600 / max(1, image.width) if image.width < 1600 else 1.0
 
                 pages.append({
                     "page": page_number,
@@ -989,6 +1037,9 @@ def extract_output_pages(file):
                     "ocr_lang": ocr_lang,
                     "ocr_scale_x": ocr_scale,
                     "ocr_scale_y": ocr_scale,
+                    "ocr_attempted": ocr_attempted,
+                    "ocr_error": str(ocr_error) if ocr_error else "",
+                    "direct_text_readable": direct_is_readable,
                     "image_bytes": _image_to_png_bytes(image),
                     "image_width": image.width,
                     "image_height": image.height,
@@ -1024,6 +1075,9 @@ def extract_output_pages(file):
             "ocr_lang": ocr_lang,
             "ocr_scale_x": ocr_scale,
             "ocr_scale_y": ocr_scale,
+            "ocr_attempted": True,
+            "ocr_error": "",
+            "direct_text_readable": False,
             "image_bytes": _image_to_png_bytes(image),
             "image_width": image.width,
             "image_height": image.height,
@@ -2612,33 +2666,36 @@ def build_page_lines(page_text, product_type):
 
 
 def _select_comparison_text(page):
-    """Choose the cleanest comparison text while preserving OCR as fallback.
+    """Select the primary text source, preferring usable native PDF text.
 
-    For editable PDFs, the PDF text layer often preserves reading order and
-    structured multi-line content much better than OCR. OCR remains the fallback
-    for scanned/non-editable artwork. This is a comparison-source decision only;
-    visual OCR boxes are still retained separately for annotations.
+    Older cached/page objects may contain both OCR and direct text. Native text
+    is now authoritative whenever it passes the readability guard; OCR is the
+    fallback, not a competing source chosen by character-count quality.
     """
     direct = str(page.get("direct_text", "") or "").strip()
     ocr = str(page.get("ocr_text", "") or "").strip()
+    primary = str(page.get("text", "") or "").strip()
+    source_type = str(page.get("source_type", "") or "").casefold()
+
+    if _pdf_text_layer_is_readable(direct):
+        return direct, "pdf_text"
+
+    if source_type == "pdf_text" and _pdf_text_layer_is_readable(primary):
+        return primary, "pdf_text"
+
+    if _usable_text(ocr):
+        return ocr, "ocr"
+
+    if _usable_text(primary):
+        return primary, source_type or "pdf_text"
 
     if direct:
-        direct_quality = _text_quality_score(direct)
-        ocr_quality = _text_quality_score(ocr) if ocr else 0
-        direct_alnum = len(re.findall(r"[A-Za-z0-9]", direct))
-
-        # Prefer a meaningful PDF text layer unless it is dramatically weaker
-        # than OCR. The 0.55 guard protects genuinely bad/partial text layers.
-        if direct_alnum >= 20 and (not ocr or direct_quality >= max(80, ocr_quality * 0.55)):
-            return direct, "pdf_text"
+        return direct, "pdf_text_fallback"
 
     if ocr:
         return ocr, "ocr"
 
-    if direct:
-        return direct, "pdf_text"
-
-    return str(page.get("text", "") or ""), str(page.get("source_type", "pdf_text"))
+    return primary, source_type or "pdf_text"
 
 
 def build_page_state(page, product_type):
