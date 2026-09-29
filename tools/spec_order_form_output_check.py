@@ -58,7 +58,7 @@ except Exception:
         auto_detect_fields,
     )
 
-TOOL3_VERSION = "2026-09-28-TOOL3-FIELD-AWARE-ORG-REFERENCE-V9"
+TOOL3_VERSION = "2026-09-29-TOOL3-PAIR-MODE-REVIEW-LOCK-V10"
 
 # -------------------------------- palette ----------------------------------
 BLUE = "#3b82f6"
@@ -186,6 +186,7 @@ def _tool3_css():
         .t3-fileline {{ font-size:9px; color:#c7d8ea !important; margin-top:7px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
         .t3-role {{ margin-top:7px; background:#0e1c2f; border:1px solid #1e3550; border-radius:8px; padding:7px; font-size:8px; color:{MUTED} !important; line-height:1.45; }}
         .t3-role b {{ color:{TEXT} !important; }}
+        .t3-review-reason {{ background:#0d1a2c; border:1px solid #35506d; border-radius:9px; padding:12px; color:#dce9f7 !important; font-size:12px; line-height:1.6; white-space:normal; }}
         .t3-section-title {{ font-size:14px; font-weight:850; margin:13px 0 7px 0; color:{TEXT} !important; }}
         .t3-section-note {{ font-size:9px; color:{MUTED} !important; margin-bottom:7px; }}
         .t3-mini-stat {{ background:#0d1a2c; border:1px solid {CARD_BORDER}; border-radius:9px; padding:9px 10px; }}
@@ -386,6 +387,21 @@ def _blocks(page):
             l,t,r,b = bbox
             result.append({"text":text,"norm":_norm(text),"compact":_compact(text),"bbox":bbox,"cx":(l+r)/2,"cy":(t+b)/2,"width":r-l,"height":b-t,"words":ws})
         result.sort(key=lambda b:(b["bbox"][1],b["bbox"][0]))
+        # Reattach the corresponding raw native line where possible. The word
+        # geometry remains the source for highlighting; raw text is used only for
+        # strict static formatting checks such as double spaces.
+        raw_lines = defaultdict(list)
+        for raw_line in str((page or {}).get("direct_text", "") or "").splitlines():
+            raw_line = unicodedata.normalize("NFKC", raw_line).strip()
+            if raw_line and _visible_compact(raw_line):
+                raw_lines[_visible_compact(raw_line)].append(raw_line)
+        for b in result:
+            key = _visible_compact(b.get("text", ""))
+            candidates = raw_lines.get(key, [])
+            if candidates:
+                b["visible_text"] = candidates.pop(0)
+            else:
+                b["visible_text"] = b.get("text", "")
         for i,b in enumerate(result): b["index"]=i
         return result
 
@@ -580,9 +596,10 @@ def _match_static(org_page, output_page, reg, locked_output_boxes, locked_org_in
                 continue
             score = _exact_static_score(ob, ub, page_w, page_h)
             if score is not None:
-                exact_case = _visible_text_exact(ob.get("text", ""), ub.get("text", ""))
+                exact_case = _visible_text_exact(ob.get("visible_text", ob.get("text", "")), ub.get("visible_text", ub.get("text", "")))
                 mismatch_kind = _visible_text_difference_kind(
-                    ob.get("text", ""), ub.get("text", "")
+                    ob.get("visible_text", ob.get("text", "")),
+                    ub.get("visible_text", ub.get("text", "")),
                 )
                 candidates.append((score, int(exact_case), oi, ui, mismatch_kind))
     # Preserve location/size as the primary selection; exact visible text is a
@@ -830,9 +847,10 @@ def _merge_evidence_boxes(boxes, gap=10):
 
 
 def _visible_text_canon(value):
-    """Normalize Unicode and whitespace without changing case or punctuation."""
-    value = unicodedata.normalize("NFKC", str(value or "")).strip()
-    return re.sub(r"\s+", " ", value)
+    """Normalize Unicode while preserving internal spaces, case and punctuation."""
+    # Leading/trailing page-layout padding is not part of the visible phrase.
+    # Internal whitespace is retained so extra/missing spaces remain detectable.
+    return unicodedata.normalize("NFKC", str(value or "")).strip()
 
 
 def _visible_compact(value):
@@ -858,6 +876,8 @@ def _visible_text_difference_kind(reference, actual):
     out = _visible_text_canon(actual)
     if not ref or not out or ref == out:
         return None
+    # Case-fold equality means only letter case differs; spaces and punctuation
+    # are still preserved by _visible_text_canon.
     if ref.casefold() == out.casefold():
         return "capitalization"
     # Only classify formatting differences when all letters and digits remain
@@ -865,12 +885,16 @@ def _visible_text_difference_kind(reference, actual):
     if _visible_compact(ref) and _visible_compact(ref) == _visible_compact(out):
         ref_letters = [ch for ch in ref if ch.isalpha()]
         out_letters = [ch for ch in out if ch.isalpha()]
-        case_changed = (
-            len(ref_letters) == len(out_letters)
-            and any(a != b for a, b in zip(ref_letters, out_letters))
+        case_changed = len(ref_letters) == len(out_letters) and any(
+            a != b for a, b in zip(ref_letters, out_letters)
         )
-        if case_changed:
+        ref_separators = "".join(ch for ch in ref if not ch.isalnum())
+        out_separators = "".join(ch for ch in out if not ch.isalnum())
+        spacing_or_punctuation_changed = ref_separators != out_separators
+        if case_changed and spacing_or_punctuation_changed:
             return "capitalization and punctuation/spacing"
+        if case_changed:
+            return "capitalization"
         return "punctuation/spacing"
     return None
 
@@ -1032,7 +1056,7 @@ def _field_aware_org_reference(field, org_blocks, box, expected, actual):
     return idx, block
 
 
-def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
+def _build_variable_evidence(df, output_pages, org_pages, report, product_type, mapping_overrides=None):
     """Build one visual evidence object per Tool 1 result.
 
     Decision order:
@@ -1082,6 +1106,18 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
                 org_idx, org_block = _field_aware_org_reference(
                     field, reg_org_blocks, combined_box, expected, actual
                 )
+            # A reviewer-selected ORG reference takes precedence over Auto Map.
+            # The key is page + field so repeated fields across pages remain distinct.
+            override_key = f"{page_no}::{field}"
+            override_index = (mapping_overrides or {}).get(override_key)
+            if override_index is not None:
+                try:
+                    override_index = int(override_index)
+                    if 0 <= override_index < len(reg_org_blocks):
+                        org_idx = override_index
+                        org_block = reg_org_blocks[override_index]
+                except (TypeError, ValueError):
+                    pass
 
             # Find the exact Output block corresponding to the evidence box.
             output_block = None
@@ -1200,9 +1236,13 @@ def _build_variable_evidence(df, output_pages, org_pages, report, product_type):
             # with an arbitrary nearest block: doing so can pair Style with CA,
             # COO with Care, or UPC with RN merely because those items are nearby.
 
-            presentation_status, presentation_reason = _presentation_for_variable(
-                org_block, actual, product_type
-            )
+            if not org_pages:
+                presentation_status = "PASS"
+                presentation_reason = "ORG Spec not uploaded; this run validates Order Form against Output only."
+            else:
+                presentation_status, presentation_reason = _presentation_for_variable(
+                    org_block, actual, product_type
+                )
             final_status = base_status
             difference = str(row.get("DIFFERENCE", "—") or "—")
             if presentation_status == "FAIL" and base_status == "PASS" and product_type in {"HTL", "Other"}:
@@ -1347,8 +1387,8 @@ def _classify_static_and_unaccounted(org_pages, output_pages, variable_evidence,
                 continue
 
             if m.get("case_mismatch"):
-                org_text = m["org"].get("text", "")
-                output_text = m["output"].get("text", "")
+                org_text = m["org"].get("visible_text", m["org"].get("text", ""))
+                output_text = m["output"].get("visible_text", m["output"].get("text", ""))
                 mismatch_kind = m.get("mismatch_kind") or "capitalization, punctuation, or spacing"
                 if mismatch_kind == "capitalization":
                     case_reason = (
@@ -1524,8 +1564,12 @@ def _draw_visual_evidence(page, variable_evidence, static_matches, selected_fiel
     # Exact static matches remain yellow.
     for idx, m in enumerate([x for x in static_matches if x["page"] == page_no], start=1):
         b = m["output"]["bbox"]
-        draw.rounded_rectangle(tuple(map(int,b)), radius=4, fill=_rgba(YELLOW,70), outline=_rgba(YELLOW,235), width=2)
-        entries.append((b, f"S{idx}", "STATIC", YELLOW))
+        static_name = m.get("field") or f"Static Element #{idx}"
+        if selected_field == static_name:
+            draw.rounded_rectangle(tuple(map(int,b)), radius=5, fill=_rgba(YELLOW,90), outline=_rgba(BLUE,255), width=4)
+        else:
+            draw.rounded_rectangle(tuple(map(int,b)), radius=4, fill=_rgba(YELLOW,70), outline=_rgba(YELLOW,235), width=2)
+        entries.append((b, f"S{idx}", static_name, YELLOW))
 
     # Capitalization-only static differences are explicit red failures.
     page_case_mismatches = [
@@ -1873,20 +1917,58 @@ def _status_counts(evidence, static_matches, unaccounted, case_mismatches=None):
 
 
 def _run_tool3_pipeline(result, selected_fields=None):
-    """Re-run Tool 1 + Tool 3 enrichment without duplicating Tool 1 rules."""
-    selected = list(selected_fields if selected_fields is not None else result["selected_fields"])
-    df = result["df"]
-    output_pages = result["output_pages"]
-    org_pages = result["org_pages"]
-    product = result["product_type"]
-    mapping = result["mapping"]
+    """Run the shared Tool 1 validator and enrich it with available ORG checks."""
+    selected = list(selected_fields if selected_fields is not None else result.get("selected_fields", []))
+    df = result.get("df")
+    if df is None:
+        df = pd.DataFrame()
+    output_pages = result.get("output_pages", []) or []
+    org_pages = result.get("org_pages", []) or []
+    product = result.get("product_type", "PFL")
+    mapping = result.get("mapping", {}) or {}
+    mode = result.get("mode", "full")
 
-    report = _tool1_variable_results(df, output_pages, selected, product, mapping)
-    evidence = _build_variable_evidence(df, output_pages, org_pages, report, product)
-    static_matches, case_mismatches, unaccounted, registrations = _classify_static_and_unaccounted(
-        org_pages, output_pages, evidence, product
-    )
+    if not df.empty and output_pages and selected:
+        report = _tool1_variable_results(df, output_pages, selected, product, mapping)
+        evidence = _build_variable_evidence(
+            df, output_pages, org_pages, report, product,
+            mapping_overrides=result.get("org_mapping_overrides", {}),
+        )
+    else:
+        report = pd.DataFrame()
+        evidence = []
+
+    if org_pages and output_pages:
+        static_matches, case_mismatches, unaccounted, registrations = _classify_static_and_unaccounted(
+            org_pages, output_pages, evidence, product
+        )
+    else:
+        static_matches, case_mismatches, unaccounted, registrations = [], [], [], []
+
     summary = _overall(evidence, static_matches, unaccounted, case_mismatches)
+    # With only ORG + Output, changes without an Order Form cannot safely be
+    # classified as valid variable replacements or static defects. Keep known
+    # exact-format defects as FAIL and mark unresolved/missing items REVIEW.
+    if mode == "org_output":
+        fails = sum(1 for m in case_mismatches if m.get("status") == "FAIL")
+        reviews = max(1, len(unaccounted))  # Variable data cannot be verified here.
+        overall = "FAIL" if fails else "REVIEW"
+        summary = (overall, len(static_matches), 0, fails, reviews, len(unaccounted))
+        for item in unaccounted:
+            item["status"] = "REVIEW"
+            item["difference"] = (
+                "ORG text has no safe exact counterpart. Without an Order Form, "
+                "this may be a variable replacement or a static-text defect and needs review."
+            )
+    elif mode == "order_org_precheck":
+        # No Output is available, so this is deliberately never reported as QC PASS.
+        populated = 0
+        if df is not None and not df.empty:
+            for field in result.get("all_fields", []):
+                if field in df.columns:
+                    populated += sum(0 if is_blank_value(v) else 1 for v in df[field].tolist())
+        summary = ("REVIEW", 0, 0, 0, 1, 0)
+
     annotated_images = {
         int(p.get("page", i + 1)): _draw_visual_evidence(
             p, evidence, static_matches, case_mismatches=case_mismatches
@@ -1954,6 +2036,68 @@ def _prepare_detect_run(order_file, org_file, output_file, product_type):
     }
 
 
+def _prepare_any_run(order_file, org_file, output_file, product_type):
+    """Initialize the appropriate workflow from any two uploaded source files."""
+    order_bytes = _extract_file_bytes(order_file)
+    org_bytes = _extract_file_bytes(org_file)
+    output_bytes = _extract_file_bytes(output_file)
+    has_order, has_org, has_output = bool(order_bytes), bool(org_bytes), bool(output_bytes)
+
+    files = {
+        "order": getattr(order_file, "name", "Order Form") if has_order else "Not uploaded",
+        "org": getattr(org_file, "name", "ORG Spec") if has_org else "Not uploaded",
+        "output": getattr(output_file, "name", "Output") if has_output else "Not uploaded",
+    }
+
+    if has_order and has_output:
+        result = _prepare_detect_run(order_file, org_file, output_file, product_type)
+        result["mode"] = "full" if has_org else "order_output"
+        result["files"] = files
+        result["source_bytes"] = {"order": order_bytes, "org": org_bytes, "output": output_bytes}
+        result["org_mapping_overrides"] = {}
+        return result
+
+    if has_org and has_output:
+        output_pages = _extract_pages_cached(output_bytes, files["output"])
+        org_pages = _extract_pages_cached(org_bytes, files["org"])
+        if not output_pages:
+            raise ValueError("The Output artwork could not be read.")
+        if not org_pages:
+            raise ValueError("The ORG Spec could not be read.")
+        result = {
+            "df": pd.DataFrame(), "org_pages": org_pages, "output_pages": output_pages,
+            "mapping": {}, "all_fields": [], "detected_fields": [], "selected_fields": [],
+            "confirmed_fields": set(), "product_type": product_type, "mode": "org_output",
+            "evidence_ready": True, "files": files,
+            "source_bytes": {"order": b"", "org": org_bytes, "output": output_bytes},
+            "org_mapping_overrides": {},
+        }
+        return _run_tool3_pipeline(result, [])
+
+    if has_order and has_org:
+        df = (pd.read_csv(io.BytesIO(order_bytes)) if files["order"].lower().endswith(".csv")
+              else load_excel(io.BytesIO(order_bytes)))
+        if df.empty:
+            raise ValueError("The Order Form contains no usable data rows.")
+        org_pages = _extract_pages_cached(org_bytes, files["org"])
+        if not org_pages:
+            raise ValueError("The ORG Spec could not be read.")
+        all_fields = [f for f in get_available_fields(df) if not is_admin_field(f)]
+        result = {
+            "df": df, "org_pages": org_pages, "output_pages": [], "mapping": {},
+            "all_fields": all_fields, "detected_fields": [], "selected_fields": [],
+            "confirmed_fields": set(), "product_type": product_type,
+            "mode": "order_org_precheck", "evidence_ready": True, "files": files,
+            "source_bytes": {"order": order_bytes, "org": org_bytes, "output": b""},
+            "org_mapping_overrides": {}, "report": pd.DataFrame(), "evidence": [],
+            "static_matches": [], "case_mismatches": [], "unaccounted": [],
+            "registrations": [], "annotated_images": {},
+        }
+        return _run_tool3_pipeline(result, [])
+
+    raise ValueError("Upload any two of the three files to start: Order Form, ORG Spec, and Output.")
+
+
 def _ensure_visual_evidence(result, selected_fields=None):
     """Build full Tool-3 evidence once, after Auto Detect is visible.
 
@@ -1963,12 +2107,13 @@ def _ensure_visual_evidence(result, selected_fields=None):
         return result
     selected = list(selected_fields if selected_fields is not None else result.get("selected_fields", []))
     org_bytes = result.get("source_bytes", {}).get("org", b"")
-    if not org_bytes:
-        raise ValueError("The ORG Spec source is unavailable. Please start a new check.")
-    org_name = result.get("files", {}).get("org", "ORG Spec")
-    org_pages = _extract_pages_cached(org_bytes, org_name)
-    result["org_pages"] = org_pages
-    _run_tool3_pipeline(result, selected)
+    if org_bytes and not result.get("org_pages"):
+        org_name = result.get("files", {}).get("org", "ORG Spec")
+        result["org_pages"] = _extract_pages_cached(org_bytes, org_name)
+    if result.get("output_pages"):
+        _run_tool3_pipeline(result, selected)
+    elif result.get("mode") == "order_org_precheck":
+        _run_tool3_pipeline(result, [])
     result["evidence_ready"] = True
     return result
 
@@ -2128,7 +2273,7 @@ def _render_visual_stage_preview(result, selected_field, selected_page, stage_ke
             f"<b>Output:</b> {html.escape(str(ev.get('actual','')))}<br>"
             f"<b>Finding:</b> {html.escape(str(ev.get('difference','—')))}</div>", unsafe_allow_html=True)
 
-def _render_navigation(back_step=None, next_label="Next", next_key=None, next_disabled=False):
+def _render_stage_navigation(back_step=None, next_label="Next", next_key=None, next_disabled=False):
     left, right = st.columns([1, 1])
     with left:
         if back_step is not None:
@@ -2176,7 +2321,6 @@ def main():
 
     # ------------------------------------------------------------------
     # Stage-specific input surface
-    # ------------------------------------------------------------------
     if stage == 1:
         st.markdown("<div class='t3-section-title'>Project Inputs</div>", unsafe_allow_html=True)
         c1, c2, c3, c4 = st.columns([1.05, 1.05, 1.05, .95], gap="small")
@@ -2186,30 +2330,39 @@ def main():
             order_file = st.file_uploader("Order Form", type=["xlsx", "xls", "csv"], label_visibility="collapsed", key=f"t3_order_{reset}")
             if order_file:
                 st.markdown(f"<div class='t3-fileline'>{html.escape(order_file.name)} ✓</div>", unsafe_allow_html=True)
-            st.markdown("<div class='t3-role'><b>Used for:</b> variable fields such as FIB, WC, RN, COO, Size, Brand, Barcode, etc.</div></div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Used for:</b> variable-field values and Tool 1 validation.</div></div>", unsafe_allow_html=True)
 
         with c2:
             st.markdown("<div class='t3-card'><div class='t3-upload-icon'>📐</div><div class='t3-card-title'>ORG Spec</div><div class='t3-card-sub'>Approved content + presentation baseline</div>", unsafe_allow_html=True)
             org_file = st.file_uploader("ORG Spec", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed", key=f"t3_org_{reset}")
             if org_file:
                 st.markdown(f"<div class='t3-fileline'>{html.escape(org_file.name)} ✓</div>", unsafe_allow_html=True)
-            st.markdown("<div class='t3-role'><b>Used for:</b> wording, case, punctuation, position, layout and static reference.</div></div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Used for:</b> static wording, case, punctuation and layout reference.</div></div>", unsafe_allow_html=True)
 
         with c3:
             st.markdown("<div class='t3-card'><div class='t3-upload-icon'>🖼️</div><div class='t3-card-title'>Output</div><div class='t3-card-sub'>Final artwork to validate</div>", unsafe_allow_html=True)
             output_file = st.file_uploader("Output", type=["pdf", "jpg", "jpeg", "png"], label_visibility="collapsed", key=f"t3_output_{reset}")
             if output_file:
                 st.markdown(f"<div class='t3-fileline'>{html.escape(output_file.name)} ✓</div>", unsafe_allow_html=True)
-            st.markdown("<div class='t3-role'><b>Checked against:</b> ORG baseline + Tool 1 Order Form validation.</div></div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>Used for:</b> final artwork comparison.</div></div>", unsafe_allow_html=True)
 
         with c4:
             st.markdown("<div class='t3-card'><div class='t3-card-title'>Product Type</div><div class='t3-card-sub'>Controls variable-data presentation behavior</div>", unsafe_allow_html=True)
             product = st.radio("Product Type", ["PFL", "HTL", "Other"], horizontal=True, key=f"t3_product_{reset}")
-            st.markdown("<div class='t3-role'><b>PFL:</b> Order Form presentation. <b>HTL / Other:</b> ORG presentation baseline.</div></div>", unsafe_allow_html=True)
+            st.markdown("<div class='t3-role'><b>PFL:</b> panelled layout. <b>HTL / Other:</b> ORG presentation baseline.</div></div>", unsafe_allow_html=True)
 
-        ready = bool(order_file and org_file and output_file)
+        present_count = sum(bool(x) for x in (order_file, org_file, output_file))
+        ready = present_count >= 2
         if not ready:
-            st.info("Upload Order Form, ORG Spec and Output to start the five-stage QC workflow.")
+            st.info("Upload any two files to start. All three enable the complete QC workflow.")
+        elif order_file and output_file and org_file:
+            st.success("Full QC mode: Order Form → Output validation plus ORG static/presentation comparison.")
+        elif order_file and output_file:
+            st.info("Data-validation mode: Order Form → Output. ORG-based checks will be skipped.")
+        elif org_file and output_file:
+            st.info("Artwork mode: ORG → Output static comparison. Variable values cannot be verified without an Order Form.")
+        elif order_file and org_file:
+            st.warning("Pre-check mode: Order Form and ORG are available, but Output is missing. Final artwork QC cannot be completed.")
     else:
         result_preview = st.session_state.get("t3_result")
         if not result_preview:
@@ -2217,16 +2370,20 @@ def main():
             st.rerun()
             return
         product = result_preview["product_type"]
-        order_name = result_preview["files"].get("order", "Order Form")
-        org_name = result_preview["files"].get("org", "ORG Spec")
-        output_name = result_preview["files"].get("output", "Output")
+        files = result_preview.get("files", {})
+        mode = result_preview.get("mode", "full")
+        present = [("Order Form", files.get("order", "Not uploaded")), ("ORG Spec", files.get("org", "Not uploaded")), ("Output", files.get("output", "Not uploaded"))]
+        badges = []
+        for label, filename in present:
+            uploaded = filename != "Not uploaded"
+            bg, fg = ("#dcfce7", "#15803d") if uploaded else ("#1f2937", "#94a3b8")
+            symbol = "✓" if uploaded else "—"
+            badges.append(f"<span class='t3-badge' style='background:{bg};color:{fg}'>{symbol} {label}</span><span style='font-size:9px;color:#94a3b8'>{html.escape(filename)}</span>")
         st.markdown(
-            f"<div class='t3-card' style='margin-bottom:10px'><div style='display:flex;gap:7px;flex-wrap:wrap;align-items:center'>"
-            f"<span class='t3-badge' style='background:#dcfce7;color:#15803d'>✓ Order Form</span><span style='font-size:9px;color:#64748b'>{html.escape(order_name)}</span>"
-            f"<span style='color:#cbd5e1'>•</span><span class='t3-badge' style='background:#e0e7ff;color:#4338ca'>✓ ORG Spec</span><span style='font-size:9px;color:#64748b'>{html.escape(org_name)}</span>"
-            f"<span style='color:#cbd5e1'>•</span><span class='t3-badge' style='background:#dbeafe;color:#1e40af'>✓ Output</span><span style='font-size:9px;color:#64748b'>{html.escape(output_name)}</span>"
-            f"<span style='margin-left:auto' class='t3-badge' style='background:#eff6ff;color:#1d4ed8'>Product: {html.escape(product)}</span>"
-            f"</div></div>",
+            "<div class='t3-card' style='margin-bottom:10px'><div style='display:flex;gap:7px;flex-wrap:wrap;align-items:center'>"
+            + "<span style='font-size:9px;color:#94a3b8'>" + " &nbsp; • &nbsp; ".join(badges) + "</span>"
+            + f"<span style='margin-left:auto' class='t3-badge'>Mode: {html.escape(mode.replace('_',' ').title())}</span>"
+            + f"<span class='t3-badge'>Product: {html.escape(product)}</span></div></div>",
             unsafe_allow_html=True,
         )
         order_file = org_file = output_file = None
@@ -2234,30 +2391,33 @@ def main():
 
     # ------------------------------------------------------------------
     # STAGE 1 — Upload / initialize
-    # ------------------------------------------------------------------
     if stage == 1:
-        _render_stage_header(1, "Upload Files & Select Product Type", "Provide the three source files and choose the product type before analysis starts.")
+        _render_stage_header(1, "Upload Files & Select Product Type", "Upload any two files for a supported comparison; upload all three for full QC.")
         st.markdown(
             "<div class='t3-hero-result'><div class='t3-hero-title'>What happens next?</div>"
-            "<div class='t3-hero-sub'>Tool 1 will detect relevant Order Form fields. Tool 3 will then analyze ORG structure, compare Output, lock evidence, and prepare the visual QC workspace.</div></div>",
+            "<div class='t3-hero-sub'>The workflow adapts to the uploaded pair. Readable PDF text is preferred; OCR is reserved for pages without usable native text.</div></div>",
             unsafe_allow_html=True,
         )
-        if _render_navigation(next_label="Start Auto Detect", next_key=f"t3_stage1_next_{reset}", next_disabled=not ready):
+        if _render_stage_navigation(next_label="Start QC / Analysis", next_key=f"t3_stage1_next_{reset}", next_disabled=not ready):
             try:
-                with st.status("Preparing files and running Tool 1 Auto Detect…", expanded=True) as status:
-                    st.write("1/3 Reading Order Form…")
-                    # Fast path: load Order Form + Output only. ORG analysis is deferred.
-                    st.write("2/3 Reading Output artwork…")
-                    result = _prepare_detect_run(order_file, org_file, output_file, product)
-                    st.write("3/3 Running Tool 1 Auto Detect…")
-                    status.update(label=f"Auto Detect complete — {len(result.get('detected_fields', []))} field(s) detected", state="complete")
+                with st.status("Preparing the uploaded files…", expanded=True) as status:
+                    st.write("1/3 Reading the available source files…")
+                    result = _prepare_any_run(order_file, org_file, output_file, product)
+                    st.write("2/3 Running the applicable field and artwork analysis…")
+                    if result.get("mode") in {"full", "order_output"}:
+                        detected_count = len(result.get("detected_fields", []))
+                        status.update(label=f"Preparation complete — {detected_count} field(s) detected", state="complete")
+                    elif result.get("mode") == "org_output":
+                        status.update(label="ORG / Output analysis complete", state="complete")
+                    else:
+                        status.update(label="Pre-check prepared; Output is required for final QC", state="complete")
                 st.session_state["t3_result"] = result
                 st.session_state["t3_confirmed_fields"] = set()
                 st.session_state["t3_stage"] = 2
-                st.session_state["t3_focus_field"] = result["selected_fields"][0] if result["selected_fields"] else None
+                st.session_state["t3_focus_field"] = result["selected_fields"][0] if result.get("selected_fields") else None
                 st.rerun()
             except Exception as exc:
-                st.error(f"QC Auto Detect could not be completed: {exc}")
+                st.error(f"QC preparation could not be completed: {exc}")
         return
 
     result = st.session_state.get("t3_result")
@@ -2270,6 +2430,47 @@ def main():
     # STAGE 2 — Auto Detect + visual tagging
     # ------------------------------------------------------------------
     if stage == 2:
+        mode = result.get("mode", "full")
+        if mode == "order_org_precheck":
+            _render_stage_header(2, "Order Form + ORG Pre-check", "Review the available inputs. Output is required to validate the final artwork.")
+            st.warning("This is a pre-check only. No Output was uploaded, so no PASS/FAIL decision about the artwork is possible.")
+            df = result.get("df", pd.DataFrame())
+            rows = []
+            for field in result.get("all_fields", []):
+                if field not in df.columns:
+                    continue
+                values = [str(v).strip() for v in df[field].tolist() if not is_blank_value(v)]
+                rows.append({"Order Form Field": field, "Family": get_field_type(field), "Region": get_field_region(field) or "—", "Populated rows": len(values), "Sample value": values[0][:180] if values else "(blank)"})
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=420)
+            st.caption(f"ORG pages available: {len(result.get('org_pages', []))}. These inputs are saved for a later full QC run; no field-to-artwork match is assumed.")
+            back, next_col = st.columns([1, 1])
+            with back:
+                if st.button("← Back to Upload", width="stretch", key=f"t3_stage2_back_{reset}"):
+                    st.session_state["t3_stage"] = 1; st.rerun()
+            with next_col:
+                if st.button("View Pre-check Result →", type="primary", width="stretch", key=f"t3_precheck_next_{reset}"):
+                    st.session_state["t3_stage"] = 5; st.rerun()
+            return
+
+        if mode == "org_output":
+            _render_stage_header(2, "ORG → Output Static Analysis", "Inspect exact static matches and differences. Variable values require an Order Form.")
+            counts = _status_counts(result.get("evidence", []), result.get("static_matches", []), result.get("unaccounted", []), result.get("case_mismatches", []))
+            cols = st.columns(4)
+            with cols[0]: st.markdown(f"<div class='t3-mini-stat'><b>{counts['static']}</b><span>Exact static matches</span></div>", unsafe_allow_html=True)
+            with cols[1]: st.markdown(f"<div class='t3-mini-stat'><b>{counts['fail']}</b><span>Formatting failures</span></div>", unsafe_allow_html=True)
+            with cols[2]: st.markdown(f"<div class='t3-mini-stat'><b>{counts['unaccounted']}</b><span>Unresolved ORG items</span></div>", unsafe_allow_html=True)
+            with cols[3]: st.markdown("<div class='t3-mini-stat'><b>REVIEW</b><span>Variable data unverified</span></div>", unsafe_allow_html=True)
+            st.info("Without an Order Form, a changed value cannot safely be classified as an approved variable replacement. Unresolved wording changes are shown for review, not automatically passed.")
+            back, next_col = st.columns([1, 1])
+            with back:
+                if st.button("← Back to Upload", width="stretch", key=f"t3_stage2_back_{reset}"):
+                    st.session_state["t3_stage"] = 1; st.rerun()
+            with next_col:
+                if st.button("Compare Artwork →", type="primary", width="stretch", key=f"t3_orgout_next_{reset}"):
+                    st.session_state["t3_stage"] = 4; st.rerun()
+            return
+
         _render_stage_header(2, "Auto Detect Fields", "Review what Tool 1 detected and see the exact artwork regions before confirming them.")
         if not result.get("evidence_ready"):
             with st.status("Preparing field evidence…", expanded=True) as status:
@@ -2323,62 +2524,129 @@ def main():
 
     # ------------------------------------------------------------------
     # STAGE 3 — Review / edit / confirm detected fields
-    # ------------------------------------------------------------------
     if stage == 3:
-        _render_stage_header(3, "Review & Edit Detected Fields", "Confirm, remove or add fields. Selected evidence remains locked so another field cannot reuse it.")
+        _render_stage_header(3, "Review & Edit Detected Fields", "Review the proposed field mapping, read the reason, then confirm or relink it. The artwork preview remains unchanged.")
         left, right = st.columns([1.3, 1.7], gap="small")
 
         with left:
-            st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Detected Fields ({len(result['selected_fields'])})</div><div class='t3-card-sub'>The full list is scrollable. Search by field name, family or semantic meaning.</div></div>", unsafe_allow_html=True)
+            current_default = [f for f in result.get("selected_fields", []) if f in result.get("all_fields", [])]
+            st.markdown(f"<div class='t3-card'><div class='t3-card-title'>Detected Fields ({len(current_default)})</div><div class='t3-card-sub'>Select the fields that should participate in validation. You can search, remove or add fields.</div></div>", unsafe_allow_html=True)
             current = st.multiselect(
-                "Fields participating in QC",
-                result["all_fields"],
-                default=[f for f in result["selected_fields"] if f in result["all_fields"]],
-                key=f"t3_review_multiselect_{reset}",
+                "Fields participating in QC", result.get("all_fields", []),
+                default=current_default, key=f"t3_review_multiselect_{reset}",
             )
-            st.caption(f"Selected: {len(current)} fields • Auto detected: {len(result['detected_fields'])}")
-            _render_field_detection_table({**result, "selected_fields": current}, 3, show_full=True)
-            if current != result["selected_fields"]:
-                st.info("Field selection has changed. The comparison will be recalculated when you continue.")
+            st.caption(f"Selected: {len(current)} fields • Auto detected: {len(result.get('detected_fields', []))}")
+            if current != result.get("selected_fields", []):
+                st.info("Field selection has changed. Results will be recalculated when you proceed.")
 
-            page_numbers = _safe_page_numbers(result["output_pages"])
-            mapping_changed = False
-            with st.expander("▾ Page Mapping", expanded=len(page_numbers) > 1):
-                opts = list(range(len(result["df"])))
-                labels = [f"Excel Row {i + 2}" for i in opts]
-                for i, pn in enumerate(page_numbers):
-                    old = int(result["mapping"].get(pn, min(i, len(result["df"]) - 1)))
-                    chosen = st.selectbox(
-                        f"PDF Page {pn}", opts,
-                        index=max(0, min(old, len(opts) - 1)),
-                        format_func=lambda x, labels=labels: labels[x],
-                        key=f"t3_review_map_{reset}_{pn}",
-                    )
-                    if chosen != old:
-                        mapping_changed = True
-                    result["mapping"][pn] = chosen
-
-        with right:
-            inspect_fields = current or result["selected_fields"]
+            inspect_fields = current or result.get("selected_fields", [])
+            page_numbers = _safe_page_numbers(result.get("output_pages", []))
             if inspect_fields:
                 focus_default = st.session_state.get("t3_focus_field")
                 idx_default = inspect_fields.index(focus_default) if focus_default in inspect_fields else 0
-                selected_field = st.selectbox("Inspect selected field", inspect_fields, index=idx_default, key=f"t3_review_field_{reset}")
+                selected_field = st.selectbox("Inspect / map field", inspect_fields, index=idx_default, key=f"t3_review_field_{reset}")
                 st.session_state["t3_focus_field"] = selected_field
-                page_numbers = _safe_page_numbers(result["output_pages"])
-                selected_page = st.selectbox("Artwork Page", page_numbers, key=f"t3_review_page_{reset}")
-                _render_visual_stage_preview(result, selected_field, selected_page, "review")
-                ev = next((e for e in result["evidence"] if e["field"] == selected_field and e["page"] == selected_page), None)
-                confirm_key = f"t3_confirm_{reset}_{selected_page}_{selected_field}"
-                confirmed = st.checkbox("I confirm this detected field/evidence is correct", value=(selected_field in st.session_state["t3_confirmed_fields"]), key=confirm_key)
-                if confirmed:
-                    st.session_state["t3_confirmed_fields"].add(selected_field)
+                if page_numbers:
+                    selected_page = st.selectbox("Artwork page", page_numbers, key=f"t3_review_page_{reset}")
                 else:
-                    st.session_state["t3_confirmed_fields"].discard(selected_field)
-                if ev:
-                    st.markdown(f"<div class='t3-role'><b>Evidence state:</b> {'🔒 Confirmed + locked' if selected_field in st.session_state['t3_confirmed_fields'] else 'Review pending'}<br><b>Classification:</b> {html.escape(ev.get('classification','VARIABLE'))}<br><b>Result:</b> {_status_badge(ev.get('status','INFO'))}</div>", unsafe_allow_html=True)
+                    selected_page = 1
+                ev = next((e for e in result.get("evidence", []) if e.get("field") == selected_field and e.get("page") == selected_page), None)
+                if ev is None:
+                    ev = next((e for e in result.get("evidence", []) if e.get("field") == selected_field), None)
+                reason = str((ev or {}).get("difference", "No comparison evidence is available yet."))
+                expected = str((ev or {}).get("expected", ""))
+                actual = str((ev or {}).get("actual", ""))
+                status = str((ev or {}).get("status", "REVIEW"))
+                st.markdown("<div class='t3-section-title'>Reason for Mapping / Result</div>", unsafe_allow_html=True)
+                reason_html = (
+                    f"<div class='t3-review-reason'><b>Status:</b> {html.escape(status)}<br>"
+                    f"<b>Order Form:</b> {html.escape(expected or '—')}<br>"
+                    f"<b>Output:</b> {html.escape(actual or '—')}<br><br>"
+                    f"<b>Reason:</b><br>{html.escape(reason or 'No reason supplied.')}</div>"
+                )
+                st.markdown(reason_html, unsafe_allow_html=True)
+
+                # Manual ORG-reference relinking is available only when ORG and
+                # Output are both present. Auto remains the default.
+                org_pages = result.get("org_pages", []) or []
+                if org_pages and page_numbers:
+                    page_idx = page_numbers.index(selected_page) if selected_page in page_numbers else 0
+                    org_page = org_pages[page_idx] if page_idx < len(org_pages) else None
+                    out_page = result["output_pages"][page_idx] if page_idx < len(result.get("output_pages", [])) else None
+                    reg = _register(org_page, out_page) if org_page and out_page else None
+                    org_blocks = _registered_org_blocks(org_page, reg) if org_page and reg else (_blocks(org_page) if org_page else [])
+                    override_key = f"{selected_page}::{selected_field}"
+                    override_map = result.setdefault("org_mapping_overrides", {})
+                    current_override = override_map.get(override_key)
+                    auto_idx = (ev or {}).get("org_index")
+                    selected_map_idx = current_override if current_override is not None else (auto_idx if auto_idx is not None else -1)
+                    if not isinstance(selected_map_idx, int) or not (-1 <= selected_map_idx < len(org_blocks)):
+                        selected_map_idx = -1
+
+                    def _org_label(x):
+                        if x == -1:
+                            return "AUTO — use field-aware mapping"
+                        text = str(org_blocks[x].get("text", "")).replace("\n", " ")
+                        if len(text) > 100:
+                            text = text[:97] + "..."
+                        return f"ORG #{x + 1}: {text or '(empty text block)'}"
+
+                    map_options = [-1] + list(range(len(org_blocks)))
+                    chosen_org = st.selectbox(
+                        "ORG reference (relink if incorrect)", map_options,
+                        index=map_options.index(selected_map_idx), format_func=_org_label,
+                        key=f"t3_org_relink_select_{reset}_{selected_page}_{selected_field}",
+                    )
+                    if st.button("Apply ORG reference / relink", width="stretch", key=f"t3_apply_org_link_{reset}_{selected_page}_{selected_field}"):
+                        if chosen_org == -1:
+                            override_map.pop(override_key, None)
+                        else:
+                            override_map[override_key] = int(chosen_org)
+                        st.session_state["t3_confirmed_fields"].discard(f"{selected_page}::{selected_field}")
+                        _run_tool3_pipeline(result, current)
+                        st.session_state["t3_result"] = result
+                        st.rerun()
+                elif result.get("mode") == "order_output":
+                    st.caption("ORG relinking is unavailable because no ORG Spec was uploaded.")
+
+                confirm_id = f"{selected_page}::{selected_field}"
+                confirmed = st.checkbox(
+                    "I confirm this field mapping and evidence", 
+                    value=confirm_id in st.session_state.get("t3_confirmed_fields", set()),
+                    key=f"t3_confirm_{reset}_{selected_page}_{selected_field}",
+                )
+                if confirmed:
+                    st.session_state["t3_confirmed_fields"].add(confirm_id)
+                else:
+                    st.session_state["t3_confirmed_fields"].discard(confirm_id)
+                state_text = "Confirmed by reviewer" if confirmed else "Awaiting reviewer confirmation"
+                st.markdown(f"<div class='t3-role'><b>Mapping state:</b> {html.escape(state_text)}<br><b>Evidence:</b> {'🔒 Locked' if (ev or {}).get('locked') or confirmed else 'Not locked'}</div>", unsafe_allow_html=True)
             else:
-                st.warning("No fields selected. Add or select at least one field before continuing.")
+                selected_field = None
+                selected_page = page_numbers[0] if page_numbers else 1
+                st.warning("No fields selected. Add or select at least one populated field before continuing.")
+
+            _render_field_detection_table({**result, "selected_fields": current}, 3, show_full=True)
+            if page_numbers and len(page_numbers) > 1:
+                opts = list(range(len(result.get("df", []))))
+                if opts:
+                    labels = [f"Excel Row {i + 2}" for i in opts]
+                    with st.expander("▾ Page Mapping", expanded=False):
+                        for i, pn in enumerate(page_numbers):
+                            old = int(result.get("mapping", {}).get(pn, min(i, len(opts) - 1)))
+                            chosen = st.selectbox(
+                                f"PDF Page {pn}", opts,
+                                index=max(0, min(old, len(opts) - 1)),
+                                format_func=lambda x, labels=labels: labels[x],
+                                key=f"t3_review_map_{reset}_{pn}",
+                            )
+                            result["mapping"][pn] = chosen
+
+        with right:
+            if selected_field and page_numbers:
+                _render_visual_stage_preview(result, selected_field, selected_page, "review")
+            else:
+                st.info("The visual evidence preview appears here when a field and artwork page are available.")
 
         back, next_col = st.columns([1,1])
         with back:
@@ -2396,7 +2664,6 @@ def main():
                     st.rerun()
         return
 
-    # ------------------------------------------------------------------
     # STAGE 4 — comparison workspace
     # ------------------------------------------------------------------
     if stage == 4:
@@ -2432,6 +2699,15 @@ def main():
             ev_focus = next((e for e in result["evidence"] if e["field"] == focus_field and e["page"] == selected_page), None)
             if ev_focus is None:
                 ev_focus = next((e for e in result.get("case_mismatches", []) if e.get("field") == focus_field and e.get("page") == selected_page), None)
+            if ev_focus is None:
+                ev_focus = next((e for e in result.get("unaccounted", []) if e.get("field") == focus_field and e.get("page") == selected_page), None)
+            if ev_focus is None:
+                page_static = [e for e in result.get("static_matches", []) if e.get("page") == selected_page]
+                for static_idx, static_item in enumerate(page_static, start=1):
+                    static_name = static_item.get("field") or f"Static Element #{static_idx}"
+                    if static_name == focus_field and static_item.get("output", {}).get("bbox"):
+                        ev_focus = {"boxes": [static_item["output"]["bbox"]]}
+                        break
             if ev_focus and ev_focus.get("boxes"):
                 bxs = ev_focus["boxes"]
                 focus_box = (min(b[0] for b in bxs), min(b[1] for b in bxs), max(b[2] for b in bxs), max(b[3] for b in bxs))
@@ -2445,6 +2721,23 @@ def main():
         page_evidence.extend(
             e for e in result.get("case_mismatches", []) if e.get("page") == selected_page
         )
+        page_evidence.extend(
+            e for e in result.get("unaccounted", []) if e.get("page") == selected_page
+        )
+        for static_idx, m in enumerate((x for x in result.get("static_matches", []) if x.get("page") == selected_page), start=1):
+            page_evidence.append({
+                "page": selected_page,
+                "field": m.get("field") or f"Static Element #{static_idx}",
+                "field_type": "STATIC TEXT",
+                "region": "ORG / Output",
+                "expected": m.get("org", {}).get("visible_text", m.get("org", {}).get("text", "")),
+                "actual": m.get("output", {}).get("visible_text", m.get("output", {}).get("text", "")),
+                "status": "STATIC",
+                "classification": "STATIC",
+                "difference": "Exact static ORG / Output match.",
+                "boxes": [m.get("output", {}).get("bbox")] if m.get("output", {}).get("bbox") else [],
+                "locked": True,
+            })
         if filter_choice == "FAIL":
             display_findings = [e for e in page_evidence if e.get("status") == "FAIL"]
         elif filter_choice == "REVIEW":
@@ -2464,11 +2757,11 @@ def main():
                 display_findings = [e for e in display_findings if q in _norm(e["field"]) or q in _norm(e.get("actual", "")) or q in _norm(e.get("expected", "")) or q in _norm(e.get("field_type", ""))]
             if not display_findings:
                 st.info("No findings match this filter.")
-            for e in display_findings:
+            for finding_idx, e in enumerate(display_findings):
                 selected = e["field"] == focus_field
                 col = st.columns([4.3, 1.0])
                 with col[0]:
-                    if st.button(f"{e['field']}", width="stretch", key=f"t3_find_{reset}_{selected_page}_{e['field']}"):
+                    if st.button(f"{e['field']}", width="stretch", key=f"t3_find_{reset}_{selected_page}_{finding_idx}"):
                         st.session_state["t3_focus_field"] = e["field"]
                         st.rerun()
                 with col[1]:
@@ -2543,7 +2836,19 @@ def main():
                     unsafe_allow_html=True,
                 )
         else:
-            st.success("No unresolved variable failures, presentation failures, reviews or unaccounted ORG elements were found.")
+            if result.get("mode") == "order_org_precheck":
+                st.warning("No final QC decision is available because Output was not uploaded.")
+            elif result.get("mode") == "org_output":
+                st.info("No static formatting failures were detected. Variable data still requires an Order Form.")
+            else:
+                st.success("No unresolved variable failures, presentation failures, reviews or unaccounted ORG elements were found.")
+
+        if result.get("mode") == "org_output":
+            st.warning("ORG + Output mode: static text was compared, but variable values could not be verified without the Order Form. Overall REVIEW is intentional unless a detected static formatting defect caused FAIL.")
+        elif result.get("mode") == "order_output":
+            st.info("Order Form + Output mode: Tool 1 data validation was performed. ORG-based static and presentation checks were skipped because no ORG Spec was uploaded.")
+        elif result.get("mode") == "order_org_precheck":
+            st.warning("Pre-check only: Order Form and ORG Spec were uploaded, but no Output artwork was provided. No final artwork comparison was performed.")
 
         st.markdown("<div class='t3-section-title'>Download QC Report</div>", unsafe_allow_html=True)
         report_bytes = _build_excel_report(result)
